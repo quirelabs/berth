@@ -105,7 +105,11 @@ impl Histogram {
     }
 
     /// A compact human-readable report, one line per populated bucket.
-    pub fn report(&self, title: &str, budget: Duration) -> String {
+    ///
+    /// `budget` is optional because not every distribution has a criterion.
+    /// The round trip is the network's, not Berth's, so printing a verdict on
+    /// it would claim a pass Berth did not earn.
+    pub fn report(&self, title: &str, budget: Option<Duration>) -> String {
         let mut out = String::new();
         out.push_str(&format!(
             "{title}: {} frames, mean {:.1} ms, p50 {} ms, p95 {} ms, p99 {} ms, max {:.1} ms\n",
@@ -116,12 +120,14 @@ impl Histogram {
             self.percentile_ms(0.99),
             self.max().as_secs_f64() * 1000.0,
         ));
-        let over = self.over(budget);
-        out.push_str(&format!(
-            "  over {} ms: {over} ({})\n",
-            budget.as_millis(),
-            if over == 0 { "PASS" } else { "FAIL" }
-        ));
+        if let Some(budget) = budget {
+            let over = self.over(budget);
+            out.push_str(&format!(
+                "  over {} ms: {over} ({})\n",
+                budget.as_millis(),
+                if over == 0 { "PASS" } else { "FAIL" }
+            ));
+        }
 
         let peak = self.buckets.iter().copied().max().unwrap_or(0).max(1);
         for (index, count) in self.buckets.iter().enumerate() {
@@ -233,8 +239,12 @@ impl LatencyReport {
         let period_ms = 1000.0 / refresh_hz.max(1.0);
         let missed = self.missed_frames(refresh_hz, paint);
         let mut out = String::new();
-        out.push_str(&self.local_render.report("local render", RENDER_BUDGET));
-        out.push_str(&self.round_trip.report("round trip", Duration::MAX));
+        out.push_str(
+            &self
+                .local_render
+                .report("local render", Some(RENDER_BUDGET)),
+        );
+        out.push_str(&self.round_trip.report("round trip", None));
         out.push_str(&format!(
             "\ntotal keystroke to glyph: mean {:.1} ms, p50 {} ms, p95 {} ms\n\
              within the {} ms local budget: {} of {}\n",
@@ -344,9 +354,14 @@ mod tests {
     fn the_report_names_pass_or_fail() {
         let mut h = Histogram::new();
         h.record(ms(4));
-        assert!(h.report("frames", FRAME_BUDGET).contains("PASS"));
+        assert!(h.report("frames", Some(FRAME_BUDGET)).contains("PASS"));
+        // A distribution with no criterion states no verdict.
+        let no_budget = h.report("round trip", None);
+        assert!(!no_budget.contains("PASS"));
+        assert!(!no_budget.contains("over "));
+        assert!(no_budget.contains("round trip"));
         h.record(ms(40));
-        assert!(h.report("frames", FRAME_BUDGET).contains("FAIL"));
+        assert!(h.report("frames", Some(FRAME_BUDGET)).contains("FAIL"));
     }
 
     #[test]

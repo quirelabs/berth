@@ -84,7 +84,7 @@ pub async fn run_cat(
 
     view.read_with(cx, |view, _| {
         let env = environment(view);
-        let report = view.frames.report("frame build", FRAME_BUDGET);
+        let report = view.frames.report("frame build", Some(FRAME_BUDGET));
         let p99 = view.frames.percentile_ms(0.99);
         let no_freeze = view.frames.within(FRAME_BUDGET);
         let batching_intact = p99 <= CAT_P99_CEILING_MS;
