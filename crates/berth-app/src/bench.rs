@@ -61,6 +61,21 @@ pub fn remove_file_command() -> String {
     format!("rm -f {BENCH_FILE}")
 }
 
+/// Bytes for the paced phase. Smaller than the file because all of it arrives.
+pub const PACED_BYTES: usize = 8 * 1024 * 1024;
+
+/// A producer that tmux forwards instead of collapsing.
+///
+/// `cat` of a cached file is instantaneous, so tmux gets only a few dozen
+/// chances to redraw and the client receives about a megabyte of a fifty
+/// megabyte file however fast the link is. That measures tmux, not Berth. A
+/// CPU-bound pipeline emits at roughly the rate tmux can forward, so what is
+/// written is what arrives: `berth-core` reading exactly this receives 114% of
+/// it on localhost. This is the phase that actually loads the renderer.
+pub fn paced_command() -> String {
+    format!("head -c {PACED_BYTES} /dev/zero | tr '\\0' 'y' | fold -w 76\n")
+}
+
 /// Stream the file and report the frame-time distribution.
 ///
 /// The pass condition is the maximum, not the mean: one 200 ms frame is a
@@ -82,9 +97,29 @@ pub async fn run_cat(
     // Let it stream, then let the grid settle.
     cx.background_executor().timer(settle).await;
 
+    // What survived tmux for the instantaneous producer, before the second
+    // phase overwrites the counters.
+    let cat_phase = view
+        .read_with(cx, |view, _| {
+            (
+                view.frames.report("frame build, cat", Some(FRAME_BUDGET)),
+                view.bytes_in,
+                view.frames.within(FRAME_BUDGET),
+                view.frames.percentile_ms(0.99),
+            )
+        })
+        .unwrap_or_default();
+
+    let _ = view.update(cx, |view, _| {
+        view.frames = crate::metrics::Histogram::new();
+        view.bytes_in = 0;
+    });
+    pty.write(paced_command()).await;
+    cx.background_executor().timer(settle).await;
+
     view.read_with(cx, |view, _| {
         let env = environment(view);
-        let report = view.frames.report("frame build", Some(FRAME_BUDGET));
+        let report = view.frames.report("frame build, paced", Some(FRAME_BUDGET));
         let p99 = view.frames.percentile_ms(0.99);
         let ceiling = f64::from(CAT_P99_CEILING_MS);
         let no_freeze = view.frames.within(FRAME_BUDGET);
@@ -93,21 +128,64 @@ pub async fn run_cat(
         // work: a histogram gathered over an idle window would look excellent
         // too. Note that tmux re-renders rather than forwarding verbatim, so
         // this is below the 50 MB written on the remote.
+        let (cat_report, cat_bytes, cat_no_freeze, cat_p99) = cat_phase;
+        // The verdict comes from the paced phase, because it is the only one
+        // that reliably puts bytes in front of the renderer. The cat phase is
+        // kept because it is what the Windows baseline measured, and because
+        // the gap between the two is the whole point.
         let text = format!(
-            "{env}{report}bytes through the parser: {} ({:.1} MB over {} frames)\n\n\
-             no frame at or above {} ms: {}\n\
-             p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms regression \
-             ceiling: {}\n",
+            "{env}\
+             {cat_report}bytes through the parser: {cat_bytes} ({:.1} MB of {:.0} MB written)\n\
+             \n\
+             {report}bytes through the parser: {} ({:.1} MB of {:.0} MB written)\n\
+             \n\
+             cat phase, no frame at or above {} ms: {} (p99 {cat_p99:.1} ms)\n\
+             paced phase, no frame at or above {} ms: {}\n\
+             paced phase, p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms \
+             regression ceiling: {}\n",
+            cat_bytes as f64 / 1024.0 / 1024.0,
+            BENCH_BYTES as f64 / 1024.0 / 1024.0,
             view.bytes_in,
             view.bytes_in as f64 / 1024.0 / 1024.0,
-            view.frames.count(),
+            PACED_BYTES as f64 / 1024.0 / 1024.0,
+            FRAME_BUDGET.as_millis(),
+            if cat_no_freeze { "PASS" } else { "FAIL" },
             FRAME_BUDGET.as_millis(),
             if no_freeze { "PASS" } else { "FAIL" },
             if batching_intact { "PASS" } else { "FAIL" },
         );
+        // Half the written bytes is a low bar deliberately: the point is that
+        // the renderer was actually loaded, not that tmux forwarded perfectly.
+        let arrived = view.bytes_in as usize > PACED_BYTES / 2;
+        // A handful of frames over twenty seconds is not "painting"; it is a
+        // starved window. The bar is low but not zero.
+        let painted = view.frames.count() >= 10;
+        // Same trap as the keystroke bench: an unfocused window paints rarely,
+        // the pump starves behind it, tmux collapses what it cannot hand over,
+        // and every frame-time criterion then passes on almost no work.
+        let text = if arrived && painted {
+            text
+        } else {
+            format!(
+                "{text}\nINVALID: the paced phase delivered {:.1} MB of {:.0} MB over {} \
+                 frames.\n{}\n",
+                view.bytes_in as f64 / 1024.0 / 1024.0,
+                PACED_BYTES as f64 / 1024.0 / 1024.0,
+                view.frames.count(),
+                if painted {
+                    "Frames were being painted, so this is the link: tmux collapsed what it \
+                     could not hand over in time. Run against a host with no network in the \
+                     way."
+                } else {
+                    "Nothing painted, so the window was probably not frontmost. gpui paints \
+                     an inactive window rarely, the pump starves behind it, and every \
+                     frame-time criterion then passes on almost no work. Re-run focused."
+                },
+            )
+        };
         Outcome {
             text,
-            passed: no_freeze && batching_intact && view.bytes_in > 0,
+            passed: no_freeze && batching_intact && arrived && painted,
         }
     })
     .unwrap_or_else(|_| Outcome {

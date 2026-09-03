@@ -211,7 +211,6 @@ pub struct LatencyReport {
     /// frame pacing or on Berth rather than argued about.
     pub wait: Histogram,
     pub paint: Histogram,
-
     /// The whole journey, which is what a user actually feels.
     pub total: Histogram,
     /// Samples whose local half fitted the spec's budget.

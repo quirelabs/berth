@@ -88,7 +88,6 @@ pub struct TerminalView {
     /// What the font system actually gave us, as opposed to what was asked
     /// for. Reported by the benchmarks; see `FontFacts`.
     pub resolved_font: Option<FontFacts>,
-
     /// The current local selection, if the user is dragging or has dragged.
     selection: Option<Selection>,
     /// Where a drag started, kept so the selection can be rebuilt as it moves.
