@@ -1,9 +1,14 @@
 //! Platform key events to Berth's key model.
 //!
-//! The AltGr rule lives here. Windows reports AltGr as Ctrl+Alt, so the
-//! modifiers alone cannot distinguish `AltGr+e` from a real `Ctrl+Alt+e`
-//! chord. What separates them is that the platform composed a character for
-//! one and not the other, so a present `key_char` under Ctrl+Alt means AltGr.
+//! Both platform quirks live here, and they pull in opposite directions.
+//!
+//! Windows reports AltGr as Ctrl+Alt, so the modifiers alone cannot distinguish
+//! `AltGr+e` from a real `Ctrl+Alt+e` chord. What separates them is that the
+//! platform composed a character for one and not the other, so a present
+//! `key_char` under Ctrl+Alt means AltGr, and that character is what to send.
+//!
+//! macOS composes for Option as well, but there Option is the Meta a terminal
+//! needs, so the composed glyph is exactly what has to be discarded.
 
 use gpui::Keystroke;
 
@@ -44,8 +49,18 @@ pub fn clipboard_action(keystroke: &Keystroke) -> Option<Clipboard> {
     None
 }
 
+/// True where the platform composes a character for Option chords rather than
+/// reporting them as Meta. macOS does; nothing else Berth targets does.
+const OPTION_COMPOSES: bool = cfg!(target_os = "macos");
+
 /// Translate a keystroke, or `None` if it produces no terminal input.
 pub fn translate(keystroke: &Keystroke) -> Option<KeyEvent> {
+    translate_with(keystroke, OPTION_COMPOSES)
+}
+
+/// The platform rule is a parameter so both branches are tested everywhere,
+/// not only on the machine that happens to be running the suite.
+fn translate_with(keystroke: &Keystroke, option_composes: bool) -> Option<KeyEvent> {
     let m = &keystroke.modifiers;
     let mods = Modifiers {
         ctrl: m.control,
@@ -54,7 +69,18 @@ pub fn translate(keystroke: &Keystroke) -> Option<KeyEvent> {
         cmd: m.platform,
     };
 
-    let composed = keystroke.key_char.as_deref().filter(|s| !s.is_empty());
+    let mut composed = keystroke.key_char.as_deref().filter(|s| !s.is_empty());
+
+    // Option is Meta. macOS composes a glyph for an Option chord, so Option+b
+    // arrives as "b" with a key_char of "∫", and sending ESC plus that
+    // glyph is neither the chord the user meant nor a character they can type.
+    // A dead key is unaffected: its glyph lands on the next keystroke, which
+    // carries no modifier.
+    let option_as_meta = option_composes && m.alt && !m.control && !m.platform;
+    if option_as_meta {
+        composed = None;
+    }
+
     // Ctrl+Alt plus a composed character is AltGr, not a chord.
     let altgr = m.control && m.alt && composed.is_some();
 
@@ -90,7 +116,13 @@ pub fn translate(keystroke: &Keystroke) -> Option<KeyEvent> {
                     // keystroke; those take a different path.
                     return None;
                 }
-                Key::Char(c)
+                // Without the composed character there is nothing carrying the
+                // case, so Shift has to apply it.
+                if option_as_meta && m.shift {
+                    Key::Char(c.to_ascii_uppercase())
+                } else {
+                    Key::Char(c)
+                }
             }
         }
     };
@@ -128,6 +160,74 @@ mod tests {
             alt: true,
             ..Default::default()
         }
+    }
+
+    fn alt() -> GpuiModifiers {
+        GpuiModifiers {
+            alt: true,
+            ..Default::default()
+        }
+    }
+
+    /// What macOS actually delivers for Option+b: the key is the unmodified
+    /// letter, the composed character is the Option glyph.
+    #[test]
+    fn option_is_meta_and_drops_the_composed_glyph() {
+        let ev = translate_with(&keystroke("b", Some("\u{222b}"), alt()), true).unwrap();
+        assert_eq!(ev.key, Key::Char('b'), "Alt+b must stay a word motion");
+        assert!(ev.mods.alt);
+        assert!(!ev.altgr);
+    }
+
+    /// The same event on Windows, where the composed character is the point.
+    #[test]
+    fn alt_keeps_the_composed_character_where_option_does_not_compose() {
+        let ev = translate_with(&keystroke("b", Some("\u{222b}"), alt()), false).unwrap();
+        assert_eq!(ev.key, Key::Char('\u{222b}'));
+    }
+
+    #[test]
+    fn shift_carries_the_case_once_the_glyph_is_gone() {
+        let mods = GpuiModifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ev = translate_with(&keystroke("b", Some("\u{131}"), mods), true).unwrap();
+        assert_eq!(ev.key, Key::Char('B'));
+    }
+
+    /// Option is only Meta on its own. Cmd and Ctrl chords keep their meaning,
+    /// and macOS reports no composed character for either.
+    #[test]
+    fn the_meta_rule_does_not_reach_ctrl_or_cmd_chords() {
+        let ev = translate_with(&keystroke("e", Some("\u{20ac}"), ctrl_alt()), true).unwrap();
+        assert!(ev.altgr, "the AltGr rule is untouched by the Option rule");
+        assert_eq!(ev.key, Key::Char('\u{20ac}'));
+
+        let cmd_alt = GpuiModifiers {
+            alt: true,
+            platform: true,
+            ..Default::default()
+        };
+        let ev = translate_with(&keystroke("b", Some("\u{222b}"), cmd_alt), true).unwrap();
+        assert_eq!(ev.key, Key::Char('\u{222b}'));
+    }
+
+    /// A dead key resolves on the following keystroke, which has no modifier,
+    /// so the composed glyph still arrives.
+    #[test]
+    fn a_dead_key_sequence_survives_the_meta_rule() {
+        let ev = translate_with(&keystroke("e", Some("\u{e9}"), plain()), true).unwrap();
+        assert_eq!(ev.key, Key::Char('\u{e9}'));
+    }
+
+    /// Named keys never carried a composed character, on either platform.
+    #[test]
+    fn option_arrows_are_unaffected() {
+        let ev = translate_with(&keystroke("left", None, alt()), true).unwrap();
+        assert_eq!(ev.key, Key::Left);
+        assert!(ev.mods.alt);
     }
 
     #[test]
