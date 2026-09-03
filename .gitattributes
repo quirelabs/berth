@@ -1,0 +1,6 @@
+# The probe is embedded with include_str! and pushed verbatim to a POSIX
+# shell. A CRLF checkout on Windows would make the remote reject the shebang,
+# so every text file in the repo stays LF on disk.
+* text=auto eol=lf
+*.sh text eol=lf
+*.rs text eol=lf
