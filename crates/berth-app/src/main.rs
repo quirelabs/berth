@@ -1,7 +1,13 @@
 //! M0 spike: open a GPUI window and show what Berth knows before any
 //! connection exists. The SSH transport lands on top of this shell.
 
+mod bench;
+mod input;
+mod metrics;
+mod runtime;
+mod session;
 mod strings;
+mod terminal_view;
 mod theme;
 mod workspace;
 
@@ -27,9 +33,12 @@ fn main() {
                     title: Some(strings::APP_NAME.into()),
                     ..Default::default()
                 }),
+                // Frame throttling for an unfocused window would show up as
+                // render latency that the user would never actually see.
+                inactive_frame_interval: None,
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Workspace::load()),
+            |_, cx| cx.new(Workspace::new),
         );
 
         if let Err(error) = window {

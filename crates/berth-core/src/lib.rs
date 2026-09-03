@@ -7,6 +7,7 @@ pub mod error;
 pub mod forward;
 pub mod host;
 pub mod known_hosts;
+pub mod pty;
 pub mod session;
 pub mod transport;
 

@@ -13,6 +13,8 @@ use crate::agent::{Agent, identity_key};
 use crate::error::{Error, Result};
 use crate::host::Host;
 use crate::known_hosts::{TrustPolicy, Verdict, accepts, verify};
+use crate::pty::{Pty, PtyEvent};
+use crate::session::Session;
 
 /// Keepalive interval, matching the reconnect state machine.
 pub const KEEPALIVE: Duration = Duration::from_secs(15);
@@ -181,6 +183,34 @@ impl Connection {
         channel.data(stdin).await?;
         channel.eof().await?;
         drain(&mut channel).await
+    }
+
+    /// Open an interactive shell, attaching to `session`'s tmux session.
+    ///
+    /// `new-session -A` makes first connect and re-attach the same code path,
+    /// so reconnecting loses nothing and tmux repaints the grid.
+    pub async fn open_session(
+        &self,
+        session: &Session,
+    ) -> Result<(Pty, tokio::sync::mpsc::Receiver<PtyEvent>)> {
+        let channel = self.handle.channel_open_session().await?;
+        crate::pty::open(
+            channel,
+            Some(&session.attach_command()),
+            session.cols,
+            session.rows,
+        )
+        .await
+    }
+
+    /// Open a plain login shell, for servers without tmux.
+    pub async fn open_shell(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Pty, tokio::sync::mpsc::Receiver<PtyEvent>)> {
+        let channel = self.handle.channel_open_session().await?;
+        crate::pty::open(channel, None, cols, rows).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {

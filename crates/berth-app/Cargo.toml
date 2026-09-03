@@ -19,5 +19,6 @@ gpui.workspace = true
 gpui_platform.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+futures = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true

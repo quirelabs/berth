@@ -607,6 +607,7 @@ dependencies = [
  "berth-probe",
  "berth-term",
  "berth-timeline",
+ "futures",
  "gpui",
  "gpui_platform",
  "tokio",
