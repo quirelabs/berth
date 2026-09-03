@@ -29,6 +29,38 @@ use crate::metrics::{Histogram, KeystrokeLatency, LatencyReport};
 /// as long as it takes to feed bytes to the parser.
 pub type SharedTerminal = Arc<Mutex<Terminal>>;
 
+/// What the font system resolved, as opposed to what was requested.
+///
+/// The requested family is often not installed, and both Core Text and
+/// DirectWrite substitute silently rather than failing, so the request tells
+/// you nothing about what is being measured. gpui cannot name the face it
+/// landed on either: `get_font_for_id` returns the `Font` that was asked for,
+/// and `all_font_names` returns 11 entries on macOS, mostly gpui's own
+/// fallback stack, with none of the installed families in it.
+///
+/// So the face is identified by its metrics rather than by name. Two runs
+/// agreeing on all of these are using the same face whatever it is called, and
+/// `m` against `i` is the check that cannot be argued with: equal in every
+/// monospace face, unequal in a proportional one, which is the failure mode
+/// that makes a terminal grid quietly wrong.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontFacts {
+    pub advance_m: f32,
+    pub advance_i: f32,
+    pub units_per_em: u32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub cap_height: f32,
+    pub x_height: f32,
+}
+
+impl FontFacts {
+    /// True when `m` and `i` advance identically, as they must in a grid.
+    pub fn is_monospace(&self) -> bool {
+        (self.advance_m - self.advance_i).abs() < 0.01
+    }
+}
+
 pub struct TerminalView {
     terminal: SharedTerminal,
     pty: Option<Pty>,
@@ -53,6 +85,10 @@ pub struct TerminalView {
     /// between platforms, and a metric difference looks like a latency
     /// difference if it is not shown.
     pub resolved_cell: Option<CellSize>,
+    /// What the font system actually gave us, as opposed to what was asked
+    /// for. Reported by the benchmarks; see `FontFacts`.
+    pub resolved_font: Option<FontFacts>,
+
     /// The current local selection, if the user is dragging or has dragged.
     selection: Option<Selection>,
     /// Where a drag started, kept so the selection can be rebuilt as it moves.
@@ -83,6 +119,7 @@ impl TerminalView {
             latency: crate::metrics::LatencyReport::new(),
             bytes_in: 0,
             resolved_cell: None,
+            resolved_font: None,
             selection: None,
             drag_anchor: None,
             geometry: None,
@@ -306,6 +343,7 @@ pub struct PrepaintState {
     runs: Vec<CellRun>,
     background: Hsla,
     cell: CellSize,
+    font_facts: FontFacts,
     started: Instant,
 }
 
@@ -370,11 +408,28 @@ impl Element for TerminalElement {
         // Cell geometry comes from the font, exactly as Zed derives it.
         let font = self.style.font();
         let font_id = window.text_system().resolve_font(&font);
-        let advance = window
-            .text_system()
-            .advance(font_id, self.style.font_size_px(), 'm')
-            .map(|s| f32::from(s.width))
-            .unwrap_or(self.style.fallback_advance);
+        let size = self.style.font_size_px();
+        let advance_of = |ch: char| {
+            window
+                .text_system()
+                .advance(font_id, size, ch)
+                .map(|s| f32::from(s.width))
+                .unwrap_or(self.style.fallback_advance)
+        };
+        let advance = advance_of('m');
+
+        // A fingerprint of the face the platform actually chose, so two runs
+        // can be compared without either of them being able to name it.
+        let text = window.text_system();
+        let font_facts = FontFacts {
+            advance_m: advance,
+            advance_i: advance_of('i'),
+            units_per_em: text.units_per_em(font_id),
+            ascent: f32::from(text.ascent(font_id, size)),
+            descent: f32::from(text.descent(font_id, size)),
+            cap_height: f32::from(text.cap_height(font_id, size)),
+            x_height: f32::from(text.x_height(font_id, size)),
+        };
         let cell = CellSize::new(
             self.style.cell_rounding.apply(advance),
             self.style
@@ -408,6 +463,7 @@ impl Element for TerminalElement {
             runs,
             background,
             cell,
+            font_facts,
             started,
         }
     }
@@ -527,12 +583,14 @@ impl Element for TerminalElement {
         let painted_size = state.snapshot.size;
         let geometry = (origin, state.cell);
         let painted_cell = state.cell;
+        let painted_font = state.font_facts.clone();
         self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
             view.dirty = false;
             view.sync_remote_size(painted_size);
             view.geometry = Some(geometry);
             view.resolved_cell = Some(painted_cell);
+            view.resolved_font = Some(painted_font);
             // This frame carried the echoed glyph, so the local half of the
             // keystroke's journey ends now.
             if let Some((arrived, round_trip)) = view.echo_arrived.take() {
@@ -625,6 +683,23 @@ fn batch_runs(snapshot: &Snapshot) -> Vec<CellRun> {
 
 #[cfg(test)]
 mod tests {
+    /// The check the benchmark header leans on: a proportional face is the one
+    /// failure mode that makes every cell measurement meaningless.
+    #[test]
+    fn the_monospace_check_separates_a_grid_font_from_a_proportional_one() {
+        let facts = |m: f32, i: f32| FontFacts {
+            advance_m: m,
+            advance_i: i,
+            units_per_em: 2048,
+            ascent: 12.09,
+            descent: 3.03,
+            cap_height: 9.36,
+            x_height: 6.84,
+        };
+        assert!(facts(7.8, 7.8).is_monospace());
+        assert!(!facts(11.2, 3.61).is_monospace());
+    }
+
     use super::*;
     use berth_term::terminal::Terminal as CoreTerminal;
 

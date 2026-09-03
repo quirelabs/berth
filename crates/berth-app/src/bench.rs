@@ -125,13 +125,20 @@ pub struct Outcome {
 
 /// Platform and font facts, printed by both benchmarks.
 ///
-/// The font line matters most: JetBrains Mono is not installed everywhere, so
+/// The font lines matter most: JetBrains Mono is not installed everywhere, so
 /// the two platforms may be measuring different metrics entirely, and that
 /// would otherwise be invisible in a latency number.
+///
+/// Naming the requested family is not enough, because Core Text and DirectWrite
+/// both substitute silently for a family that is not installed. So this reports
+/// whether the request was honoured, which family the chain actually landed on,
+/// and the advance of `m` against `i`. That last pair is the one that cannot be
+/// argued with: they are equal in every monospace face, and a difference means
+/// the grid has been built on a proportional font.
 pub fn environment(view: &TerminalView) -> String {
     let style = view.style();
     let cell = view.resolved_cell;
-    format!(
+    let mut out = format!(
         "platform: {}
 font requested: {} at {} px, line height {}
 cell resolved: {}
@@ -144,7 +151,30 @@ cell resolved: {}
             Some(c) => format!("{:.2} x {:.2} px", c.width, c.height),
             None => "not painted yet".to_string(),
         }
-    )
+    );
+
+    match &view.resolved_font {
+        None => out.push_str("face: not painted yet\n"),
+        Some(facts) => {
+            out.push_str(&format!(
+                "face metrics: units/em {}, ascent {:.2} px, descent {:.2} px, \
+                 cap {:.2} px, x {:.2} px\n",
+                facts.units_per_em, facts.ascent, facts.descent, facts.cap_height, facts.x_height,
+            ));
+            out.push_str(&format!(
+                "monospace check: m {:.2} px, i {:.2} px, advance ratio {:.2} ({})\n",
+                facts.advance_m,
+                facts.advance_i,
+                facts.advance_m / style.font_size,
+                if facts.is_monospace() {
+                    "OK"
+                } else {
+                    "PROPORTIONAL, the grid is wrong and these numbers are not comparable"
+                },
+            ));
+        }
+    }
+    out
 }
 
 /// Type into the remote and report both halves of the latency separately.
