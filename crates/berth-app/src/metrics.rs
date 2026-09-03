@@ -13,8 +13,17 @@ pub const FRAME_BUDGET: Duration = Duration::from_millis(32);
 /// The spec's keystroke-to-glyph target, which applies to local render only.
 pub const RENDER_BUDGET: Duration = Duration::from_millis(16);
 
-/// Fixed-bucket histogram in milliseconds. Bucket `i` counts samples in
-/// `[i, i+1)` ms; everything at or above `BUCKETS-1` lands in the last bucket.
+/// Fixed-bucket histogram. Bucket `i` counts samples in
+/// `[i * BUCKET_MS, (i+1) * BUCKET_MS)`; everything at or above the top edge
+/// lands in the last bucket.
+///
+/// The buckets are a tenth of a millisecond because a whole millisecond is too
+/// coarse for the thing they feed. The missed-frame threshold is one refresh
+/// period plus the typical paint, and at 120 Hz that period is 8.3 ms, so a
+/// paint estimate rounded to a whole millisecond moved the threshold by more
+/// than a tenth of it. Memory is unchanged in character: still a fixed array,
+/// still no per-sample storage, because `view.frames` records every frame of a
+/// long-running session and must not grow.
 #[derive(Debug, Clone)]
 pub struct Histogram {
     buckets: Vec<u32>,
@@ -23,7 +32,15 @@ pub struct Histogram {
     max: Duration,
 }
 
-const BUCKETS: usize = 129;
+/// Bucket width. Also the precision of every percentile this reports.
+const BUCKET_MS: f64 = 0.1;
+/// The same width in microseconds. Bucketing is done in integers because
+/// `5.9 / 0.1` is 58.999... in binary and would file a sample one bucket low.
+const BUCKET_US: u128 = 100;
+/// Covering 0 to 129 ms, the same range as when buckets were 1 ms wide.
+const BUCKETS: usize = 1290;
+/// Bucket count per millisecond, for the one-line-per-millisecond display.
+const BUCKETS_PER_MS: usize = 10;
 
 impl Default for Histogram {
     fn default() -> Self {
@@ -42,8 +59,7 @@ impl Histogram {
     }
 
     pub fn record(&mut self, sample: Duration) {
-        let ms = sample.as_secs_f64() * 1000.0;
-        let index = (ms.floor().max(0.0) as usize).min(BUCKETS - 1);
+        let index = ((sample.as_micros() / BUCKET_US) as usize).min(BUCKETS - 1);
         self.buckets[index] += 1;
         self.count += 1;
         self.total += sample;
@@ -73,24 +89,24 @@ impl Histogram {
     /// The lower edge of the bucket containing the given quantile, in ms.
     /// Reported as a bucket edge rather than an interpolated value, so the
     /// number never claims more precision than the histogram has.
-    pub fn percentile_ms(&self, quantile: f64) -> u32 {
+    pub fn percentile_ms(&self, quantile: f64) -> f64 {
         if self.count == 0 {
-            return 0;
+            return 0.0;
         }
         let target = (quantile.clamp(0.0, 1.0) * self.count as f64).ceil() as u64;
         let mut seen = 0u64;
         for (index, bucket) in self.buckets.iter().enumerate() {
             seen += *bucket as u64;
             if seen >= target {
-                return index as u32;
+                return index as f64 * BUCKET_MS;
             }
         }
-        (BUCKETS - 1) as u32
+        (BUCKETS - 1) as f64 * BUCKET_MS
     }
 
     /// How many samples were at or above `limit`.
     pub fn over(&self, limit: Duration) -> u64 {
-        let cutoff = (limit.as_secs_f64() * 1000.0).floor() as usize;
+        let cutoff = (limit.as_micros() / BUCKET_US) as usize;
         self.buckets
             .iter()
             .enumerate()
@@ -112,7 +128,8 @@ impl Histogram {
     pub fn report(&self, title: &str, budget: Option<Duration>) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "{title}: {} frames, mean {:.1} ms, p50 {} ms, p95 {} ms, p99 {} ms, max {:.1} ms\n",
+            "{title}: {} frames, mean {:.1} ms, p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms, \
+             max {:.1} ms\n",
             self.count,
             self.mean().as_secs_f64() * 1000.0,
             self.percentile_ms(0.50),
@@ -129,13 +146,21 @@ impl Histogram {
             ));
         }
 
-        let peak = self.buckets.iter().copied().max().unwrap_or(0).max(1);
-        for (index, count) in self.buckets.iter().enumerate() {
+        // Drawn one line per millisecond, not one per bucket: the extra
+        // resolution is there for the arithmetic, not for a reader.
+        let per_ms: Vec<u32> = self
+            .buckets
+            .chunks(BUCKETS_PER_MS)
+            .map(|chunk| chunk.iter().sum())
+            .collect();
+        let peak = per_ms.iter().copied().max().unwrap_or(0).max(1);
+        let last = per_ms.len() - 1;
+        for (index, count) in per_ms.iter().enumerate() {
             if *count == 0 {
                 continue;
             }
             let width = (*count as f64 / peak as f64 * 40.0).round() as usize;
-            let label = if index == BUCKETS - 1 {
+            let label = if index == last {
                 format!(">={index}")
             } else {
                 format!("{index}")
@@ -246,7 +271,7 @@ impl LatencyReport {
         );
         out.push_str(&self.round_trip.report("round trip", None));
         out.push_str(&format!(
-            "\ntotal keystroke to glyph: mean {:.1} ms, p50 {} ms, p95 {} ms\n\
+            "\ntotal keystroke to glyph: mean {:.1} ms, p50 {:.1} ms, p95 {:.1} ms\n\
              within the {} ms local budget: {} of {}\n",
             self.total.mean().as_secs_f64() * 1000.0,
             self.total.percentile_ms(0.50),
@@ -263,7 +288,7 @@ impl LatencyReport {
              Local render is the wait for the next frame plus the paint. On a {refresh_hz:.0} Hz \
              display that wait is uniform over {period_ms:.1} ms whatever Berth does, so samples \
              above the {} ms budget are expected; a missed frame is not.\n\
-             Network round trip p50 {} ms is reported separately: it dominates the total a user \
+             Network round trip p50 {:.1} ms is reported separately: it dominates the total a user \
              feels, and it is not Berth's to fix.\n",
             paint.as_secs_f64() * 1000.0,
             if missed == 0 { "PASS" } else { "FAIL" },
@@ -287,7 +312,7 @@ mod tests {
         let h = Histogram::new();
         assert_eq!(h.count(), 0);
         assert_eq!(h.mean(), Duration::ZERO);
-        assert_eq!(h.percentile_ms(0.5), 0);
+        assert_eq!(h.percentile_ms(0.5), 0.0);
         assert!(h.within(FRAME_BUDGET));
     }
 
@@ -296,7 +321,35 @@ mod tests {
         let mut h = Histogram::new();
         h.record(ms(5));
         h.record(Duration::from_micros(5_900));
-        assert_eq!(h.buckets[5], 2, "5.0 and 5.9 ms both belong to bucket 5");
+        assert_eq!(h.buckets[50], 1, "5.0 ms belongs to the 5.0 bucket");
+        assert_eq!(h.buckets[59], 1, "5.9 ms is no longer in the same bucket");
+    }
+
+    /// The reason the buckets are a tenth of a millisecond: this is the paint
+    /// estimate, and rounding it to a whole millisecond moved the missed-frame
+    /// threshold by more than a tenth of a frame period at 120 Hz.
+    #[test]
+    fn a_sub_millisecond_median_is_reported_as_itself() {
+        let mut h = Histogram::new();
+        for _ in 0..10 {
+            h.record(Duration::from_micros(400));
+        }
+        assert_eq!(h.percentile_ms(0.50), 0.4);
+    }
+
+    #[test]
+    fn the_display_stays_one_line_per_millisecond() {
+        let mut h = Histogram::new();
+        h.record(Duration::from_micros(4_100));
+        h.record(Duration::from_micros(4_800));
+        let report = h.report("frames", None);
+        let bars: Vec<&str> = report.lines().filter(|l| l.contains('|')).collect();
+        assert_eq!(bars.len(), 1, "both samples are in the 4 ms row");
+        assert!(
+            bars[0].contains(" 2"),
+            "and the row counts both: {}",
+            bars[0]
+        );
     }
 
     #[test]
@@ -315,9 +368,9 @@ mod tests {
             h.record(ms(4));
         }
         h.record(ms(50));
-        assert_eq!(h.percentile_ms(0.50), 4);
-        assert_eq!(h.percentile_ms(0.99), 4);
-        assert_eq!(h.percentile_ms(1.0), 50);
+        assert_eq!(h.percentile_ms(0.50), 4.0);
+        assert_eq!(h.percentile_ms(0.99), 4.0);
+        assert_eq!(h.percentile_ms(1.0), 50.0);
     }
 
     #[test]

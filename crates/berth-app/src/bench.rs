@@ -86,8 +86,9 @@ pub async fn run_cat(
         let env = environment(view);
         let report = view.frames.report("frame build", Some(FRAME_BUDGET));
         let p99 = view.frames.percentile_ms(0.99);
+        let ceiling = f64::from(CAT_P99_CEILING_MS);
         let no_freeze = view.frames.within(FRAME_BUDGET);
-        let batching_intact = p99 <= CAT_P99_CEILING_MS;
+        let batching_intact = p99 <= ceiling;
         // Byte count reported so the frame numbers can be checked against real
         // work: a histogram gathered over an idle window would look excellent
         // too. Note that tmux re-renders rather than forwarding verbatim, so
@@ -95,7 +96,7 @@ pub async fn run_cat(
         let text = format!(
             "{env}{report}bytes through the parser: {} ({:.1} MB over {} frames)\n\n\
              no frame at or above {} ms: {}\n\
-             p99 frame time {p99} ms against a {CAT_P99_CEILING_MS} ms regression \
+             p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms regression \
              ceiling: {}\n",
             view.bytes_in,
             view.bytes_in as f64 / 1024.0 / 1024.0,
@@ -186,8 +187,11 @@ pub async fn run_keys(
     view.read_with(cx, |view, _| {
         // Typical paint cost, from the frames recorded while typing. The median
         // rather than a tail percentile: one slow outlier must not inflate the
-        // threshold and turn a genuinely missed frame into a pass.
-        let paint = Duration::from_millis(view.frames.percentile_ms(0.50).max(1) as u64);
+        // threshold and turn a genuinely missed frame into a pass. Taken at the
+        // histogram's full resolution and not rounded up to a millisecond: a
+        // paint here is well under one, and rounding it up loosened the
+        // threshold by more than a tenth of a frame period at 120 Hz.
+        let paint = Duration::from_secs_f64(view.frames.percentile_ms(0.50) / 1000.0);
         Outcome {
             text: format!(
                 "{}{}",
