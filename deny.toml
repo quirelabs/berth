@@ -4,6 +4,24 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # Marvin Attack: timing sidechannel in RSA private-key operations.
+    # Berth never performs one. Private keys stay in the OS agent, which does
+    # all signing; the rsa crate is reached only for public-key verification of
+    # host keys and for parsing. Revisit immediately if Berth ever gains the
+    # ability to read a private key file, which v1 explicitly forbids.
+    { id = "RUSTSEC-2023-0071", reason = "no client-side RSA private-key operations; the agent signs" },
+
+    # paste is an unmaintained proc-macro. It runs at build time and ships no
+    # runtime code. Transitive, and not something Berth can replace.
+    { id = "RUSTSEC-2024-0436", reason = "build-time proc-macro, no runtime surface" },
+
+    # rustybuzz and ttf-parser are unmaintained, and both arrive through gpui's
+    # text shaping and SVG stack. They are Zed's dependencies to replace, not
+    # Berth's. Tracked so that a gpui bump is the fix.
+    { id = "RUSTSEC-2026-0206", reason = "transitive through gpui text shaping" },
+    { id = "RUSTSEC-2026-0192", reason = "transitive through gpui font parsing" },
+]
 
 [licenses]
 version = 2
@@ -19,15 +37,31 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
+    "Unlicense",
+    # libbz2-rs-sys, pulled in transitively. Permissive, BSD-like.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.9
+
+# Berth's own crates carry no license field because the project is private and
+# unpublished. Without this they are reported as unlicensed.
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal crates are path dependencies with no version, which reads
+# as a wildcard. Third-party wildcards are still denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 # gpui is consumed from the Zed monorepo; see the pin in the workspace manifest.
-allow-git = ["https://github.com/zed-industries/zed"]
+# The other two are forks gpui itself depends on, so they come along with it.
+allow-git = [
+    "https://github.com/zed-industries/zed",
+    "https://github.com/zed-industries/wasm_thread",
+    "https://github.com/zed-industries/font-kit",
+]
