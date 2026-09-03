@@ -18,5 +18,9 @@ dirs.workspace = true
 shellexpand.workspace = true
 
 [dev-dependencies]
+# Live tests assert on the rendered grid, not on raw bytes. berth-term does not
+# depend on berth-core, so this creates no cycle.
+berth-term.workspace = true
+berth-probe.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

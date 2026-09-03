@@ -33,14 +33,16 @@ pub async fn connect(
     slug: String,
     cols: u16,
     rows: u16,
+    palette: berth_term::terminal::Palette,
 ) -> berth_core::Result<Connected> {
     let connection = Connection::connect(&host, TrustPolicy::KnownHostsOnly).await?;
     let session = Session::new(slug, cols, rows);
     let (pty, events) = connection.open_session(&session).await?;
-    let terminal: SharedTerminal = Arc::new(Mutex::new(Terminal::new(
-        TermSize::new(cols, rows),
-        CellSize::new(8.0, 16.0),
-    )));
+    // The palette comes from TerminalStyle, so every visual constant stays in
+    // one struct rather than half of them living in berth-term's defaults.
+    let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
+    term.set_palette(palette);
+    let terminal: SharedTerminal = Arc::new(Mutex::new(term));
     Ok(Connected {
         connection: Arc::new(connection),
         pty,
@@ -63,31 +65,7 @@ pub async fn pump(
             break;
         };
 
-        let mut batch = vec![first];
-        let mut closed = matches!(batch[0], PtyEvent::Closed);
-
-        // Take whatever is *already* queued, but never wait for more.
-        //
-        // Waiting out a fixed window here would add its full length to every
-        // keystroke echo, which is a lone small event with nothing to batch it
-        // with. Draining only what is pending keeps bursts batched, because a
-        // firehose refills the queue faster than this loop empties it, while a
-        // single echo goes through immediately. `cx.notify()` already collapses
-        // repaints to one per frame, so painting more often than the coalescing
-        // window costs no extra frames.
-        while !closed && batch.len() < COALESCE_MAX_EVENTS {
-            match events.try_recv() {
-                Ok(event) => {
-                    closed = matches!(event, PtyEvent::Closed);
-                    batch.push(event);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    closed = true;
-                    break;
-                }
-            }
-        }
+        let (batch, closed) = take_batch(first, &mut events);
 
         let updated = view.update(cx, |view, cx| {
             for event in batch {
@@ -99,6 +77,39 @@ pub async fn pump(
             break;
         }
     }
+}
+
+/// Take `first` plus whatever is *already* queued, and never wait for more.
+///
+/// This is the whole batching policy, extracted so it can be tested without a
+/// window. Two properties matter and they pull in opposite directions:
+///
+/// - A lone event must go through immediately. Waiting out a fixed window, as
+///   an earlier version did, adds the window's full length to every keystroke
+///   echo, which has nothing to batch against.
+/// - A burst must still batch. It does, because a firehose refills the queue
+///   faster than this drains it, so `try_recv` keeps returning until the cap.
+///
+/// Painting more often than a coalescing window costs nothing, because
+/// `cx.notify()` already collapses repaints to one per frame.
+fn take_batch(first: PtyEvent, events: &mut mpsc::Receiver<PtyEvent>) -> (Vec<PtyEvent>, bool) {
+    let mut closed = matches!(first, PtyEvent::Closed);
+    let mut batch = vec![first];
+
+    while !closed && batch.len() < COALESCE_MAX_EVENTS {
+        match events.try_recv() {
+            Ok(event) => {
+                closed = matches!(event, PtyEvent::Closed);
+                batch.push(event);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    (batch, closed)
 }
 
 /// Start the pump for a freshly connected session.
@@ -129,5 +140,75 @@ mod tests {
     #[test]
     fn the_event_cap_matches_zeds() {
         assert_eq!(COALESCE_MAX_EVENTS, 100);
+    }
+
+    fn output(n: u8) -> PtyEvent {
+        PtyEvent::Output(vec![n])
+    }
+
+    /// Regression guard for the keystroke-latency bug: a lone echo must not be
+    /// held back waiting for company that is not coming.
+    #[tokio::test]
+    async fn a_lone_event_is_taken_on_its_own() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(output(1)).await.unwrap();
+        let first = rx.recv().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let (batch, closed) = take_batch(first, &mut rx);
+
+        assert_eq!(batch.len(), 1);
+        assert!(!closed);
+        assert!(
+            started.elapsed() < Duration::from_millis(1),
+            "took {:?}; a lone event must not wait on a timer",
+            started.elapsed()
+        );
+    }
+
+    /// Regression guard for the other direction: removing the timer must not
+    /// cost batching, or the 50 MB cat frame budget goes with it.
+    #[tokio::test]
+    async fn a_burst_is_batched_in_one_take() {
+        let (tx, mut rx) = mpsc::channel(64);
+        for i in 0..50 {
+            tx.send(output(i)).await.unwrap();
+        }
+        let first = rx.recv().await.unwrap();
+        let (batch, _) = take_batch(first, &mut rx);
+        assert_eq!(batch.len(), 50, "a queued burst must come out in one batch");
+    }
+
+    #[tokio::test]
+    async fn a_batch_never_exceeds_the_cap() {
+        let (tx, mut rx) = mpsc::channel(COALESCE_MAX_EVENTS * 2);
+        for i in 0..(COALESCE_MAX_EVENTS + 40) {
+            tx.send(output(i as u8)).await.unwrap();
+        }
+        let first = rx.recv().await.unwrap();
+        let (batch, _) = take_batch(first, &mut rx);
+        assert_eq!(batch.len(), COALESCE_MAX_EVENTS);
+    }
+
+    #[tokio::test]
+    async fn a_close_ends_the_batch_and_is_reported() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(output(1)).await.unwrap();
+        tx.send(PtyEvent::Closed).await.unwrap();
+        tx.send(output(2)).await.unwrap();
+        let first = rx.recv().await.unwrap();
+        let (batch, closed) = take_batch(first, &mut rx);
+        assert!(closed);
+        assert_eq!(batch.len(), 2, "nothing is taken past the close");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sender_reports_closed() {
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.send(output(1)).await.unwrap();
+        let first = rx.recv().await.unwrap();
+        drop(tx);
+        let (_, closed) = take_batch(first, &mut rx);
+        assert!(closed);
     }
 }

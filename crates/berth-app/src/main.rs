@@ -7,6 +7,7 @@ mod metrics;
 mod runtime;
 mod session;
 mod strings;
+mod terminal_style;
 mod terminal_view;
 mod theme;
 mod workspace;

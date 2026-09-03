@@ -13,6 +13,7 @@ use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
 use std::sync::{Arc, Mutex};
 
+use crate::shell::{Scanner, ShellEvent};
 use crate::size::{CellSize, TermSize};
 
 /// Local scrollback. tmux keeps far more on the remote.
@@ -99,6 +100,60 @@ impl Snapshot {
     }
 }
 
+/// A rectangular-by-rows selection: from one cell to another, following the
+/// text as it reads rather than as a box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub start_line: u16,
+    pub start_column: u16,
+    pub end_line: u16,
+    pub end_column: u16,
+}
+
+impl Selection {
+    pub fn new(start_line: u16, start_column: u16, end_line: u16, end_column: u16) -> Self {
+        Self {
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        }
+    }
+
+    /// Put the anchor before the head, so dragging upwards or leftwards
+    /// selects the same text as dragging the other way.
+    pub fn normalised(self) -> Self {
+        let before = (self.start_line, self.start_column) <= (self.end_line, self.end_column);
+        if before {
+            self
+        } else {
+            Self {
+                start_line: self.end_line,
+                start_column: self.end_column,
+                end_line: self.start_line,
+                end_column: self.start_column,
+            }
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.start_line == self.end_line && self.start_column == self.end_column
+    }
+
+    fn contains(self, line: u16, column: u16) -> bool {
+        if line < self.start_line || line > self.end_line {
+            return false;
+        }
+        if line == self.start_line && column < self.start_column {
+            return false;
+        }
+        if line == self.end_line && column > self.end_column {
+            return false;
+        }
+        true
+    }
+}
+
 pub struct Terminal {
     term: Term<Listener>,
     parser: Processor,
@@ -108,6 +163,9 @@ pub struct Terminal {
     palette: Palette,
     /// Bumped whenever output changes the grid, so the renderer can skip work.
     revision: u64,
+    scanner: Scanner,
+    shell_events: Vec<ShellEvent>,
+    seen_shell_marker: bool,
 }
 
 impl Terminal {
@@ -126,7 +184,18 @@ impl Terminal {
             cell_size,
             palette: Palette::default(),
             revision: 0,
+            scanner: Scanner::new(),
+            shell_events: Vec::new(),
+            seen_shell_marker: false,
         }
+    }
+
+    /// Replace the colour palette. Owned by the app so every visual constant
+    /// lives in one struct there; this crate only needs somewhere to resolve
+    /// indexed and named colours against.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn size(&self) -> TermSize {
@@ -138,12 +207,40 @@ impl Terminal {
     }
 
     /// Feed raw PTY bytes to the parser.
+    ///
+    /// OSC 133 markers are scanned out as the stream goes past. Bytes are fed
+    /// to alacritty in the same order and with nothing removed; the scanner
+    /// only observes. Splitting at each marker is what lets an event record the
+    /// cursor row at that exact point rather than at the end of the chunk.
     pub fn advance(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        self.parser.advance(&mut self.term, bytes);
+        for piece in self.scanner.scan(bytes) {
+            match piece {
+                crate::shell::Piece::Bytes(bytes) => self.parser.advance(&mut self.term, bytes),
+                crate::shell::Piece::Marker(kind) => {
+                    let line = self.term.grid().cursor.point.line.0.max(0) as u16;
+                    self.seen_shell_marker = true;
+                    self.shell_events.push(ShellEvent { kind, line });
+                }
+            }
+        }
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Shell integration markers seen since the last call.
+    ///
+    /// Nothing consumes these yet. M1 uses them for command blocks and a styled
+    /// prompt row; M3's timeline uses `CommandEnd` for exit codes.
+    pub fn drain_shell_events(&mut self) -> Vec<ShellEvent> {
+        std::mem::take(&mut self.shell_events)
+    }
+
+    /// Whether the remote has shell integration sourced. Until a marker has
+    /// been seen, Berth cannot know command boundaries and the UI must say so.
+    pub fn has_shell_integration(&self) -> bool {
+        self.seen_shell_marker
     }
 
     /// Events alacritty raised since the last call, such as title changes.
@@ -169,6 +266,52 @@ impl Terminal {
     pub fn application_cursor(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// True while the remote wants mouse events. Clicks must then be forwarded
+    /// rather than used to start a local selection.
+    pub fn mouse_reporting(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// True when the remote's line editor has asked for bracketed paste.
+    pub fn bracketed_paste(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// The text inside a selection, as displayed.
+    ///
+    /// Trailing blanks on each row are dropped, because a grid row is padded
+    /// out to its full width and copying that padding gives a paste full of
+    /// spaces.
+    pub fn selection_text(&self, selection: Selection) -> String {
+        let selection = selection.normalised();
+        let mut out = String::new();
+        let mut row = String::new();
+        let mut current_line: Option<u16> = None;
+
+        for cell in self.snapshot().cells {
+            if !selection.contains(cell.line, cell.column) {
+                continue;
+            }
+            match current_line {
+                Some(line) if line == cell.line => {}
+                Some(_) => {
+                    out.push_str(row.trim_end());
+                    out.push('\n');
+                    row.clear();
+                }
+                None => {}
+            }
+            current_line = Some(cell.line);
+            row.push(cell.c);
+        }
+        if current_line.is_some() {
+            out.push_str(row.trim_end());
+        }
+        out
     }
 
     /// Build the frame's render data. The only place the grid is read.
@@ -551,6 +694,113 @@ mod tests {
         }
         let snap = t.snapshot();
         assert!(!snap.is_scrolled_back(), "the view follows new output");
+    }
+
+    #[test]
+    fn shell_events_carry_the_row_they_landed_on() {
+        use crate::shell::ShellEventKind;
+        let mut t = terminal();
+        // Prompt on row 0, command runs, output on row 1, end on row 2.
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n");
+        t.advance(b"\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+
+        let events = t.drain_shell_events();
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ShellEventKind::PromptStart,
+                ShellEventKind::CommandStart,
+                ShellEventKind::OutputStart,
+                ShellEventKind::CommandEnd { exit_code: Some(0) },
+            ]
+        );
+        assert_eq!(events[0].line, 0, "prompt starts on the first row");
+        assert_eq!(events[1].line, 0, "command starts on the prompt row");
+        assert_eq!(events[2].line, 1, "output starts on the next row");
+        assert_eq!(events[3].line, 2);
+    }
+
+    #[test]
+    fn draining_shell_events_clears_them() {
+        let mut t = terminal();
+        t.advance(b"\x1b]133;A\x07");
+        assert_eq!(t.drain_shell_events().len(), 1);
+        assert!(t.drain_shell_events().is_empty());
+    }
+
+    #[test]
+    fn shell_integration_is_only_reported_once_a_marker_arrives() {
+        let mut t = terminal();
+        assert!(!t.has_shell_integration());
+        t.advance(b"just output\r\n");
+        assert!(!t.has_shell_integration());
+        t.advance(b"\x1b]133;A\x07");
+        assert!(t.has_shell_integration());
+    }
+
+    /// The markers must not end up drawn on screen.
+    #[test]
+    fn markers_leave_no_visible_text() {
+        let mut t = terminal();
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let text = t.visible_text();
+        assert!(!text.contains("133"), "markers must not render: {text:?}");
+        assert!(text.contains('$'));
+    }
+
+    #[test]
+    fn mouse_reporting_is_detected_and_released() {
+        let mut t = terminal();
+        assert!(!t.mouse_reporting());
+        t.advance(b"\x1b[?1000h");
+        assert!(t.mouse_reporting());
+        t.advance(b"\x1b[?1000l");
+        assert!(!t.mouse_reporting());
+    }
+
+    #[test]
+    fn bracketed_paste_mode_is_detected() {
+        let mut t = terminal();
+        assert!(!t.bracketed_paste());
+        t.advance(b"\x1b[?2004h");
+        assert!(t.bracketed_paste());
+        t.advance(b"\x1b[?2004l");
+        assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn selection_returns_the_text_on_screen() {
+        let mut t = terminal();
+        t.advance(b"hello world");
+        let text = t.selection_text(Selection::new(0, 0, 0, 4));
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn selection_spans_rows_and_drops_row_padding() {
+        let mut t = terminal();
+        t.advance(b"ab\r\ncd");
+        let text = t.selection_text(Selection::new(0, 0, 1, 19));
+        assert_eq!(text, "ab\ncd", "trailing grid padding must not be copied");
+    }
+
+    #[test]
+    fn a_backwards_selection_reads_the_same() {
+        let mut t = terminal();
+        t.advance(b"hello");
+        assert_eq!(
+            t.selection_text(Selection::new(0, 4, 0, 0)),
+            t.selection_text(Selection::new(0, 0, 0, 4))
+        );
+    }
+
+    #[test]
+    fn an_empty_selection_yields_one_cell() {
+        let mut t = terminal();
+        t.advance(b"hello");
+        assert!(Selection::new(0, 0, 0, 0).is_empty());
+        assert_eq!(t.selection_text(Selection::new(0, 1, 0, 1)), "e");
     }
 
     #[test]

@@ -620,6 +620,8 @@ name = "berth-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "berth-probe",
+ "berth-term",
  "dirs",
  "notify",
  "proptest",

@@ -30,12 +30,18 @@ impl Session {
 
     /// `new-session -A` attaches if the session exists and creates it if not,
     /// which makes reconnect and first connect the same code path.
+    ///
+    /// `allow-passthrough` is set on this session first, because tmux drops
+    /// OSC sequences it does not recognise and shell integration markers
+    /// otherwise never reach Berth at all (measured on tmux 3.4). The option is
+    /// set per session rather than globally, so nothing about the user's other
+    /// tmux sessions changes, and it disappears with the session.
     pub fn attach_command(&self) -> String {
+        let name = shell_quote(&self.tmux_name());
         format!(
-            "tmux -u new-session -A -s {} -x {} -y {}",
-            shell_quote(&self.tmux_name()),
-            self.cols,
-            self.rows
+            "tmux -u new-session -A -s {name} -x {} -y {} \\; \
+             set-option -t {name} allow-passthrough on",
+            self.cols, self.rows
         )
     }
 
@@ -76,9 +82,25 @@ mod tests {
     #[test]
     fn attach_command_matches_the_spec() {
         let s = Session::new("main", 120, 40);
-        assert_eq!(
-            s.attach_command(),
-            "tmux -u new-session -A -s 'berth/main' -x 120 -y 40"
+        let command = s.attach_command();
+        assert!(
+            command.starts_with("tmux -u new-session -A -s 'berth/main' -x 120 -y 40"),
+            "{command}"
+        );
+    }
+
+    /// Without this, tmux swallows the shell integration markers entirely.
+    #[test]
+    fn the_attach_enables_passthrough_for_this_session_only() {
+        let command = Session::new("main", 80, 24).attach_command();
+        assert!(command.contains("allow-passthrough on"), "{command}");
+        assert!(
+            command.contains("-t 'berth/main'"),
+            "must target this session, not global: {command}"
+        );
+        assert!(
+            !command.contains("set-option -g"),
+            "must not change the user's global tmux options: {command}"
         );
     }
 

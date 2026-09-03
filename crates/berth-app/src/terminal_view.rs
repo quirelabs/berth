@@ -10,16 +10,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable, Font, FontFeatures,
-    FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement,
-    IntoElement, LayoutId, ParentElement, Pixels, SharedString, StrikethroughStyle, Style, Styled,
-    TextAlign, TextRun, UnderlineStyle, Window, fill, point, px, size,
+    Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable, FontStyle, FontWeight,
+    GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
+    ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Style, Styled, TextAlign,
+    TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 
+use crate::terminal_style::{CursorShape, TerminalStyle};
 use berth_core::pty::{Pty, PtyEvent};
 use berth_term::size::{CellSize, TermSize};
+use berth_term::terminal::Selection;
 use berth_term::terminal::{Rgb, Snapshot};
-use berth_term::{KeyEvent, Terminal};
+use berth_term::{KeyEvent, MouseButton as TermButton, Terminal};
 
 use crate::metrics::{Histogram, KeystrokeLatency, LatencyReport};
 
@@ -31,8 +33,7 @@ pub struct TerminalView {
     terminal: SharedTerminal,
     pty: Option<Pty>,
     focus: FocusHandle,
-    font_family: SharedString,
-    font_size: Pixels,
+    style: TerminalStyle,
     /// Frame build times, the basis of the heavy-output acceptance test.
     pub frames: Histogram,
     /// Set when the pump has seen output that is not yet painted.
@@ -47,22 +48,28 @@ pub struct TerminalView {
     pub latency: LatencyReport,
     /// Bytes fed to the parser, so throughput claims can be checked.
     pub bytes_in: u64,
+    /// The current local selection, if the user is dragging or has dragged.
+    selection: Option<Selection>,
+    /// Where a drag started, kept so the selection can be rebuilt as it moves.
+    drag_anchor: Option<(u16, u16)>,
+    /// Grid origin and cell size from the last paint, so a mouse position can
+    /// be turned into a cell. Set during paint because only the element knows
+    /// the laid-out bounds.
+    geometry: Option<(Point<Pixels>, CellSize)>,
 }
 
 impl TerminalView {
     pub fn new(
         terminal: SharedTerminal,
         pty: Option<Pty>,
-        font_family: impl Into<SharedString>,
-        font_size: f32,
+        style: TerminalStyle,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             terminal,
             pty,
             focus: cx.focus_handle(),
-            font_family: font_family.into(),
-            font_size: px(font_size),
+            style,
             frames: Histogram::new(),
             dirty: false,
             last_sent_size: None,
@@ -70,6 +77,9 @@ impl TerminalView {
             echo_arrived: None,
             latency: crate::metrics::LatencyReport::new(),
             bytes_in: 0,
+            selection: None,
+            drag_anchor: None,
+            geometry: None,
         }
     }
 
@@ -122,14 +132,87 @@ impl TerminalView {
         });
     }
 
-    fn font(&self) -> Font {
-        Font {
-            family: self.font_family.clone(),
-            features: FontFeatures::default(),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-            fallbacks: None,
+    /// Which cell a window position falls on, clamped to the grid.
+    fn cell_at(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
+        let (origin, cell) = self.geometry?;
+        let column = ((f32::from(position.x) - f32::from(origin.x)) / cell.width).floor();
+        let line = ((f32::from(position.y) - f32::from(origin.y)) / cell.height).floor();
+        Some((
+            line.max(0.0).min(u16::MAX as f32) as u16,
+            column.max(0.0).min(u16::MAX as f32) as u16,
+        ))
+    }
+
+    /// True when the remote asked for mouse events, in which case a click
+    /// belongs to the program rather than to local selection.
+    fn forwards_mouse(&self) -> bool {
+        self.terminal
+            .lock()
+            .map(|t| t.mouse_reporting())
+            .unwrap_or(false)
+    }
+
+    fn on_mouse_down(&mut self, position: Point<Pixels>) {
+        let Some((line, column)) = self.cell_at(position) else {
+            return;
+        };
+        if self.forwards_mouse() {
+            self.send_mouse(TermButton::Left, column, line, true);
+            return;
         }
+        self.drag_anchor = Some((line, column));
+        self.selection = None;
+    }
+
+    fn on_mouse_drag(&mut self, position: Point<Pixels>) {
+        if self.forwards_mouse() {
+            return;
+        }
+        let (Some((anchor_line, anchor_column)), Some((line, column))) =
+            (self.drag_anchor, self.cell_at(position))
+        else {
+            return;
+        };
+        self.selection = Some(Selection::new(anchor_line, anchor_column, line, column));
+    }
+
+    fn on_mouse_up(&mut self, position: Point<Pixels>) {
+        if self.forwards_mouse() {
+            if let Some((line, column)) = self.cell_at(position) {
+                self.send_mouse(TermButton::Left, column, line, false);
+            }
+            return;
+        }
+        self.drag_anchor = None;
+    }
+
+    fn send_mouse(&self, button: TermButton, column: u16, line: u16, pressed: bool) {
+        let Some(pty) = self.pty.clone() else { return };
+        let bytes = berth_term::mouse_sgr(button, column, line, pressed);
+        crate::runtime::handle().spawn(async move {
+            pty.write(bytes).await;
+        });
+    }
+
+    /// The selected text, for copying.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let text = self.terminal.lock().ok()?.selection_text(selection);
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Paste, honouring the remote's bracketed paste mode.
+    pub fn paste(&self, text: &str) {
+        let bracketed = self
+            .terminal
+            .lock()
+            .map(|t| t.bracketed_paste())
+            .unwrap_or(false);
+        let Some(pty) = self.pty.clone() else { return };
+        let bytes = berth_term::paste_bytes(text, bracketed);
+        crate::runtime::handle().spawn(async move {
+            pty.write(bytes).await;
+        });
     }
 }
 
@@ -143,8 +226,7 @@ impl gpui::Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let element = TerminalElement {
             view: cx.entity(),
-            font: self.font(),
-            font_size: self.font_size,
+            style: self.style.clone(),
         };
         gpui::div()
             .track_focus(&self.focus)
@@ -152,9 +234,50 @@ impl gpui::Render for TerminalView {
             .size_full()
             .on_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    if let Some(key_event) = crate::input::translate(&event.keystroke) {
-                        this.send_key(key_event, cx);
+                    // Copy and paste are chords the terminal never sees; a
+                    // bare Ctrl+C must still reach the remote as an interrupt,
+                    // which is why copy is Ctrl+Shift+C.
+                    match crate::input::clipboard_action(&event.keystroke) {
+                        Some(crate::input::Clipboard::Copy) => {
+                            if let Some(text) = this.selected_text() {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                            }
+                        }
+                        Some(crate::input::Clipboard::Paste) => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                this.paste(&text);
+                            }
+                        }
+                        None => {
+                            if let Some(key_event) = crate::input::translate(&event.keystroke) {
+                                this.send_key(key_event, cx);
+                            }
+                        }
                     }
+                }),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                    this.on_mouse_down(event.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    if event.dragging() {
+                        this.on_mouse_drag(event.position);
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, _window, cx| {
+                    this.on_mouse_up(event.position);
+                    cx.notify();
                 }),
             )
             .child(element)
@@ -163,13 +286,13 @@ impl gpui::Render for TerminalView {
 
 pub struct TerminalElement {
     view: Entity<TerminalView>,
-    font: Font,
-    font_size: Pixels,
+    style: TerminalStyle,
 }
 
 /// Everything painting needs, computed during prepaint.
 pub struct PrepaintState {
     snapshot: Snapshot,
+    selection: Option<Selection>,
     runs: Vec<CellRun>,
     background: Hsla,
     cell: CellSize,
@@ -235,18 +358,25 @@ impl Element for TerminalElement {
         let started = Instant::now();
 
         // Cell geometry comes from the font, exactly as Zed derives it.
-        let font_id = window.text_system().resolve_font(&self.font);
+        let font = self.style.font();
+        let font_id = window.text_system().resolve_font(&font);
         let advance = window
             .text_system()
-            .advance(font_id, self.font_size, 'm')
-            .map(|s| s.width)
-            .unwrap_or(px(8.0));
-        let line_height = self.font_size * 1.3;
-        let cell = CellSize::new(f32::from(advance), f32::from(line_height));
+            .advance(font_id, self.style.font_size_px(), 'm')
+            .map(|s| f32::from(s.width))
+            .unwrap_or(self.style.fallback_advance);
+        let cell = CellSize::new(
+            self.style.cell_rounding.apply(advance),
+            self.style
+                .cell_rounding
+                .apply(f32::from(self.style.line_height_px())),
+        );
 
+        // Padding is inside the pane, so the grid is measured against what is
+        // left after it.
         let size = TermSize::from_pixels(
-            f32::from(bounds.size.width),
-            f32::from(bounds.size.height),
+            f32::from(bounds.size.width) - self.style.padding_x * 2.0,
+            f32::from(bounds.size.height) - self.style.padding_y * 2.0,
             cell,
         );
 
@@ -258,17 +388,13 @@ impl Element for TerminalElement {
             term.snapshot()
         };
 
+        let selection = self.view.read(cx).selection;
         let runs = batch_runs(&snapshot);
-        let background = hsla(
-            snapshot
-                .cells
-                .first()
-                .map(|_| Rgb::new(0x10, 0x10, 0x12))
-                .unwrap_or(Rgb::new(0x10, 0x10, 0x12)),
-        );
+        let background = self.style.colour(self.style.background);
 
         PrepaintState {
             snapshot,
+            selection,
             runs,
             background,
             cell,
@@ -288,7 +414,10 @@ impl Element for TerminalElement {
     ) {
         let cell_w = px(state.cell.width);
         let cell_h = px(state.cell.height);
-        let origin = bounds.origin;
+        let origin = point(
+            bounds.origin.x + px(self.style.padding_x),
+            bounds.origin.y + px(self.style.padding_y),
+        );
 
         window.paint_quad(fill(bounds, state.background));
 
@@ -306,9 +435,27 @@ impl Element for TerminalElement {
             window.paint_quad(fill(Bounds::new(at, size(cell_w, cell_h)), colour));
         }
 
+        // Selection sits above the cell backgrounds and below the glyphs, so
+        // the text under it stays readable.
+        if let Some(selection) = state.selection.map(Selection::normalised)
+            && !selection.is_empty()
+        {
+            let colour = self.style.selection_colour();
+            for cell in &state.snapshot.cells {
+                if !selection_covers(selection, cell.line, cell.column) {
+                    continue;
+                }
+                let at = point(
+                    origin.x + cell_w * cell.column as f32,
+                    origin.y + cell_h * cell.line as f32,
+                );
+                window.paint_quad(fill(Bounds::new(at, size(cell_w, cell_h)), colour));
+            }
+        }
+
         for run in &state.runs {
             let text: SharedString = run.text.clone().into();
-            let mut font = self.font.clone();
+            let mut font = self.style.font();
             if run.bold {
                 font.weight = FontWeight::BOLD;
             }
@@ -321,12 +468,12 @@ impl Element for TerminalElement {
                 color: run.fg,
                 background_color: None,
                 underline: run.underline.then(|| UnderlineStyle {
-                    thickness: px(1.0),
+                    thickness: px(self.style.underline_thickness),
                     color: Some(run.fg),
                     wavy: false,
                 }),
                 strikethrough: run.strikethrough.then(|| StrikethroughStyle {
-                    thickness: px(1.0),
+                    thickness: px(self.style.strikethrough_thickness),
                     color: Some(run.fg),
                 }),
             };
@@ -338,7 +485,7 @@ impl Element for TerminalElement {
             // makes a proportional fallback font still line up in the grid.
             let shaped = window.text_system().shape_line(
                 text,
-                self.font_size,
+                self.style.font_size_px(),
                 std::slice::from_ref(&text_run),
                 Some(cell_w),
             );
@@ -346,22 +493,34 @@ impl Element for TerminalElement {
         }
 
         if state.snapshot.cursor.visible && !state.snapshot.is_scrolled_back() {
+            let cursor = &self.style.cursor;
             let at = point(
                 origin.x + cell_w * state.snapshot.cursor.column as f32,
                 origin.y + cell_h * state.snapshot.cursor.line as f32,
             );
+            let thickness = px(cursor.thickness);
+            let (at, cursor_size) = match cursor.shape {
+                CursorShape::Block => (at, size(cell_w, cell_h)),
+                CursorShape::Bar => (at, size(thickness, cell_h)),
+                CursorShape::Underline => (
+                    point(at.x, at.y + cell_h - thickness),
+                    size(cell_w, thickness),
+                ),
+            };
             window.paint_quad(fill(
-                Bounds::new(at, size(cell_w, cell_h)),
-                hsla(Rgb::new(0x4c, 0x8d, 0xff)),
+                Bounds::new(at, cursor_size),
+                self.style.colour(cursor.colour),
             ));
         }
 
         let elapsed = state.started.elapsed();
         let painted_size = state.snapshot.size;
+        let geometry = (origin, state.cell);
         self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
             view.dirty = false;
             view.sync_remote_size(painted_size);
+            view.geometry = Some(geometry);
             // This frame carried the echoed glyph, so the local half of the
             // keystroke's journey ends now.
             if let Some((arrived, round_trip)) = view.echo_arrived.take() {
@@ -380,6 +539,21 @@ impl IntoElement for TerminalElement {
     fn into_element(self) -> Self::Element {
         self
     }
+}
+
+/// Whether a selection covers a cell. Mirrors the rule in berth-term, which
+/// owns the text extraction; this is the painting half of the same shape.
+fn selection_covers(selection: Selection, line: u16, column: u16) -> bool {
+    if line < selection.start_line || line > selection.end_line {
+        return false;
+    }
+    if line == selection.start_line && column < selection.start_column {
+        return false;
+    }
+    if line == selection.end_line && column > selection.end_column {
+        return false;
+    }
+    true
 }
 
 /// Group contiguous cells on a row that share a style into single runs.

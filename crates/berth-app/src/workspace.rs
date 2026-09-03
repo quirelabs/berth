@@ -90,7 +90,8 @@ impl Workspace {
 
         let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
         cx.spawn(async move |this, cx| {
-            let result = runtime::spawn(session::connect(host, slug, 80, 24))
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let result = runtime::spawn(session::connect(host, slug, 80, 24, palette))
                 .await
                 .map_err(|_| "the runtime dropped the connection task".to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()));
@@ -101,7 +102,12 @@ impl Workspace {
                         let terminal = connected.terminal.clone();
                         let pty = connected.pty.clone();
                         let view = cx.new(|cx| {
-                            TerminalView::new(terminal, Some(pty), "monospace", 13.0, cx)
+                            TerminalView::new(
+                                terminal,
+                                Some(pty),
+                                crate::terminal_style::TerminalStyle::default(),
+                                cx,
+                            )
                         });
                         view.update(cx, |_, cx| {
                             session::start_pump(&cx.entity(), connected.events, cx);
@@ -156,12 +162,19 @@ impl Workspace {
                             };
                             println!(
                                 "
-{report}"
+{}",
+                                report.text
                             );
                             let _ = runtime::spawn(async move {
                                 let _ = connection.exec(&crate::bench::remove_file_command()).await;
                             })
                             .await;
+                            if !report.passed {
+                                // Exit non-zero so a regression is a failure,
+                                // not a number someone has to notice.
+                                eprintln!("benchmark did not meet its criteria");
+                                std::process::exit(1);
+                            }
                             cx.update(|cx| cx.quit());
                             return;
                         }

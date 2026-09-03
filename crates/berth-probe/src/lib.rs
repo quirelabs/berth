@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 /// The canonical probe, embedded so the binary and the script cannot drift.
 pub const SCRIPT: &str = include_str!("../../../scripts/probe.sh");
 
+/// The opt-in shell integration snippet, shown to the user before it is ever
+/// sourced. Lives here because this crate owns everything Berth puts on a
+/// remote host.
+pub const SHELL_INTEGRATION: &str = include_str!("../../../scripts/shell-integration.sh");
+
 /// Where the script lives on the remote.
 pub const REMOTE_DIR: &str = "~/.berth";
 pub const REMOTE_PATH: &str = "~/.berth/probe.sh";
@@ -153,6 +158,71 @@ mod tests {
     fn script_is_embedded_and_hashable() {
         assert!(SCRIPT.contains("mode_sys"));
         assert_eq!(script_hash().len(), 64);
+    }
+
+    /// All four markers, not just D. D alone gives exit codes and nothing to
+    /// build command blocks or a styled prompt row from.
+    #[test]
+    fn the_shell_integration_emits_every_marker() {
+        assert!(SHELL_INTEGRATION.contains(r"\033]133;%s\007"));
+        // A, C and D are emitted from hooks; B goes into the prompt string,
+        // because that is the only place marking where input begins. Both go
+        // through the same helpers so tmux wrapping applies to all four.
+        for code in ["__berth_osc \"A\"", "__berth_osc \"C\"", "__berth_osc \"D;"] {
+            assert!(
+                SHELL_INTEGRATION.contains(code),
+                "the snippet must emit {code}"
+            );
+        }
+        assert_eq!(
+            SHELL_INTEGRATION.matches("__berth_osc_str B").count(),
+            2,
+            "B must be in both the bash and the zsh prompt"
+        );
+    }
+
+    /// Without the passthrough wrapping, tmux swallows every marker.
+    #[test]
+    fn the_shell_integration_wraps_markers_for_tmux() {
+        assert!(SHELL_INTEGRATION.contains("${TMUX:-}"), "must detect tmux");
+        assert!(
+            SHELL_INTEGRATION.contains(r"\033Ptmux;\033\033]133;%s\007\033\\"),
+            "markers must be wrapped, with the inner ESC doubled"
+        );
+    }
+
+    #[test]
+    fn the_shell_integration_covers_bash_and_zsh() {
+        assert!(SHELL_INTEGRATION.contains("ZSH_VERSION"));
+        assert!(SHELL_INTEGRATION.contains("BASH_VERSION"));
+    }
+
+    /// The snippet is sourced into someone's login shell, so it must not do
+    /// anything beyond printing escape sequences.
+    #[test]
+    fn the_shell_integration_touches_nothing() {
+        for forbidden in ["curl", "wget", "rm ", "mkdir", "> /", ">> /", "sudo"] {
+            assert!(
+                !SHELL_INTEGRATION.contains(forbidden),
+                "the snippet must not contain {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exit_code_is_captured_before_anything_can_clobber_it() {
+        // `local exit_code=$?` must be the first statement in precmd, or the
+        // recorded status is that of the marker printf instead.
+        let precmd = SHELL_INTEGRATION
+            .split("__berth_precmd() {")
+            .nth(1)
+            .expect("bash and zsh both define __berth_precmd");
+        let first = precmd
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap();
+        assert!(first.contains("exit_code=$?"), "first line was {first:?}");
     }
 
     #[test]
