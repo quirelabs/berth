@@ -25,7 +25,17 @@ berth-timeline = { path = "crates/berth-timeline" }
 # Pinned rev: zed-industries/zed @ 33375c34 (2026-09-03), toolchain 1.97.1.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "33375c34b9301dd850b0e6d9781fd00acace6953" }
 # `application()` lives here rather than in gpui itself on this revision.
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33375c34b9301dd850b0e6d9781fd00acace6953" }
+#
+# `font-kit` is not optional in practice. It maps to `gpui_macos/font-kit`, and
+# gpui_platform's default feature set is empty, so without it the macOS text
+# system comes up unable to see a single installed font: `all_font_names()`
+# returns gpui's own 11-entry fallback list, `add_fonts` reports success and
+# registers nothing, and every glyph rasterises empty while metrics and layout
+# still look correct. The window renders, and nothing in it has any text. See
+# decisions.md D2 and B5.
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33375c34b9301dd850b0e6d9781fd00acace6953", features = [
+    "font-kit",
+] }
 
 # russh >= 0.5x re-exports key handling as `russh::keys`; the standalone
 # russh-keys crate is stale at 0.49 and is not used. The default aws-lc-rs
