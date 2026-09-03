@@ -4,7 +4,7 @@
 //! neither number means anything measured anywhere else. Driven by
 //! `BERTH_BENCH`, which is never set in normal use.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AsyncApp, WeakEntity};
 
@@ -58,22 +58,152 @@ pub fn create_file_command() -> String {
 }
 
 pub fn remove_file_command() -> String {
-    format!("rm -f {BENCH_FILE}")
+    format!("rm -f {BENCH_FILE} {CHUNK_FILE}")
 }
 
-/// Bytes for the paced phase. Smaller than the file because all of it arrives.
+/// Bytes for the paced phase, once the rate has been calibrated.
 pub const PACED_BYTES: usize = 8 * 1024 * 1024;
+/// The chunk file the pacer replays, so a chunk costs one `cat` rather than a
+/// three-process pipeline.
+pub const CHUNK_FILE: &str = "/tmp/berth_bench_chunk";
+/// Chunks per second. Fine enough that the rate is a rate rather than a series
+/// of bursts, coarse enough that process spawning is not itself the limit.
+pub const CHUNKS_PER_SECOND: usize = 20;
+/// Rates tried during calibration, bytes per second. A doubling ladder, which
+/// finds the knee in a handful of trials rather than bisecting for accuracy
+/// the number does not need.
+pub const RATE_LADDER: [usize; 7] = [
+    1 << 20,
+    2 << 20,
+    4 << 20,
+    8 << 20,
+    16 << 20,
+    32 << 20,
+    64 << 20,
+];
+/// The fraction that has to arrive for a rate to count as forwarded intact.
+/// Not 1.0, because tmux adds escape sequences and the ratio runs slightly over
+/// on a good link, and not lower, because the whole point is that nothing was
+/// dropped.
+pub const INTACT: f64 = 0.95;
+/// Seconds of output per calibration trial.
+pub const TRIAL_SECONDS: usize = 2;
 
-/// A producer that tmux forwards instead of collapsing.
+/// Build the chunk the pacer replays, sized for one chunk at `rate`.
+pub fn chunk_command(rate: usize) -> String {
+    let chunk = (rate / CHUNKS_PER_SECOND).max(1);
+    // Written to the pty rather than exec'd, so it needs its own newline; the
+    // next command would otherwise be appended to the redirect target.
+    format!("head -c {chunk} /dev/zero | tr '\\0' 'y' | fold -w 76 > {CHUNK_FILE}\n")
+}
+
+/// Replay the chunk `count` times, one every 1/`CHUNKS_PER_SECOND` seconds.
 ///
-/// `cat` of a cached file is instantaneous, so tmux gets only a few dozen
-/// chances to redraw and the client receives about a megabyte of a fifty
-/// megabyte file however fast the link is. That measures tmux, not Berth. A
-/// CPU-bound pipeline emits at roughly the rate tmux can forward, so what is
-/// written is what arrives: `berth-core` reading exactly this receives 114% of
-/// it on localhost. This is the phase that actually loads the renderer.
-pub fn paced_command() -> String {
-    format!("head -c {PACED_BYTES} /dev/zero | tr '\\0' 'y' | fold -w 76\n")
+/// The rate matters because the whole finding behind D25 is that what survives
+/// tmux depends on how far the producer outruns tmux's redraw. A fixed gentle
+/// rate would measure a load Berth is never asked to carry; the number worth
+/// having is the most the renderer can be fed while the stream still arrives
+/// intact, and that has to be found per host.
+pub fn paced_command(count: usize) -> String {
+    let delay = 1.0 / CHUNKS_PER_SECOND as f64;
+    format!("i=0; while [ $i -lt {count} ]; do cat {CHUNK_FILE}; i=$((i+1)); sleep {delay}; done\n")
+}
+
+/// How long to allow for the chunk file to be written before replaying it.
+pub const CHUNK_BUILD: Duration = Duration::from_secs(2);
+/// Polling interval while waiting for a stream to go quiet.
+const POLL: Duration = Duration::from_millis(250);
+/// Consecutive quiet polls that count as the end of a stream.
+const QUIET_POLLS: usize = 4;
+/// A trial that has not finished by now is not a rate this host sustains.
+const TRIAL_CAP: Duration = Duration::from_secs(30);
+
+/// Run a command and wait for its output to stop, rather than for a fixed
+/// window.
+///
+/// A fixed window conflates two different failures. If the producer cannot
+/// sustain the rate asked of it, the loop simply runs long, and cutting the
+/// measurement off early reports the shortfall as though tmux had dropped it.
+/// Waiting for quiet separates them: what arrived is integrity, and how long it
+/// took is the rate actually achieved.
+async fn stream_until_quiet(
+    view: &WeakEntity<TerminalView>,
+    pty: &Pty,
+    command: String,
+    cx: &mut AsyncApp,
+) -> (u64, Duration) {
+    let _ = view.update(cx, |view, _| view.bytes_in = 0);
+    let start = Instant::now();
+    pty.write(command).await;
+
+    let mut last = 0u64;
+    let mut quiet = 0usize;
+    let mut moving_since = start;
+    loop {
+        cx.background_executor().timer(POLL).await;
+        let now = view.read_with(cx, |view, _| view.bytes_in).unwrap_or(last);
+        if now == last {
+            quiet += 1;
+        } else {
+            quiet = 0;
+            last = now;
+            moving_since = Instant::now();
+        }
+        if quiet >= QUIET_POLLS || start.elapsed() > TRIAL_CAP {
+            break;
+        }
+    }
+    // Discount the silence at the end, so the rate is over the time bytes were
+    // actually moving.
+    (last, moving_since.saturating_duration_since(start))
+}
+
+/// Find the fastest rate this host forwards intact, and report the ladder.
+///
+/// Climbs a doubling ladder. For each rate it records two things that a single
+/// number would confuse: how much of what was written arrived, and how fast it
+/// arrived. The rate chosen is the one with the highest achieved throughput
+/// among those that arrived intact, which is what "the most this renderer can
+/// be fed" means. Per host, because the knee moves with the link and with how
+/// fast tmux can redraw at the far end.
+async fn calibrate(
+    view: &WeakEntity<TerminalView>,
+    pty: &Pty,
+    cx: &mut AsyncApp,
+) -> (usize, String) {
+    let mut best = RATE_LADDER[0];
+    let mut best_achieved = 0.0f64;
+    let mut lines = String::from("rate calibration, per requested rate: arrived, and achieved\n");
+
+    for rate in RATE_LADDER {
+        let chunk = (rate / CHUNKS_PER_SECOND).max(1);
+        pty.write(chunk_command(rate)).await;
+        cx.background_executor().timer(CHUNK_BUILD).await;
+
+        let count = CHUNKS_PER_SECOND * TRIAL_SECONDS;
+        let (received, elapsed) = stream_until_quiet(view, pty, paced_command(count), cx).await;
+
+        // `fold` adds a newline every 76 bytes and tmux adds escape sequences,
+        // so a healthy ratio sits slightly over 1 rather than exactly at it.
+        let integrity = received as f64 / (chunk * count) as f64;
+        let achieved = received as f64 / elapsed.as_secs_f64().max(0.001);
+        let intact = integrity >= INTACT;
+        lines.push_str(&format!(
+            "  {:>5.0} MB/s requested: {integrity:.2} arrived, {:.1} MB/s achieved  {}\n",
+            rate as f64 / 1024.0 / 1024.0,
+            achieved / 1024.0 / 1024.0,
+            if intact { "intact" } else { "collapsed" }
+        ));
+        if intact && achieved > best_achieved {
+            best_achieved = achieved;
+            best = rate;
+        }
+        // One collapse is the knee; asking for more only collapses harder.
+        if !intact {
+            break;
+        }
+    }
+    (best, lines)
 }
 
 /// Stream the file and report the frame-time distribution.
@@ -104,17 +234,26 @@ pub async fn run_cat(
             (
                 view.frames.report("frame build, cat", Some(FRAME_BUDGET)),
                 view.bytes_in,
-                view.frames.within(FRAME_BUDGET),
-                view.frames.percentile_ms(0.99),
             )
         })
         .unwrap_or_default();
+
+    let (rate, ladder) = calibrate(&view, &pty, cx).await;
 
     let _ = view.update(cx, |view, _| {
         view.frames = crate::metrics::Histogram::new();
         view.bytes_in = 0;
     });
-    pty.write(paced_command()).await;
+    pty.write(chunk_command(rate)).await;
+    cx.background_executor().timer(CHUNK_BUILD).await;
+    let _ = view.update(cx, |view, _| {
+        view.frames = crate::metrics::Histogram::new();
+        view.bytes_in = 0;
+    });
+    pty.write(paced_command(
+        PACED_BYTES / (rate / CHUNKS_PER_SECOND).max(1),
+    ))
+    .await;
     cx.background_executor().timer(settle).await;
 
     view.read_with(cx, |view, _| {
@@ -128,7 +267,7 @@ pub async fn run_cat(
         // work: a histogram gathered over an idle window would look excellent
         // too. Note that tmux re-renders rather than forwarding verbatim, so
         // this is below the 50 MB written on the remote.
-        let (cat_report, cat_bytes, cat_no_freeze, cat_p99) = cat_phase;
+        let (cat_report, cat_bytes) = cat_phase;
         // The verdict comes from the paced phase, because it is the only one
         // that reliably puts bytes in front of the renderer. The cat phase is
         // kept because it is what the Windows baseline measured, and because
@@ -136,20 +275,22 @@ pub async fn run_cat(
         let text = format!(
             "{env}\
              {cat_report}bytes through the parser: {cat_bytes} ({:.1} MB of {:.0} MB written)\n\
+             tmux collapse case, no renderer verdict: an instantaneous producer never \
+             reaches the renderer, so these frame times say nothing about it.\n\
              \n\
+             {ladder}\
+             paced at {:.0} MB/s, the fastest rate this host forwards intact\n\
              {report}bytes through the parser: {} ({:.1} MB of {:.0} MB written)\n\
              \n\
-             cat phase, no frame at or above {} ms: {} (p99 {cat_p99:.1} ms)\n\
              paced phase, no frame at or above {} ms: {}\n\
              paced phase, p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms \
              regression ceiling: {}\n",
             cat_bytes as f64 / 1024.0 / 1024.0,
             BENCH_BYTES as f64 / 1024.0 / 1024.0,
+            rate as f64 / 1024.0 / 1024.0,
             view.bytes_in,
             view.bytes_in as f64 / 1024.0 / 1024.0,
             PACED_BYTES as f64 / 1024.0 / 1024.0,
-            FRAME_BUDGET.as_millis(),
-            if cat_no_freeze { "PASS" } else { "FAIL" },
             FRAME_BUDGET.as_millis(),
             if no_freeze { "PASS" } else { "FAIL" },
             if batching_intact { "PASS" } else { "FAIL" },
