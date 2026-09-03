@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/berth-core",
+    "crates/berth-term",
+    "crates/berth-probe",
+    "crates/berth-timeline",
+    "crates/berth-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+berth-core = { path = "crates/berth-core" }
+berth-probe = { path = "crates/berth-probe" }
+berth-term = { path = "crates/berth-term" }
+berth-timeline = { path = "crates/berth-timeline" }
+
+# gpui is pinned to a Zed commit; it is only published to crates.io sporadically
+# (0.2.2 dates from 2025-10) and the Windows backend moves fast on main.
+# Pinned rev: zed-industries/zed @ 33375c34 (2026-09-03), toolchain 1.97.1.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "33375c34b9301dd850b0e6d9781fd00acace6953" }
+
+# russh >= 0.5x re-exports key handling as `russh::keys`; the standalone
+# russh-keys crate is stale at 0.49 and is not used. The default aws-lc-rs
+# backend needs NASM to build on Windows, so ring is used instead.
+russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
+alacritty_terminal = "0.26"
+rusqlite = { version = "0.40", features = ["bundled"] }
+zstd = "0.13"
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify = "8"
+dirs = "6"
+shellexpand = "3"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+proptest = "1"
+tempfile = "3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
