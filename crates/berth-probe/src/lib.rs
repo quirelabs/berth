@@ -87,14 +87,27 @@ pub fn hash_command() -> String {
     )
 }
 
+/// The exact bytes `push_command` causes to land on the remote.
+///
+/// CRLF is stripped because a checkout on Windows would otherwise push a script
+/// whose shebang the remote sh cannot parse. Keeping this separate from the
+/// command matters: [`script_hash`] must equal the remote's `sha256sum` of this
+/// content, or Berth would decide the copy is stale and re-push on every
+/// connect.
+pub fn written_script(script: &str) -> String {
+    let mut normalised = script.replace("\r\n", "\n").trim_end().to_string();
+    normalised.push('\n');
+    normalised
+}
+
 /// Command that writes the script to the remote in one exec channel.
 pub fn push_command(script: &str) -> String {
-    // A quoted heredoc delimiter stops the remote shell expanding the body.
-    // CRLF is stripped because a checkout on Windows would otherwise push a
-    // script whose shebang the remote sh cannot parse.
+    // A quoted heredoc delimiter stops the remote shell expanding the body, and
+    // supplies the trailing newline that `written_script` accounts for.
+    let body = written_script(script);
     format!(
-        "mkdir -p {REMOTE_DIR} && cat > {REMOTE_PATH} <<'BERTH_EOF'\n{}\nBERTH_EOF\nchmod 700 {REMOTE_PATH}",
-        script.replace("\r\n", "\n").trim_end()
+        "mkdir -p {REMOTE_DIR} && cat > {REMOTE_PATH} <<'BERTH_EOF'\n{}BERTH_EOF\nchmod 700 {REMOTE_PATH}",
+        body
     )
 }
 
@@ -189,6 +202,23 @@ mod tests {
     fn pushed_script_never_contains_carriage_returns() {
         assert!(!push_command("a\r\nb\r\n").contains('\r'));
         assert!(!push_command(SCRIPT).contains('\r'));
+    }
+
+    /// Verified against a real host: the remote `sha256sum` of the pushed file
+    /// equals `script_hash()`. If these ever diverge Berth re-pushes the script
+    /// on every single connect, silently and forever.
+    #[test]
+    fn the_hash_matches_what_is_actually_written() {
+        assert_eq!(script_hash(), hash_of(&written_script(SCRIPT)));
+    }
+
+    #[test]
+    fn written_script_ends_in_exactly_one_newline() {
+        for input in ["a", "a\n", "a\n\n\n", "a\r\n"] {
+            let written = written_script(input);
+            assert!(written.ends_with('\n'), "{input:?}");
+            assert!(!written.ends_with("\n\n"), "{input:?}");
+        }
     }
 
     #[test]

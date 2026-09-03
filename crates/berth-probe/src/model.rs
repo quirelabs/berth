@@ -71,6 +71,20 @@ fn tcp() -> String {
     "tcp".to_string()
 }
 
+impl Port {
+    /// The owning process, when the remote user could see it. `ss` and
+    /// `netstat` only report pid and command for sockets the caller owns, so an
+    /// unprivileged probe legitimately returns neither and the UI must show the
+    /// port without inventing a pid of 0.
+    pub fn process(&self) -> Option<(u32, &str)> {
+        if self.pid == 0 || self.cmd.is_empty() {
+            None
+        } else {
+            Some((self.pid, self.cmd.as_str()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Sessions {
     #[serde(default)]
@@ -173,6 +187,25 @@ mod tests {
             .fraction(),
             0.0
         );
+    }
+
+    #[test]
+    fn an_unprivileged_probe_reports_no_owning_process() {
+        let anonymous = Port {
+            proto: "tcp".into(),
+            port: 443,
+            pid: 0,
+            cmd: String::new(),
+        };
+        assert_eq!(anonymous.process(), None);
+
+        let owned = Port {
+            proto: "tcp".into(),
+            port: 443,
+            pid: 812,
+            cmd: "nginx".into(),
+        };
+        assert_eq!(owned.process(), Some((812, "nginx")));
     }
 
     #[test]
