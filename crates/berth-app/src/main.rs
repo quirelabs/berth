@@ -4,6 +4,7 @@
 mod bench;
 mod input;
 mod metrics;
+mod reconnect;
 mod runtime;
 mod session;
 mod strings;

@@ -10,6 +10,7 @@ use gpui::{
 
 use berth_core::config::SshConfig;
 use berth_core::connection::ConnectionState;
+use berth_core::connection::state::{Action, Event};
 use berth_core::host::Host;
 use berth_core::transport::Connection;
 
@@ -32,7 +33,10 @@ pub struct Workspace {
     ssh_config_path: Option<String>,
     theme: Theme,
     pane: Pane,
-    state: ConnectionState,
+    /// The reconnect machine and its clock. The state shown in the UI is this
+    /// machine's, never a value set by hand at a call site, so the two cannot
+    /// drift apart.
+    reconnect: crate::reconnect::Driver,
     connection: Option<Arc<Connection>>,
     rtt: Option<Duration>,
     /// The terminal takes focus once, when it first appears.
@@ -57,7 +61,7 @@ impl Workspace {
             ssh_config_path: path,
             theme: Theme::for_appearance(Appearance::Dark),
             pane: Pane::FirstRun,
-            state: ConnectionState::Disconnected,
+            reconnect: crate::reconnect::Driver::new(),
             connection: None,
             rtt: None,
             focused: false,
@@ -85,8 +89,12 @@ impl Workspace {
     fn connect(&mut self, host: Host, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
         tracing::info!(%alias, "connecting");
-        self.pane = Pane::Connecting(alias.clone());
-        self.state = ConnectionState::Connecting;
+        // The grid stays up across a reconnect. Only a first connect, which
+        // has no grid yet, shows the connecting pane.
+        if !matches!(self.pane, Pane::Session(_)) {
+            self.pane = Pane::Connecting(alias.clone());
+        }
+        self.reconnect.handle(Event::Open);
 
         let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
         cx.spawn(async move |this, cx| {
@@ -113,8 +121,9 @@ impl Workspace {
                             session::start_pump(&cx.entity(), connected.events, cx);
                         });
                         this.connection = Some(connected.connection.clone());
-                        this.state = ConnectionState::Connected;
+                        this.reconnect.handle(Event::ConnectSucceeded);
                         this.pane = Pane::Session(view.clone());
+                        this.drive(cx);
                         cx.notify();
                     });
 
@@ -193,10 +202,84 @@ impl Workspace {
                 Err(error) => {
                     tracing::error!(%error, "connection failed");
                     let _ = this.update(cx, |this, cx| {
-                        this.state = ConnectionState::Disconnected;
-                        this.pane = Pane::Failed(error);
+                        this.reconnect.handle(Event::ConnectFailed);
+                        // A failure with a grid already on screen keeps it:
+                        // the machine is Reconnecting, not Disconnected, and
+                        // the last screen stays correct until told otherwise.
+                        if !this.reconnect.holds_grid() {
+                            this.pane = Pane::Failed(error);
+                        }
                         cx.notify();
                     });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Run the machine's clock: keepalives while connected, the slide into
+    /// Degraded when they stop being answered, and the backoff after that.
+    ///
+    /// The loop sleeps until the machine's own next deadline rather than
+    /// polling, and exits when the machine says it is resting, because only an
+    /// external event can move it from there.
+    fn drive(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(Some(wait)) = this.read_with(cx, |this, _| this.reconnect.next_wait())
+                else {
+                    return;
+                };
+                cx.background_executor().timer(wait).await;
+
+                let Ok(step) = this.update(cx, |this, cx| {
+                    let step = this.reconnect.handle(Event::Tick);
+                    if step.changed {
+                        tracing::info!(state = ?step.state, "connection state");
+                        cx.notify();
+                    }
+                    step
+                }) else {
+                    return;
+                };
+
+                for action in step.actions {
+                    match action {
+                        Action::SendKeepalive => {
+                            let Ok(Some(connection)) =
+                                this.read_with(cx, |this, _| this.connection.clone())
+                            else {
+                                return;
+                            };
+                            // Deliberately not awaited inline: a keepalive on a
+                            // dead link blocks until its own timeout, and the
+                            // machine has to keep ticking through that or it
+                            // can never reach Degraded.
+                            tracing::debug!("keepalive");
+                            let alive = this.clone();
+                            cx.spawn(async move |cx| {
+                                if runtime::spawn(crate::reconnect::keepalive(connection))
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    let _ = alive.update(cx, |this, cx| {
+                                        if this.reconnect.handle(Event::KeepaliveAck).changed {
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .detach();
+                        }
+                        Action::Connect | Action::Reattach => {
+                            // Re-establishing the transport and re-attaching
+                            // tmux is the next increment. The machine already
+                            // schedules it correctly, and the grid stays up
+                            // meanwhile, which is what the user sees.
+                            tracing::info!(?action, "reconnect action not yet wired");
+                        }
+                        Action::Teardown => return,
+                    }
                 }
             }
         })
@@ -225,7 +308,7 @@ impl Workspace {
             let connected = matches!(self.pane, Pane::Session(_)) && self.hosts.len() == 1
                 || Some(host.alias.as_str()) == std::env::var("BERTH_HOST").ok().as_deref();
             let state = if connected {
-                self.state
+                self.reconnect.state()
             } else {
                 ConnectionState::Disconnected
             };
@@ -327,7 +410,7 @@ impl Workspace {
                     .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
                 _ => strings::STATUS_NO_HOST.to_string(),
             })
-            .child(strings::connection_state(self.state))
+            .child(strings::connection_state(self.reconnect.state()))
             .child(rtt)
             .child(strings::STATUS_NOT_RECORDING)
     }
