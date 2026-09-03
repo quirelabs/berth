@@ -222,16 +222,30 @@ pub async fn run_keys(
         // paint here is well under one, and rounding it up loosened the
         // threshold by more than a tenth of a frame period at 120 Hz.
         let paint = Duration::from_secs_f64(view.frames.percentile_ms(0.50) / 1000.0);
+        // Every keystroke must have produced a sample. A short run is not a
+        // good run: gpui drops frames for a window that is not frontmost, and
+        // D19 records that silently costing 33 of 40 samples once already.
+        // Reporting a percentile over whatever survived hides exactly the
+        // conditions that produce the worst numbers.
+        let collected = view.latency.local_render.count() as usize;
+        let complete = collected == samples;
         Outcome {
             text: format!(
-                "{}{}",
+                "{}{}{}",
                 environment(view),
-                view.latency.report(refresh_hz, paint)
+                view.latency.report(refresh_hz, paint),
+                if complete {
+                    String::new()
+                } else {
+                    format!(
+                        "\nINVALID: {collected} of {samples} keystrokes produced a frame. \
+                         The window was probably not frontmost. Re-run with it focused.\n"
+                    )
+                },
             ),
-            // The criterion is missed frames, not the raw 16 ms line. See
-            // decisions.md D19 and spec section 10.
-            passed: view.latency.missed_frames(refresh_hz, paint) == 0
-                && view.latency.local_render.count() > 0,
+            // p95 within the next frame and max within two, not the raw 16 ms
+            // line and no longer zero missed frames. See decisions.md D19.
+            passed: complete && view.latency.meets_criterion(refresh_hz, paint),
         }
     })
     .unwrap_or_else(|_| Outcome {

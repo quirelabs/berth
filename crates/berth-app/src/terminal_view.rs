@@ -580,6 +580,7 @@ impl Element for TerminalElement {
         }
 
         let elapsed = state.started.elapsed();
+        let frame_started = state.started;
         let painted_size = state.snapshot.size;
         let geometry = (origin, state.cell);
         let painted_cell = state.cell;
@@ -597,6 +598,10 @@ impl Element for TerminalElement {
                 view.latency.record(KeystrokeLatency {
                     round_trip,
                     local_render: arrived.elapsed(),
+                    // Split at the moment this frame started being built, so
+                    // the wait for vsync and Berth's own work are separable.
+                    wait: frame_started.saturating_duration_since(arrived),
+                    paint: elapsed,
                 });
             }
         });

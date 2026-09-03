@@ -184,6 +184,11 @@ pub struct KeystrokeLatency {
     /// Echo arrival until the frame carrying that glyph was painted. This is
     /// the part Berth controls.
     pub local_render: Duration,
+    /// Echo arrival until that frame started being built. Almost all of this
+    /// is the wait for the next vsync, which is not Berth's to shorten.
+    pub wait: Duration,
+    /// Building and painting that frame. Berth's actual work.
+    pub paint: Duration,
 }
 
 impl KeystrokeLatency {
@@ -202,6 +207,11 @@ impl KeystrokeLatency {
 pub struct LatencyReport {
     pub round_trip: Histogram,
     pub local_render: Histogram,
+    /// The two halves of `local_render`, kept apart so a tail can be blamed on
+    /// frame pacing or on Berth rather than argued about.
+    pub wait: Histogram,
+    pub paint: Histogram,
+
     /// The whole journey, which is what a user actually feels.
     pub total: Histogram,
     /// Samples whose local half fitted the spec's budget.
@@ -214,6 +224,9 @@ pub struct LatencyReport {
     /// failure, observed) or none of those above it (a false pass). Keystroke
     /// samples number in the dozens, so keeping them exactly costs nothing.
     local_render_samples: Vec<Duration>,
+    /// Every sample, kept whole so a late one can be decomposed after the fact.
+    /// Forty per run, so this costs nothing.
+    late_samples: Vec<KeystrokeLatency>,
 }
 
 impl LatencyReport {
@@ -221,17 +234,23 @@ impl LatencyReport {
         Self {
             round_trip: Histogram::new(),
             local_render: Histogram::new(),
+            wait: Histogram::new(),
+            paint: Histogram::new(),
             total: Histogram::new(),
             within_budget: 0,
             local_render_samples: Vec::new(),
+            late_samples: Vec::new(),
         }
     }
 
     pub fn record(&mut self, sample: KeystrokeLatency) {
         self.round_trip.record(sample.round_trip);
         self.local_render.record(sample.local_render);
+        self.wait.record(sample.wait);
+        self.paint.record(sample.paint);
         self.total.record(sample.total());
         self.local_render_samples.push(sample.local_render);
+        self.late_samples.push(sample);
         if sample.within_budget() {
             self.within_budget += 1;
         }
@@ -260,6 +279,84 @@ impl LatencyReport {
         Duration::from_secs_f64(1.0 / refresh_hz.max(1.0)) + paint + Duration::from_millis(1)
     }
 
+    /// Two refresh periods plus a paint. The ceiling on the worst sample.
+    pub fn two_frame_threshold(&self, refresh_hz: f64, paint: Duration) -> Duration {
+        self.missed_frame_threshold(refresh_hz, paint)
+            + Duration::from_secs_f64(1.0 / refresh_hz.max(1.0))
+    }
+
+    /// The exact quantile of the local half, from the samples rather than the
+    /// histogram, for the same reason `missed_frames` uses them.
+    pub fn local_render_percentile(&self, quantile: f64) -> Duration {
+        if self.local_render_samples.is_empty() {
+            return Duration::ZERO;
+        }
+        let mut sorted = self.local_render_samples.clone();
+        sorted.sort_unstable();
+        let rank = (quantile.clamp(0.0, 1.0) * sorted.len() as f64).ceil() as usize;
+        sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+    }
+
+    /// The keystroke criterion: the bulk of keystrokes make the next frame,
+    /// and none of them takes more than two. See decisions.md D19.
+    pub fn meets_criterion(&self, refresh_hz: f64, paint: Duration) -> bool {
+        !self.local_render_samples.is_empty()
+            && self.local_render_percentile(0.95) <= self.missed_frame_threshold(refresh_hz, paint)
+            && self.local_render.max() <= self.two_frame_threshold(refresh_hz, paint)
+    }
+
+    /// Where a late sample's time actually went.
+    ///
+    /// `local_render` is the wait for the next vsync plus the frame Berth
+    /// builds. Only the second is Berth's, so a tail is worth chasing only if
+    /// it shows up there. Printed per sample rather than as a distribution
+    /// because there are only ever a handful.
+    fn late_sample_breakdown(&self, refresh_hz: f64, paint: Duration) -> String {
+        let threshold = self.missed_frame_threshold(refresh_hz, paint);
+        let late: Vec<&KeystrokeLatency> = self
+            .late_samples
+            .iter()
+            .filter(|s| s.local_render > threshold)
+            .collect();
+        if late.is_empty() {
+            return String::new();
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut out = format!(
+            "\nlate samples, against a {:.2} ms threshold:\n",
+            ms(threshold)
+        );
+        for s in &late {
+            out.push_str(&format!(
+                "  local {:.2} ms = wait {:.2} + paint {:.2}, over by {:.2}\n",
+                ms(s.local_render),
+                ms(s.wait),
+                ms(s.paint),
+                ms(s.local_render) - ms(threshold),
+            ));
+        }
+        // Judged against the frame period, not against the median paint.
+        // Doubling a median of a few hundred microseconds is not a meaningful
+        // bar, and calling 0.6 ms "slow" against an 8.3 ms period was wrong.
+        let period = Duration::from_secs_f64(1.0 / refresh_hz.max(1.0));
+        let worst_paint = late.iter().map(|s| s.paint).max().unwrap_or_default();
+        let worst_wait = late.iter().map(|s| s.wait).max().unwrap_or_default();
+        out.push_str(&format!(
+            "  worst wait {:.2} ms against a nominal period of {:.2} ms; \
+             worst paint {:.2} ms\n  {}\n",
+            ms(worst_wait),
+            ms(period),
+            ms(worst_paint),
+            if worst_paint * 4 < period {
+                "the paint is a small fraction of a frame, so the time went into the wait, \
+                 which is the display's and not Berth's"
+            } else {
+                "the paint is a material fraction of a frame, so this is Berth's to fix"
+            }
+        ));
+        out
+    }
+
     pub fn report(&self, refresh_hz: f64, paint: Duration) -> String {
         let period_ms = 1000.0 / refresh_hz.max(1.0);
         let missed = self.missed_frames(refresh_hz, paint);
@@ -280,10 +377,12 @@ impl LatencyReport {
             self.within_budget,
             self.local_render.count(),
         ));
+        out.push_str(&self.late_sample_breakdown(refresh_hz, paint));
         out.push_str(&format!(
             "\ndisplay: {refresh_hz:.0} Hz, frame period {period_ms:.1} ms, \
              paint cost {:.1} ms\n\
-             frames missed (local render above one frame period plus a paint): {missed} ({})\n\
+             frames missed (local render above one frame period plus a paint): {missed}\n\
+             p95 {:.2} ms within one frame ({:.2} ms), max {:.2} ms within two ({:.2} ms): {}\n\
              \n\
              Local render is the wait for the next frame plus the paint. On a {refresh_hz:.0} Hz \
              display that wait is uniform over {period_ms:.1} ms whatever Berth does, so samples \
@@ -291,7 +390,15 @@ impl LatencyReport {
              Network round trip p50 {:.1} ms is reported separately: it dominates the total a user \
              feels, and it is not Berth's to fix.\n",
             paint.as_secs_f64() * 1000.0,
-            if missed == 0 { "PASS" } else { "FAIL" },
+            self.local_render_percentile(0.95).as_secs_f64() * 1000.0,
+            self.missed_frame_threshold(refresh_hz, paint).as_secs_f64() * 1000.0,
+            self.local_render.max().as_secs_f64() * 1000.0,
+            self.two_frame_threshold(refresh_hz, paint).as_secs_f64() * 1000.0,
+            if self.meets_criterion(refresh_hz, paint) {
+                "PASS"
+            } else {
+                "FAIL"
+            },
             RENDER_BUDGET.as_millis(),
             self.round_trip.percentile_ms(0.50),
         ));
@@ -417,12 +524,61 @@ mod tests {
         assert!(h.report("frames", Some(FRAME_BUDGET)).contains("FAIL"));
     }
 
+    /// The amended D19 criterion: a tail of one or two frames is frame pacing,
+    /// which Berth cannot shorten, but nothing may take more than two frames.
+    #[test]
+    fn the_criterion_tolerates_a_thin_tail_but_not_a_second_lost_frame() {
+        let sample = |local: Duration| KeystrokeLatency {
+            round_trip: ms(30),
+            local_render: local,
+            wait: local,
+            paint: Duration::ZERO,
+        };
+        let paint = Duration::from_micros(500);
+
+        // 120 Hz: one frame is 9.83 ms with the jitter allowance, two is 18.17.
+        let mut clean = LatencyReport::new();
+        for _ in 0..39 {
+            clean.record(sample(ms(5)));
+        }
+        clean.record(sample(Duration::from_micros(10_400)));
+        assert!(
+            clean.missed_frames(120.0, paint) > 0,
+            "the late sample is still counted and reported"
+        );
+        assert!(
+            clean.meets_criterion(120.0, paint),
+            "but one sample in forty past a frame is pacing, not a failure"
+        );
+
+        let mut two_frames_lost = LatencyReport::new();
+        for _ in 0..39 {
+            two_frames_lost.record(sample(ms(5)));
+        }
+        two_frames_lost.record(sample(ms(25)));
+        assert!(
+            !two_frames_lost.meets_criterion(120.0, paint),
+            "a sample past two frames is a real stall"
+        );
+
+        let mut most_are_late = LatencyReport::new();
+        for _ in 0..40 {
+            most_are_late.record(sample(Duration::from_micros(11_000)));
+        }
+        assert!(
+            !most_are_late.meets_criterion(120.0, paint),
+            "a tail is tolerated; a distribution is not"
+        );
+    }
+
     #[test]
     fn keystroke_latency_is_judged_on_the_local_half() {
         // A slow link with a fast renderer passes; that is the point.
         let slow_link = KeystrokeLatency {
             round_trip: ms(200),
             local_render: ms(3),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         };
         assert!(slow_link.within_budget());
         assert_eq!(slow_link.total(), ms(203));
@@ -430,6 +586,8 @@ mod tests {
         let slow_renderer = KeystrokeLatency {
             round_trip: ms(1),
             local_render: ms(40),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         };
         assert!(!slow_renderer.within_budget());
     }
@@ -440,6 +598,8 @@ mod tests {
         r.record(KeystrokeLatency {
             round_trip: ms(120),
             local_render: ms(2),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         let text = r.report(60.0, Duration::from_millis(2));
         assert!(text.contains("local render"));
@@ -458,11 +618,15 @@ mod tests {
         r.record(KeystrokeLatency {
             round_trip: ms(10),
             local_render: Duration::from_micros(18_500),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         assert_eq!(r.missed_frames(60.0, ms(1)), 0, "18.5 ms is under 18.67 ms");
         r.record(KeystrokeLatency {
             round_trip: ms(10),
             local_render: Duration::from_micros(18_900),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         assert_eq!(r.missed_frames(60.0, ms(1)), 1, "18.9 ms is over 18.67 ms");
     }
@@ -473,6 +637,8 @@ mod tests {
         r.record(KeystrokeLatency {
             round_trip: ms(10),
             local_render: ms(15),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         assert_eq!(r.missed_frames(60.0, ms(2)), 0);
         assert!(r.report(60.0, ms(2)).contains("PASS"));
@@ -484,6 +650,8 @@ mod tests {
         r.record(KeystrokeLatency {
             round_trip: ms(10),
             local_render: ms(40),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         assert_eq!(r.missed_frames(60.0, ms(2)), 1);
         assert!(r.report(60.0, ms(2)).contains("FAIL"));
@@ -495,6 +663,8 @@ mod tests {
         r.record(KeystrokeLatency {
             round_trip: ms(10),
             local_render: ms(15),
+            wait: Duration::ZERO,
+            paint: Duration::ZERO,
         });
         // 15 ms is fine at 60 Hz and a missed frame at 144 Hz.
         assert_eq!(r.missed_frames(60.0, ms(2)), 0);
