@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The non-UI crates carry the logic and the tests. They build without gpui,
+  # so this job stays fast and needs no system graphics libraries.
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy -p berth-core -p berth-probe -p berth-term -p berth-timeline --all-targets
+      - run: cargo test -p berth-core -p berth-probe -p berth-term -p berth-timeline
+
+  # gpui only compiles as part of berth-app, and only on the platforms Berth
+  # ships to. Compile check only; the interactive criteria are verified by hand.
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p berth-app
+
+  # probe.sh must run everywhere Berth can connect to.
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12
+          - ubuntu:24.04
+          - alpine:3.20
+          - fedora:40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run probe modes
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -c '
+            set -e
+            sh -n scripts/probe.sh
+            for mode in sys ports sessions agents; do
+              out=$(sh scripts/probe.sh $mode)
+              echo "$mode: $out"
+              case "$out" in
+                "{"*"}") ;;
+                *) echo "mode $mode did not emit a JSON object"; exit 1 ;;
+              esac
+            done
+            sh scripts/probe.sh remove
+          '
+
+  # macOS has neither /proc nor GNU coreutils, so it gets its own run.
+  probe-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sh -n scripts/probe.sh
+          for mode in sys ports sessions agents; do
+            sh scripts/probe.sh $mode | python3 -c 'import json,sys; json.load(sys.stdin)'
+          done
+          sh scripts/probe.sh remove
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
