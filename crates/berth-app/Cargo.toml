@@ -1,0 +1,23 @@
+[package]
+name = "berth-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "berth"
+path = "src/main.rs"
+
+[dependencies]
+berth-core.workspace = true
+berth-probe.workspace = true
+berth-term.workspace = true
+berth-timeline.workspace = true
+
+gpui.workspace = true
+gpui_platform.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
