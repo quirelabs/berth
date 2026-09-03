@@ -83,6 +83,7 @@ pub async fn run_cat(
     cx.background_executor().timer(settle).await;
 
     view.read_with(cx, |view, _| {
+        let env = environment(view);
         let report = view.frames.report("frame build", FRAME_BUDGET);
         let p99 = view.frames.percentile_ms(0.99);
         let no_freeze = view.frames.within(FRAME_BUDGET);
@@ -92,7 +93,7 @@ pub async fn run_cat(
         // too. Note that tmux re-renders rather than forwarding verbatim, so
         // this is below the 50 MB written on the remote.
         let text = format!(
-            "{report}bytes through the parser: {} ({:.1} MB over {} frames)\n\n\
+            "{env}{report}bytes through the parser: {} ({:.1} MB over {} frames)\n\n\
              no frame at or above {} ms: {}\n\
              p99 frame time {p99} ms against a {CAT_P99_CEILING_MS} ms regression \
              ceiling: {}\n",
@@ -119,6 +120,30 @@ pub async fn run_cat(
 pub struct Outcome {
     pub text: String,
     pub passed: bool,
+}
+
+/// Platform and font facts, printed by both benchmarks.
+///
+/// The font line matters most: JetBrains Mono is not installed everywhere, so
+/// the two platforms may be measuring different metrics entirely, and that
+/// would otherwise be invisible in a latency number.
+pub fn environment(view: &TerminalView) -> String {
+    let style = view.style();
+    let cell = view.resolved_cell;
+    format!(
+        "platform: {}
+font requested: {} at {} px, line height {}
+cell resolved: {}
+",
+        std::env::consts::OS,
+        style.font_family,
+        style.font_size,
+        style.line_height,
+        match cell {
+            Some(c) => format!("{:.2} x {:.2} px", c.width, c.height),
+            None => "not painted yet".to_string(),
+        }
+    )
 }
 
 /// Type into the remote and report both halves of the latency separately.
@@ -164,7 +189,11 @@ pub async fn run_keys(
         // threshold and turn a genuinely missed frame into a pass.
         let paint = Duration::from_millis(view.frames.percentile_ms(0.50).max(1) as u64);
         Outcome {
-            text: view.latency.report(refresh_hz, paint),
+            text: format!(
+                "{}{}",
+                environment(view),
+                view.latency.report(refresh_hz, paint)
+            ),
             // The criterion is missed frames, not the raw 16 ms line. See
             // decisions.md D19 and spec section 10.
             passed: view.latency.missed_frames(refresh_hz, paint) == 0

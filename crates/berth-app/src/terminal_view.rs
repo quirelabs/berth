@@ -48,6 +48,11 @@ pub struct TerminalView {
     pub latency: LatencyReport,
     /// Bytes fed to the parser, so throughput claims can be checked.
     pub bytes_in: u64,
+    /// Cell metrics as the platform font system resolved them. Reported by the
+    /// benchmarks because font metrics are the most likely thing to differ
+    /// between platforms, and a metric difference looks like a latency
+    /// difference if it is not shown.
+    pub resolved_cell: Option<CellSize>,
     /// The current local selection, if the user is dragging or has dragged.
     selection: Option<Selection>,
     /// Where a drag started, kept so the selection can be rebuilt as it moves.
@@ -77,6 +82,7 @@ impl TerminalView {
             echo_arrived: None,
             latency: crate::metrics::LatencyReport::new(),
             bytes_in: 0,
+            resolved_cell: None,
             selection: None,
             drag_anchor: None,
             geometry: None,
@@ -130,6 +136,10 @@ impl TerminalView {
         crate::runtime::handle().spawn(async move {
             pty.resize(size.cols, size.rows).await;
         });
+    }
+
+    pub fn style(&self) -> &TerminalStyle {
+        &self.style
     }
 
     /// Which cell a window position falls on, clamped to the grid.
@@ -516,11 +526,13 @@ impl Element for TerminalElement {
         let elapsed = state.started.elapsed();
         let painted_size = state.snapshot.size;
         let geometry = (origin, state.cell);
+        let painted_cell = state.cell;
         self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
             view.dirty = false;
             view.sync_remote_size(painted_size);
             view.geometry = Some(geometry);
+            view.resolved_cell = Some(painted_cell);
             // This frame carried the echoed glyph, so the local half of the
             // keystroke's journey ends now.
             if let Some((arrived, round_trip)) = view.echo_arrived.take() {

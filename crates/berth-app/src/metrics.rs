@@ -175,6 +175,14 @@ pub struct LatencyReport {
     pub total: Histogram,
     /// Samples whose local half fitted the spec's budget.
     within_budget: u64,
+    /// Exact local-render samples.
+    ///
+    /// The missed-frame verdict cannot come from the histogram: its buckets are
+    /// 1 ms wide, and a threshold of 18.7 ms falls inside bucket 18, so counting
+    /// whole buckets either flags every sample between 18.0 and 18.7 (a false
+    /// failure, observed) or none of those above it (a false pass). Keystroke
+    /// samples number in the dozens, so keeping them exactly costs nothing.
+    local_render_samples: Vec<Duration>,
 }
 
 impl LatencyReport {
@@ -184,6 +192,7 @@ impl LatencyReport {
             local_render: Histogram::new(),
             total: Histogram::new(),
             within_budget: 0,
+            local_render_samples: Vec::new(),
         }
     }
 
@@ -191,6 +200,7 @@ impl LatencyReport {
         self.round_trip.record(sample.round_trip);
         self.local_render.record(sample.local_render);
         self.total.record(sample.total());
+        self.local_render_samples.push(sample.local_render);
         if sample.within_budget() {
             self.within_budget += 1;
         }
@@ -206,9 +216,17 @@ impl LatencyReport {
     /// than the next frame: anything over the period plus one paint is a frame
     /// Berth actually missed.
     pub fn missed_frames(&self, refresh_hz: f64, paint: Duration) -> u64 {
-        let period = Duration::from_secs_f64(1.0 / refresh_hz.max(1.0));
-        self.local_render
-            .over(period + paint + Duration::from_millis(1))
+        let threshold = self.missed_frame_threshold(refresh_hz, paint);
+        self.local_render_samples
+            .iter()
+            .filter(|sample| **sample > threshold)
+            .count() as u64
+    }
+
+    /// One refresh period plus a paint, with a small allowance for scheduling
+    /// jitter that is not a dropped frame.
+    pub fn missed_frame_threshold(&self, refresh_hz: f64, paint: Duration) -> Duration {
+        Duration::from_secs_f64(1.0 / refresh_hz.max(1.0)) + paint + Duration::from_millis(1)
     }
 
     pub fn report(&self, refresh_hz: f64, paint: Duration) -> String {
@@ -363,6 +381,24 @@ mod tests {
     }
 
     /// A wait inside the refresh interval is the display, not Berth.
+    /// The bucketing trap: a threshold inside a bucket must not condemn every
+    /// sample in that bucket. Seen for real, as three false failures.
+    #[test]
+    fn a_sample_just_under_the_threshold_is_not_a_missed_frame() {
+        let mut r = LatencyReport::new();
+        // Threshold at 60 Hz with a 1 ms paint is 16.67 + 1 + 1 = 18.67 ms.
+        r.record(KeystrokeLatency {
+            round_trip: ms(10),
+            local_render: Duration::from_micros(18_500),
+        });
+        assert_eq!(r.missed_frames(60.0, ms(1)), 0, "18.5 ms is under 18.67 ms");
+        r.record(KeystrokeLatency {
+            round_trip: ms(10),
+            local_render: Duration::from_micros(18_900),
+        });
+        assert_eq!(r.missed_frames(60.0, ms(1)), 1, "18.9 ms is over 18.67 ms");
+    }
+
     #[test]
     fn a_vsync_wait_is_not_a_missed_frame() {
         let mut r = LatencyReport::new();
