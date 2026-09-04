@@ -125,6 +125,28 @@ impl TerminalView {
         }
     }
 
+    /// The grid's current size, so a reconnect can attach at the same shape.
+    pub fn grid_size(&self) -> TermSize {
+        self.terminal
+            .lock()
+            .map(|t| t.size())
+            .unwrap_or(TermSize::new(80, 24))
+    }
+
+    /// Point the view at a new transport without touching the grid.
+    ///
+    /// This is instant reattach. The terminal, and so everything on screen,
+    /// is deliberately left alone: the last rendered screen is still the
+    /// truth until the remote contradicts it, and tmux sends a full repaint
+    /// on attach which overwrites it in place. Clearing here would produce
+    /// exactly the blank flash the reconnect is supposed to avoid.
+    pub fn swap_pty(&mut self, pty: Pty) {
+        self.pty = Some(pty);
+        // The remote is a fresh tmux client that has not been told the size,
+        // so forget what the last one was told and let the next paint resize.
+        self.last_sent_size = None;
+    }
+
     /// Feed output into the parser. Called from the coalescing pump, never
     /// per byte.
     pub fn ingest(&mut self, event: PtyEvent) {

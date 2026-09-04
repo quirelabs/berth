@@ -27,6 +27,38 @@ pub struct Connected {
     pub events: mpsc::Receiver<PtyEvent>,
 }
 
+/// Just the transport: a connection and a tmux session attached to it.
+///
+/// Separate from [`connect`] because a reconnect must not build a terminal.
+/// The grid on screen is the one Berth already holds, and it stays there while
+/// the transport is rebuilt underneath it.
+pub struct Attached {
+    pub connection: Arc<Connection>,
+    pub pty: Pty,
+    pub events: mpsc::Receiver<PtyEvent>,
+}
+
+/// Open a connection and attach to the session named by `slug`.
+///
+/// `Session::new` uses `new-session -A`, so the same slug lands in the same
+/// tmux session whether this is the first attach or the fifth. That is what
+/// makes a reconnect resume the same shell rather than start another one.
+pub async fn attach(
+    host: Host,
+    slug: String,
+    cols: u16,
+    rows: u16,
+) -> berth_core::Result<Attached> {
+    let connection = Connection::connect(&host, TrustPolicy::KnownHostsOnly).await?;
+    let session = Session::new(slug, cols, rows);
+    let (pty, events) = connection.open_session(&session).await?;
+    Ok(Attached {
+        connection: Arc::new(connection),
+        pty,
+        events,
+    })
+}
+
 /// Connect, attach to a tmux session, and prepare a terminal for it.
 pub async fn connect(
     host: Host,
@@ -35,19 +67,17 @@ pub async fn connect(
     rows: u16,
     palette: berth_term::terminal::Palette,
 ) -> berth_core::Result<Connected> {
-    let connection = Connection::connect(&host, TrustPolicy::KnownHostsOnly).await?;
-    let session = Session::new(slug, cols, rows);
-    let (pty, events) = connection.open_session(&session).await?;
+    let attached = attach(host, slug, cols, rows).await?;
     // The palette comes from TerminalStyle, so every visual constant stays in
     // one struct rather than half of them living in berth-term's defaults.
     let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
     term.set_palette(palette);
     let terminal: SharedTerminal = Arc::new(Mutex::new(term));
     Ok(Connected {
-        connection: Arc::new(connection),
-        pty,
+        connection: attached.connection,
+        pty: attached.pty,
         terminal,
-        events,
+        events: attached.events,
     })
 }
 

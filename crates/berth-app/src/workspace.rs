@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext, Context, Entity, Focusable, IntoElement, ParentElement, Render, Styled, Window,
-    div, px,
+    AppContext, AsyncApp, Context, Entity, Focusable, IntoElement, ParentElement, Render, Styled,
+    WeakEntity, Window, div, px,
 };
 
 use berth_core::config::SshConfig;
@@ -29,6 +29,10 @@ enum Pane {
 
 pub struct Workspace {
     hosts: Vec<Host>,
+    /// What a reconnect re-opens. Kept so the driver does not have to guess,
+    /// and so the same slug lands in the same tmux session every time.
+    session_host: Option<Host>,
+    session_slug: String,
     warnings: Vec<String>,
     ssh_config_path: Option<String>,
     theme: Theme,
@@ -61,6 +65,8 @@ impl Workspace {
             ssh_config_path: path,
             theme: Theme::for_appearance(Appearance::Dark),
             pane: Pane::FirstRun,
+            session_host: None,
+            session_slug: String::new(),
             reconnect: crate::reconnect::Driver::new(),
             connection: None,
             rtt: None,
@@ -97,6 +103,8 @@ impl Workspace {
         self.reconnect.handle(Event::Open);
 
         let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
+        self.session_host = Some(host.clone());
+        self.session_slug = slug.clone();
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             // Resolved once here, against what the platform actually has, so
@@ -278,19 +286,78 @@ impl Workspace {
                             })
                             .detach();
                         }
-                        Action::Connect | Action::Reattach => {
-                            // Re-establishing the transport and re-attaching
-                            // tmux is the next increment. The machine already
-                            // schedules it correctly, and the grid stays up
-                            // meanwhile, which is what the user sees.
-                            tracing::info!(?action, "reconnect action not yet wired");
+                        Action::Connect => {
+                            Self::reattach(&this, cx).await;
                         }
+                        // Emitted after the machine is already Connected. The
+                        // work it names is done before that, in `reattach`, so
+                        // the state never claims a session that is not ready.
+                        Action::Reattach => {}
                         Action::Teardown => return,
                     }
                 }
             }
         })
         .detach();
+    }
+
+    /// Rebuild the transport underneath the live view.
+    ///
+    /// Everything the session needs is done before `ConnectSucceeded` is fed
+    /// in: the connection, the tmux attach, the pty swap, the pump, and the
+    /// port forwards. The machine only returns to Connected once the session
+    /// is genuinely usable, rather than announcing it and then catching up.
+    async fn reattach(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        let Ok(Some((host, slug, view))) = this.read_with(cx, |this, _| {
+            let Pane::Session(view) = &this.pane else {
+                return None;
+            };
+            Some((
+                this.session_host.clone()?,
+                this.session_slug.clone(),
+                view.clone(),
+            ))
+        }) else {
+            return;
+        };
+
+        // Attach at the size the grid already is, so tmux repaints into the
+        // same shape and nothing reflows on the way back.
+        let size = view.read_with(cx, |view, _| view.grid_size());
+
+        let attached = runtime::spawn(session::attach(host, slug, size.cols, size.rows)).await;
+        let attached = match attached {
+            Ok(Ok(attached)) => attached,
+            failed => {
+                if let Ok(Err(error)) = failed {
+                    tracing::warn!(%error, "reattach failed");
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.reconnect.handle(Event::ConnectFailed);
+                    cx.notify();
+                });
+                return;
+            }
+        };
+
+        // Port forwards belong here, before the state goes back to Connected.
+        // There are none to restore yet; establishing them is its own M1 item,
+        // and this is the seam it lands in.
+        let forwards_restored = true;
+
+        let _ = this.update(cx, |this, cx| {
+            this.connection = Some(attached.connection.clone());
+            view.update(cx, |view, cx| {
+                // The grid is untouched. tmux's repaint overwrites it in place.
+                view.swap_pty(attached.pty.clone());
+                session::start_pump(&cx.entity(), attached.events, cx);
+            });
+            if forwards_restored {
+                let step = this.reconnect.handle(Event::ConnectSucceeded);
+                tracing::info!(state = ?step.state, "reattached");
+            }
+            cx.notify();
+        });
     }
 
     fn warnings(&self) -> impl IntoElement {
