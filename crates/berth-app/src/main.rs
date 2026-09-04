@@ -5,6 +5,7 @@ mod bench;
 mod input;
 mod metrics;
 mod reconnect;
+mod render_probe;
 mod runtime;
 mod session;
 mod strings;
@@ -47,6 +48,48 @@ fn self_check() {
     });
 }
 
+/// Open the window the pixel check photographs, and hold it open.
+///
+/// Prints the window's bounds so the test does not have to duplicate them, then
+/// stays up until killed.
+fn render_probe() {
+    application().run(|cx| {
+        let bounds = crate::render_probe::window_bounds();
+        let window = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Berth render probe".into()),
+                    ..Default::default()
+                }),
+                inactive_frame_interval: None,
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| crate::render_probe::RenderProbe),
+        );
+        if let Err(error) = window {
+            eprintln!("render probe could not open a window: {error}");
+            std::process::exit(1);
+        }
+        cx.activate(true);
+        // The check reads its geometry from here rather than duplicating it,
+        // so the two can never drift apart.
+        println!(
+            "PROBE window={},{},{},{} text={},{} control={},{}",
+            crate::render_probe::WINDOW_X,
+            crate::render_probe::WINDOW_Y,
+            crate::render_probe::WINDOW_W,
+            crate::render_probe::WINDOW_H,
+            crate::render_probe::TEXT_TOP,
+            crate::render_probe::TEXT_HEIGHT,
+            crate::render_probe::CONTROL_TOP,
+            crate::render_probe::CONTROL_HEIGHT,
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    });
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -54,6 +97,11 @@ fn main() {
                 .unwrap_or_else(|_| "berth=info".into()),
         )
         .init();
+
+    if std::env::args().any(|a| a == "--render-probe") {
+        render_probe();
+        return;
+    }
 
     if std::env::args().any(|a| a == "--self-check") {
         self_check();

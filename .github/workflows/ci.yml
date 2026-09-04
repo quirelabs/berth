@@ -47,6 +47,16 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: cargo run -p berth-app -- --self-check
 
+      # The stronger form of the same guard: open a window, draw a known
+      # string, photograph it, and count lit pixels in the text's rect. The
+      # font-count check proves the text system can see fonts; only this
+      # proves a glyph reaches the screen. Both runners, since the font chain
+      # and the substitution behaviour differ between them.
+      - name: Text reaches the framebuffer
+        env:
+          BERTH_PIXEL_CHECK: "1"
+        run: cargo test -p berth-app --test renders_text
+
   # probe.sh must run everywhere Berth can connect to.
   probe:
     runs-on: ubuntu-latest

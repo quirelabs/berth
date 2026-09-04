@@ -610,6 +610,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "image",
  "tokio",
  "tracing",
  "tracing-subscriber",
