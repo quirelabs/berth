@@ -60,6 +60,29 @@ pub fn changed_key(line: usize, fingerprint: &str) -> String {
 pub const FORWARD_BIND_TOOLTIP: &str = "While Berth holds this port, a plain ssh to the same host will report \
      \"bind: Address already in use\" for it. Harmless: the forward is already up.";
 
+/// Closing a tab and ending a session are different actions with different
+/// costs, so they never share a word.
+pub const TAB_DETACH: &str = "\u{00d7}";
+pub const TAB_DETACH_TOOLTIP: &str = "Detach. The connection closes and the tab goes, but the tmux \
+     session keeps running on the server with everything in it. Opening the \
+     host again re-attaches to the same shell.";
+pub const TAB_KILL: &str = "\u{25a0}";
+pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it stops and its scrollback \
+     is gone. Asks first.";
+
+pub const KILL_TITLE: &str = "End this session?";
+pub const KILL_ACCEPT: &str = "End session";
+pub const KILL_REJECT: &str = "Cancel";
+pub const KILL_ALTERNATIVE: &str =
+    "To close the tab and leave the session running, use detach instead.";
+
+pub fn kill_body(alias: &str, session: &str) -> String {
+    format!(
+        "{session} on {alias} will be killed. Everything running in it stops \
+         and its scrollback is gone. This cannot be undone."
+    )
+}
+
 pub const STATUS_NO_HOST: &str = "No host";
 pub const STATUS_NOT_RECORDING: &str = "Not recording";
 

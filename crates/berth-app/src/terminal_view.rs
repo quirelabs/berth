@@ -147,6 +147,14 @@ impl TerminalView {
         self.last_sent_size = None;
     }
 
+    /// The pty this view is currently writing to.
+    ///
+    /// Read rather than held by the caller, because a reconnect replaces it and
+    /// a benchmark holding the old one would be typing into a dead channel.
+    pub fn pty(&self) -> Option<Pty> {
+        self.pty.clone()
+    }
+
     /// Feed output into the parser. Called from the coalescing pump, never
     /// per byte.
     pub fn ingest(&mut self, event: PtyEvent) {

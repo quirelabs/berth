@@ -1,11 +1,12 @@
-//! The root view: sidebar, main area, status bar.
+//! The root view: sidebar, tabs, main area, status bar.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
+    AppContext, AsyncApp, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, px,
 };
 
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ impl Render for Note {
         div()
             .max_w(px(320.0))
             .p(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(4.0))
             .bg(hsla(self.theme.surface))
             .border_1()
             .border_color(hsla(self.theme.border))
@@ -53,7 +54,7 @@ pub enum HostStatus {
     /// The probe is in flight. Berth is looking at the host's key and has
     /// authenticated to nothing.
     Verifying,
-    /// Whatever the connection is doing, as the reconnect machine sees it.
+    /// Whatever the connection is doing, as that session's machine sees it.
     Connection(ConnectionState),
     /// Warming failed. Recorded per host so one bad host cannot stop the rest.
     Failed(String),
@@ -80,16 +81,36 @@ impl HostStatus {
     }
 }
 
-/// A session that is up but not on screen.
+/// One open session.
 ///
-/// The connection travels with the view because switching hosts has to carry
-/// the transport too, and the forwards travel with it because dropping a
-/// `Forwarder` closes its listener: a forward whose port is in use must not go
-/// down just because its host is no longer the one being looked at.
-struct Warm {
+/// Everything a session needs is here, including its own reconnect machine.
+/// That is the point: a machine per workspace could only ever watch whatever
+/// was on screen, so a background session that dropped went unnoticed until
+/// someone looked at it. A machine per session watches all of them.
+struct Tab {
+    /// Stable across reordering and closing, unlike an index. The keepalive
+    /// loop holds this and exits when it stops resolving, which is what makes
+    /// closing a tab end its loop with no separate bookkeeping.
+    id: u64,
+    host: Host,
+    slug: String,
     view: Entity<TerminalView>,
     connection: Arc<Connection>,
+    /// Dropping one closes its listener, which is how closing a tab retires
+    /// the forwards belonging to it.
     forwarders: Vec<Forwarder>,
+    reconnect: crate::reconnect::Driver,
+    rtt: Option<Duration>,
+}
+
+impl Tab {
+    fn state(&self) -> ConnectionState {
+        self.reconnect.state()
+    }
+
+    fn tmux_name(&self) -> String {
+        berth_core::session::Session::new(self.slug.clone(), 80, 24).tmux_name()
+    }
 }
 
 /// A host key the user is being asked about.
@@ -104,29 +125,41 @@ struct Prompt {
     key: Box<berth_core::known_hosts::PublicKey>,
 }
 
-/// What the main area is showing.
-enum Pane {
+/// A question in front of everything else.
+///
+/// One at a time, and both of them are decisions that are awkward to undo: one
+/// trusts a machine, the other ends a session and everything running in it.
+enum Modal {
+    Verify(Prompt),
+    /// Killing is not closing. This exists so the destructive one has to be
+    /// asked for twice and can never be reached by meaning the other.
+    Kill {
+        tab: u64,
+        alias: String,
+        session: String,
+    },
+}
+
+/// What the main area shows when there is no session to show.
+enum Empty {
     FirstRun,
     Connecting(String),
     Failed(String),
-    Session(Entity<TerminalView>),
 }
 
 pub struct Workspace {
     hosts: Vec<Host>,
-    /// What a reconnect re-opens. Kept so the driver does not have to guess,
-    /// and so the same slug lands in the same tmux session every time.
-    session_host: Option<Host>,
-    session_slug: String,
-    /// Live forwards for the current session. Dropping one closes its
-    /// listener, which is how a reconnect retires the forwards belonging to
-    /// the connection that died.
-    forwarders: Vec<Forwarder>,
-    /// Sessions brought up at startup but not on screen, so switching to one
-    /// is instant rather than a fresh connect and attach.
-    warmed: std::collections::BTreeMap<String, Warm>,
-    /// The host key question currently in front of the user, if any.
-    prompt: Option<Prompt>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
+    modal: Option<Modal>,
+    /// The modal takes the keyboard so Escape and Enter reach it rather than
+    /// the terminal underneath.
+    modal_focus: FocusHandle,
+    modal_focused: bool,
+    /// Which tab currently holds the keyboard, so switching moves it. Without
+    /// this the user looks at one session and types into another.
+    focused_tab: Option<u64>,
     /// Per-host status, so the sidebar can show hosts landing independently.
     statuses: std::collections::BTreeMap<String, HostStatus>,
     /// When the process started, for the cold-start measurement.
@@ -136,19 +169,7 @@ pub struct Workspace {
     warnings: Vec<String>,
     ssh_config_path: Option<String>,
     theme: Theme,
-    pane: Pane,
-    /// The reconnect machine and its clock. The state shown in the UI is this
-    /// machine's, never a value set by hand at a call site, so the two cannot
-    /// drift apart.
-    reconnect: crate::reconnect::Driver,
-    connection: Option<Arc<Connection>>,
-    rtt: Option<Duration>,
-    /// The terminal takes focus once, when it first appears.
-    focused: bool,
-    /// Which host the keepalive loop belongs to. Switching hosts starts a new
-    /// loop, and the old one exits when it sees a number that is not its own,
-    /// so two loops can never tick the same machine.
-    driving: u64,
+    empty: Empty,
 }
 
 impl Workspace {
@@ -179,24 +200,110 @@ impl Workspace {
             warnings,
             ssh_config_path: path,
             theme: Theme::for_appearance(Appearance::Dark),
-            pane: Pane::FirstRun,
-            session_host: None,
-            session_slug: String::new(),
-            forwarders: Vec::new(),
-            warmed: std::collections::BTreeMap::new(),
-            prompt: None,
+            empty: Empty::FirstRun,
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 0,
+            modal: None,
+            modal_focus: cx.focus_handle(),
+            modal_focused: false,
+            focused_tab: None,
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
-            reconnect: crate::reconnect::Driver::new(),
-            connection: None,
-            rtt: None,
-            focused: false,
-            driving: 0,
         };
 
         this.warm(cx);
         this
+    }
+
+    // -- sessions ----------------------------------------------------------
+
+    fn tab(&self, id: u64) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.get(self.active)
+    }
+
+    fn tab_for(&self, alias: &str) -> Option<u64> {
+        self.tabs
+            .iter()
+            .find(|t| t.host.alias == alias)
+            .map(|t| t.id)
+    }
+
+    fn slug() -> String {
+        std::env::var("BERTH_SESSION")
+            .unwrap_or_else(|_| berth_core::session::DEFAULT_SLUG.to_string())
+    }
+
+    /// Take a freshly connected session and make it a tab.
+    ///
+    /// Everything that makes a session a session happens here, once, so a first
+    /// connect and a warm one cannot drift into behaving differently.
+    fn adopt(
+        &mut self,
+        host: Host,
+        connected: session::Connected,
+        forwarders: Vec<Forwarder>,
+        installed: Vec<String>,
+        show: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let alias = host.alias.clone();
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                connected.terminal.clone(),
+                Some(connected.pty.clone()),
+                {
+                    let mut style = crate::terminal_style::TerminalStyle::default();
+                    style.resolve_family(&installed);
+                    style
+                },
+                cx,
+            )
+        });
+        view.update(cx, |_, cx| {
+            session::start_pump(&cx.entity(), connected.events, cx);
+        });
+
+        self.next_tab_id += 1;
+        let id = self.next_tab_id;
+        let mut reconnect = crate::reconnect::Driver::new();
+        reconnect.handle(Event::Open);
+        reconnect.handle(Event::ConnectSucceeded);
+
+        self.tabs.push(Tab {
+            id,
+            host,
+            slug: Self::slug(),
+            view,
+            connection: connected.connection.clone(),
+            forwarders,
+            reconnect,
+            rtt: None,
+        });
+        self.statuses.insert(
+            alias.clone(),
+            HostStatus::Connection(ConnectionState::Connected),
+        );
+        // The first session to land is shown whether or not it was asked for by
+        // name. Sitting on the first-run screen with a live session behind it
+        // would be wrong, and whichever host answered first is the one the user
+        // can start typing into soonest.
+        if show || self.tabs.len() == 1 {
+            self.active = self.tabs.len() - 1;
+        }
+        self.report_cold_start(&alias);
+        self.drive(id, cx);
+        self.measure_rtt(id, cx);
+        cx.notify();
     }
 
     /// Open every host that is already trusted, in parallel, at startup.
@@ -212,12 +319,10 @@ impl Workspace {
     /// the others, which is the whole point of doing this at startup.
     fn warm(&mut self, cx: &mut Context<Self>) {
         let hosts = self.hosts.clone();
-        let only = self.startup_host().map(|h| h.alias);
+        let named = self.startup_host().map(|h| h.alias);
 
         for host in hosts {
-            // BERTH_HOST, or a single-host config, still picks what the pane
-            // shows. Warming decides what is connected, not what is visible.
-            let visible = only.as_deref() == Some(host.alias.as_str());
+            let asked_for = named.as_deref() == Some(host.alias.as_str());
 
             if !berth_core::known_hosts::is_known(&host.hostname, host.port) {
                 self.statuses
@@ -226,7 +331,7 @@ impl Workspace {
                 // the same request a click makes, so it gets the same answer,
                 // a fingerprint to look at. Showing an empty pane instead would
                 // be a launch that silently did nothing.
-                if visible {
+                if asked_for {
                     self.verify(host, cx);
                 } else {
                     tracing::info!(
@@ -241,91 +346,54 @@ impl Workspace {
                 host.alias.clone(),
                 HostStatus::Connection(ConnectionState::Connecting),
             );
-            if visible {
-                self.connect(host, cx);
-            } else {
-                self.warm_one(host, cx);
+            if asked_for {
+                self.empty = Empty::Connecting(host.alias.clone());
             }
+            self.connect(host, asked_for, cx);
         }
     }
 
-    /// Bring a host up without showing it, so switching to it later is instant.
-    fn warm_one(&mut self, host: Host, cx: &mut Context<Self>) {
+    /// Bring a host up, as a tab, shown or not.
+    fn connect(&mut self, host: Host, show: bool, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
-        let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
+        tracing::info!(%alias, "connecting");
+        let slug = Self::slug();
         let forwards = host.forwards.clone();
+
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
+            // Resolved once here, against what the platform actually has, so
+            // the grid is not built on a proportional substitute.
             let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let result = runtime::spawn(session::connect(host, slug, 80, 24, palette))
+            let result = runtime::spawn(session::connect(host.clone(), slug, 80, 24, palette))
                 .await
-                .map_err(|_| "the runtime dropped the connection task".to_string())
+                .map_err(|_| strings::RUNTIME_DROPPED.to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()));
 
             match result {
                 Ok(connected) => {
-                    // A warmed host's forwards come up with it and stay up. The
-                    // port is wanted by whatever is using it, not by whichever
-                    // host happens to be on screen.
+                    // Same ordering as a reconnect: ports before the state.
                     let forwarders =
                         session::start_forwards(connected.connection.clone(), &forwards).await;
                     let _ = this.update(cx, |this, cx| {
-                        let view = cx.new(|cx| {
-                            TerminalView::new(
-                                connected.terminal.clone(),
-                                Some(connected.pty.clone()),
-                                {
-                                    let mut style = crate::terminal_style::TerminalStyle::default();
-                                    style.resolve_family(&installed);
-                                    style
-                                },
-                                cx,
-                            )
-                        });
-                        view.update(cx, |_, cx| {
-                            session::start_pump(&cx.entity(), connected.events, cx);
-                        });
-                        this.statuses.insert(
-                            alias.clone(),
-                            HostStatus::Connection(ConnectionState::Connected),
-                        );
-                        // Nothing on screen yet, so the first host to land gets
-                        // the pane. Showing the first-run screen while several
-                        // hosts are connected behind it is simply wrong, and
-                        // whichever host answered first is the one the user can
-                        // start typing into soonest.
-                        if matches!(this.pane, Pane::FirstRun | Pane::Connecting(_)) {
-                            this.session_host =
-                                this.hosts.iter().find(|h| h.alias == alias).cloned();
-                            this.session_slug = std::env::var("BERTH_SESSION")
-                                .unwrap_or_else(|_| "main".to_string());
-                            this.connection = Some(connected.connection.clone());
-                            this.forwarders = forwarders;
-                            this.reconnect.handle(Event::Open);
-                            this.reconnect.handle(Event::ConnectSucceeded);
-                            this.pane = Pane::Session(view.clone());
-                            this.drive(cx);
-                        } else {
-                            this.warmed.insert(
-                                alias.clone(),
-                                Warm {
-                                    view,
-                                    connection: connected.connection.clone(),
-                                    forwarders,
-                                },
-                            );
-                        }
-                        this.report_cold_start(&alias);
-                        cx.notify();
+                        this.adopt(host, connected, forwarders, installed, show, cx);
                     });
+
+                    // Benchmarks drive the real render loop, then quit.
+                    if crate::bench::Bench::from_env().is_some() {
+                        Self::run_benchmark(&this, cx).await;
+                    }
                 }
                 Err(error) => {
                     // Recorded against this host only. A host that refuses must
                     // not take the others down with it.
-                    tracing::warn!(%alias, %error, "warming failed");
+                    tracing::warn!(%alias, %error, "connect failed");
                     let _ = this.update(cx, |this, cx| {
                         this.statuses
-                            .insert(alias.clone(), HostStatus::Failed(error));
+                            .insert(alias.clone(), HostStatus::Failed(error.clone()));
+                        if this.tabs.is_empty() {
+                            this.empty = Empty::Failed(error);
+                        }
                         cx.notify();
                     });
                 }
@@ -352,29 +420,36 @@ impl Workspace {
         println!("COLD_START {} ms via {alias}", elapsed.as_millis());
     }
 
+    fn startup_host(&self) -> Option<Host> {
+        if let Ok(alias) = std::env::var("BERTH_HOST") {
+            return self.hosts.iter().find(|h| h.alias == alias).cloned();
+        }
+        if self.hosts.len() == 1 {
+            return self.hosts.first().cloned();
+        }
+        None
+    }
+
+    // -- opening, closing, killing ----------------------------------------
+
     /// Act on a click on a host row.
     ///
     /// What happens is decided from what is true now rather than from the
-    /// status the sidebar last drew: a warm host is shown, a host with no
-    /// recorded key is verified first, anything else is connected. So a failed
-    /// row is retried by clicking it, and a row that failed because it was
-    /// never trusted asks the question instead of retrying the failure.
+    /// status the sidebar last drew: a host with a session shows it, a host
+    /// with no recorded key is verified first, anything else is connected. So a
+    /// failed row is retried by clicking it, and a row that failed because it
+    /// was never trusted asks the question instead of retrying the failure.
     fn open(&mut self, alias: String, cx: &mut Context<Self>) {
-        // One question at a time, and never a connection started behind the
-        // dialog that is asking whether to make one.
-        if self.prompt.is_some() {
+        // Never a connection started behind a dialog that is asking whether to
+        // make one.
+        if self.modal.is_some() {
             return;
         }
         if matches!(self.statuses.get(&alias), Some(HostStatus::Verifying)) {
             return;
         }
-        if self.warmed.contains_key(&alias) {
-            self.show(&alias, cx);
-            return;
-        }
-        if matches!(self.pane, Pane::Session(_))
-            && self.session_host.as_ref().is_some_and(|h| h.alias == alias)
-        {
+        if let Some(id) = self.tab_for(&alias) {
+            self.activate(id, cx);
             return;
         }
         let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
@@ -383,65 +458,100 @@ impl Workspace {
         if berth_core::known_hosts::is_known(&host.hostname, host.port) {
             self.statuses
                 .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
-            self.connect(host, cx);
+            self.connect(host, true, cx);
         } else {
             self.verify(host, cx);
         }
     }
 
-    /// Put an already-warm session on screen, parking the one it replaces.
-    ///
-    /// Parking rather than dropping: the outgoing connection, its grid and its
-    /// forwards all stay up, so coming back costs the same nothing that going
-    /// did, and a port someone is using does not close because the user looked
-    /// at another host.
-    fn show(&mut self, alias: &str, cx: &mut Context<Self>) {
-        let Some(warm) = self.warmed.remove(alias) else {
-            return;
-        };
-        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
-            return;
-        };
-
-        if let Pane::Session(view) = &self.pane
-            && let (Some(previous), Some(connection)) =
-                (self.session_host.clone(), self.connection.clone())
-        {
-            let parked = Warm {
-                view: view.clone(),
-                connection,
-                forwarders: std::mem::take(&mut self.forwarders),
-            };
-            self.statuses.insert(
-                previous.alias.clone(),
-                HostStatus::Connection(ConnectionState::Connected),
-            );
-            self.warmed.insert(previous.alias, parked);
+    fn activate(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+            self.active = index;
+            cx.notify();
         }
+    }
 
-        self.session_host = Some(host);
-        self.session_slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
-        self.connection = Some(warm.connection);
-        self.forwarders = warm.forwarders;
-        self.pane = Pane::Session(warm.view);
-        // The incoming terminal has to take the keyboard, or the user is
-        // looking at one session and typing into another.
-        self.focused = false;
-
-        // The machine follows the visible session, so a parked host is not
-        // watched: if its link died while parked, that is noticed on the first
-        // keepalive after it comes back rather than at the moment it happened.
-        // Removing that is tabs' job, when each session gets its own machine.
-        self.reconnect = crate::reconnect::Driver::new();
-        self.reconnect.handle(Event::Open);
-        self.reconnect.handle(Event::ConnectSucceeded);
+    /// Close a tab. This detaches and never kills.
+    ///
+    /// The connection goes and the forwards go with it, because both belong to
+    /// this client. The tmux session on the server does not: it keeps running,
+    /// and opening the host again re-attaches to the same shell with its
+    /// scrollback and its running command intact. That is the whole reason
+    /// sessions are tmux-backed, and it is why this is the cheap action.
+    fn close(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        if let Some(tab) = self.tab_mut(id) {
+            // Tell the machine rather than dropping it mid-backoff. Closing is
+            // the one action that releases a session's grid, and this is the
+            // one place that reaches the state which does.
+            tab.reconnect.handle(Event::Close);
+            debug_assert!(!tab.reconnect.holds_grid());
+        }
+        let tab = self.tabs.remove(index);
+        tracing::info!(alias = %tab.host.alias, session = %tab.tmux_name(), "detached");
         self.statuses.insert(
-            alias.to_string(),
-            HostStatus::Connection(ConnectionState::Connected),
+            tab.host.alias.clone(),
+            HostStatus::Connection(ConnectionState::Disconnected),
         );
-        self.drive(cx);
+        // Politeness, not correctness: dropping the handle would end it anyway,
+        // but a clean disconnect saves the server a timeout.
+        let connection = tab.connection.clone();
+        drop(tab);
+        cx.background_executor()
+            .spawn(async move {
+                let _ = connection.disconnect().await;
+            })
+            .detach();
+
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        if self.tabs.is_empty() {
+            self.empty = Empty::FirstRun;
+        }
         cx.notify();
     }
+
+    /// Ask before ending a session. Never kill directly from a click.
+    fn ask_kill(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        self.modal = Some(Modal::Kill {
+            tab: id,
+            alias: tab.host.alias.clone(),
+            session: tab.tmux_name(),
+        });
+        self.modal_focused = false;
+        cx.notify();
+    }
+
+    /// End the tmux session and everything running in it, then close the tab.
+    fn kill(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        let connection = tab.connection.clone();
+        let name = tab.tmux_name();
+        let command = berth_core::session::Session::new(tab.slug.clone(), 80, 24).kill_command();
+        tracing::warn!(alias = %tab.host.alias, session = %name, "killing session");
+
+        cx.spawn(async move |_, _| {
+            match runtime::spawn(async move { connection.exec(&command).await }).await {
+                Ok(Ok(out)) if out.succeeded() => tracing::info!(%name, "session killed"),
+                Ok(Ok(out)) => tracing::warn!(%name, stderr = %out.stderr_string(), "kill failed"),
+                Ok(Err(error)) => tracing::warn!(%name, %error, "kill failed"),
+                Err(_) => tracing::warn!(%name, "the runtime dropped the kill"),
+            }
+        })
+        .detach();
+
+        self.close(id, cx);
+    }
+
+    // -- trust -------------------------------------------------------------
 
     /// Ask a host for its key and put the fingerprint in front of the user.
     fn verify(&mut self, host: Host, cx: &mut Context<Self>) {
@@ -457,12 +567,13 @@ impl Workspace {
                 match offer {
                     Ok(Ok(session::Offer::Unknown { key, fingerprint })) => {
                         this.statuses.insert(alias.clone(), HostStatus::NeedsVerify);
-                        this.prompt = Some(Prompt {
+                        this.modal = Some(Modal::Verify(Prompt {
                             alias,
                             endpoint,
                             fingerprint,
                             key,
-                        });
+                        }));
+                        this.modal_focused = false;
                     }
                     // Recorded between startup and the click, so there is
                     // nothing to ask and the click meant "open this".
@@ -470,7 +581,7 @@ impl Workspace {
                         if let Some(host) = this.hosts.iter().find(|h| h.alias == alias).cloned() {
                             this.statuses
                                 .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
-                            this.connect(host, cx);
+                            this.connect(host, true, cx);
                         }
                     }
                     // Never offered as a question. There is nothing here a user
@@ -500,11 +611,33 @@ impl Workspace {
         .detach();
     }
 
+    /// Say yes to whatever is being asked.
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        match self.modal.take() {
+            Some(Modal::Verify(prompt)) => self.accept(prompt, cx),
+            Some(Modal::Kill { tab, .. }) => self.kill(tab, cx),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Say no. Nothing is written, nothing is ended.
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        match self.modal.take() {
+            Some(Modal::Verify(prompt)) => {
+                tracing::info!(alias = %prompt.alias, "host key declined");
+                self.statuses.insert(prompt.alias, HostStatus::NeedsVerify);
+            }
+            Some(Modal::Kill { alias, .. }) => {
+                tracing::info!(%alias, "kill cancelled");
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
     /// Record the key the user accepted, then open the host.
-    fn accept(&mut self, cx: &mut Context<Self>) {
-        let Some(prompt) = self.prompt.take() else {
-            return;
-        };
+    fn accept(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.iter().find(|h| h.alias == prompt.alias).cloned() else {
             return;
         };
@@ -519,7 +652,7 @@ impl Workspace {
                     prompt.alias,
                     HostStatus::Connection(ConnectionState::Connecting),
                 );
-                self.connect(host, cx);
+                self.connect(host, true, cx);
             }
             Err(error) => {
                 // Nothing was written, so the host stays a question. Connecting
@@ -530,211 +663,40 @@ impl Workspace {
                 self.statuses.insert(prompt.alias, HostStatus::NeedsVerify);
             }
         }
-        cx.notify();
     }
 
-    /// Decline. Nothing is written and the host goes back to waiting.
-    fn reject(&mut self, cx: &mut Context<Self>) {
-        if let Some(prompt) = self.prompt.take() {
-            tracing::info!(alias = %prompt.alias, "host key declined");
-            self.statuses.insert(prompt.alias, HostStatus::NeedsVerify);
-        }
-        cx.notify();
-    }
+    // -- the connection machine, one per session ---------------------------
 
-    fn startup_host(&self) -> Option<Host> {
-        if let Ok(alias) = std::env::var("BERTH_HOST") {
-            return self.hosts.iter().find(|h| h.alias == alias).cloned();
-        }
-        if self.hosts.len() == 1 {
-            return self.hosts.first().cloned();
-        }
-        None
-    }
-
-    fn connect(&mut self, host: Host, cx: &mut Context<Self>) {
-        let alias = host.alias.clone();
-        tracing::info!(%alias, "connecting");
-        // The grid stays up across a reconnect. Only a first connect, which
-        // has no grid yet, shows the connecting pane.
-        if !matches!(self.pane, Pane::Session(_)) {
-            self.pane = Pane::Connecting(alias.clone());
-        }
-        self.reconnect.handle(Event::Open);
-
-        let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
-        self.session_host = Some(host.clone());
-        self.session_slug = slug.clone();
-        let forwards = host.forwards.clone();
-        cx.spawn(async move |this, cx| {
-            let palette = crate::terminal_style::TerminalStyle::default().palette;
-            // Resolved once here, against what the platform actually has, so
-            // the grid is not built on a proportional substitute.
-            let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let result = runtime::spawn(session::connect(host, slug, 80, 24, palette))
-                .await
-                .map_err(|_| "the runtime dropped the connection task".to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()));
-
-            match result {
-                Ok(connected) => {
-                    // Same ordering as a reconnect: ports before the state.
-                    let forwarders =
-                        session::start_forwards(connected.connection.clone(), &forwards).await;
-                    let _ = this.update(cx, |this, cx| {
-                        let terminal = connected.terminal.clone();
-                        let pty = connected.pty.clone();
-                        let view = cx.new(|cx| {
-                            TerminalView::new(
-                                terminal,
-                                Some(pty),
-                                {
-                                    let mut style = crate::terminal_style::TerminalStyle::default();
-                                    style.resolve_family(&installed);
-                                    style
-                                },
-                                cx,
-                            )
-                        });
-                        view.update(cx, |_, cx| {
-                            session::start_pump(&cx.entity(), connected.events, cx);
-                        });
-                        this.connection = Some(connected.connection.clone());
-                        this.forwarders = forwarders;
-                        this.reconnect.handle(Event::ConnectSucceeded);
-                        this.pane = Pane::Session(view.clone());
-                        this.statuses.insert(
-                            alias.clone(),
-                            HostStatus::Connection(this.reconnect.state()),
-                        );
-                        this.report_cold_start(&alias);
-                        this.drive(cx);
-                        cx.notify();
-                    });
-
-                    // Benchmarks drive the real render loop, then quit.
-                    if let Some(mode) = crate::bench::Bench::from_env() {
-                        let view = this
-                            .read_with(cx, |t, _| match &t.pane {
-                                Pane::Session(v) => Some(v.downgrade()),
-                                _ => None,
-                            })
-                            .ok()
-                            .flatten();
-                        if let Some(view) = view {
-                            let connection = connected.connection.clone();
-                            let pty = connected.pty.clone();
-                            let report = match mode {
-                                crate::bench::Bench::Cat => {
-                                    let prepared = runtime::spawn({
-                                        let connection = connection.clone();
-                                        async move {
-                                            connection
-                                                .exec(&crate::bench::create_file_command())
-                                                .await
-                                                .map(|o| o.stdout_string().trim().to_string())
-                                        }
-                                    })
-                                    .await;
-                                    println!("benchmark file bytes: {prepared:?}");
-                                    crate::bench::run_cat(
-                                        view,
-                                        pty,
-                                        std::time::Duration::from_secs(
-                                            std::env::var("BERTH_BENCH_SETTLE")
-                                                .ok()
-                                                .and_then(|v| v.parse().ok())
-                                                .unwrap_or(20),
-                                        ),
-                                        cx,
-                                    )
-                                    .await
-                                }
-                                crate::bench::Bench::Keys => {
-                                    crate::bench::run_keys(view, pty, 40, refresh_hz(), cx).await
-                                }
-                            };
-                            println!(
-                                "
-{}",
-                                report.text
-                            );
-                            let _ = runtime::spawn(async move {
-                                let _ = connection.exec(&crate::bench::remove_file_command()).await;
-                            })
-                            .await;
-                            if !report.passed {
-                                // Exit non-zero so a regression is a failure,
-                                // not a number someone has to notice.
-                                eprintln!("benchmark did not meet its criteria");
-                                std::process::exit(1);
-                            }
-                            cx.update(|cx| cx.quit());
-                            return;
-                        }
-                    }
-                    // A first RTT sample for the status bar.
-                    if let Ok(Some(connection)) = this.read_with(cx, |t, _| t.connection.clone()) {
-                        let rtt = runtime::spawn(session::round_trip(connection)).await;
-                        if let Ok(Some(rtt)) = rtt {
-                            let _ = this.update(cx, |this, cx| {
-                                this.rtt = Some(rtt);
-                                cx.notify();
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, "connection failed");
-                    let _ = this.update(cx, |this, cx| {
-                        this.statuses
-                            .insert(alias.clone(), HostStatus::Failed(error.clone()));
-                        this.reconnect.handle(Event::ConnectFailed);
-                        // A failure with a grid already on screen keeps it:
-                        // the machine is Reconnecting, not Disconnected, and
-                        // the last screen stays correct until told otherwise.
-                        if !this.reconnect.holds_grid() {
-                            this.pane = Pane::Failed(error);
-                        }
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Run the machine's clock: keepalives while connected, the slide into
+    /// Run one session's clock: keepalives while connected, the slide into
     /// Degraded when they stop being answered, and the backoff after that.
     ///
-    /// The loop sleeps until the machine's own next deadline rather than
-    /// polling, and exits when the machine says it is resting, because only an
-    /// external event can move it from there.
-    fn drive(&mut self, cx: &mut Context<Self>) {
-        self.driving += 1;
-        let mine = self.driving;
+    /// The loop sleeps until that machine's own next deadline rather than
+    /// polling, and exits when the machine rests or when the tab is gone. The
+    /// tab id is what ends it: a closed tab stops resolving, so closing one
+    /// ends its loop with no separate bookkeeping and two loops can never tick
+    /// one machine.
+    fn drive(&mut self, id: u64, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some(wait)) = this.read_with(cx, |this, _| {
-                    // A loop that no longer owns the visible session exits.
-                    // Two loops on one machine would tick it twice and send
-                    // keepalives at double the interval the machine expects.
-                    if this.driving != mine {
-                        return None;
-                    }
-                    this.reconnect.next_wait()
+                    this.tab(id).and_then(|t| t.reconnect.next_wait())
                 }) else {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
 
-                let Ok(step) = this.update(cx, |this, cx| {
-                    let step = this.reconnect.handle(Event::Tick);
+                let Ok(Some(step)) = this.update(cx, |this, cx| {
+                    let step = this.tab_mut(id).map(|t| t.reconnect.handle(Event::Tick))?;
                     if step.changed {
-                        tracing::info!(state = ?step.state, "connection state");
+                        let alias = this.tab(id).map(|t| t.host.alias.clone());
+                        tracing::info!(?alias, state = ?step.state, "connection state");
+                        if let Some(alias) = alias {
+                            this.statuses
+                                .insert(alias, HostStatus::Connection(step.state));
+                        }
                         cx.notify();
                     }
-                    step
+                    Some(step)
                 }) else {
                     return;
                 };
@@ -742,16 +704,16 @@ impl Workspace {
                 for action in step.actions {
                     match action {
                         Action::SendKeepalive => {
-                            let Ok(Some(connection)) =
-                                this.read_with(cx, |this, _| this.connection.clone())
-                            else {
+                            let Ok(Some(connection)) = this.read_with(cx, |this, _| {
+                                this.tab(id).map(|t| t.connection.clone())
+                            }) else {
                                 return;
                             };
                             // Deliberately not awaited inline: a keepalive on a
                             // dead link blocks until its own timeout, and the
                             // machine has to keep ticking through that or it
                             // can never reach Degraded.
-                            tracing::debug!("keepalive");
+                            tracing::debug!(id, "keepalive");
                             let alive = this.clone();
                             cx.spawn(async move |cx| {
                                 if runtime::spawn(crate::reconnect::keepalive(connection))
@@ -759,7 +721,13 @@ impl Workspace {
                                     .unwrap_or(false)
                                 {
                                     let _ = alive.update(cx, |this, cx| {
-                                        if this.reconnect.handle(Event::KeepaliveAck).changed {
+                                        let changed = this
+                                            .tab_mut(id)
+                                            .map(|t| {
+                                                t.reconnect.handle(Event::KeepaliveAck).changed
+                                            })
+                                            .unwrap_or(false);
+                                        if changed {
                                             cx.notify();
                                         }
                                     });
@@ -767,9 +735,7 @@ impl Workspace {
                             })
                             .detach();
                         }
-                        Action::Connect => {
-                            Self::reattach(&this, cx).await;
-                        }
+                        Action::Connect => Self::reattach(&this, id, cx).await,
                         // Emitted after the machine is already Connected. The
                         // work it names is done before that, in `reattach`, so
                         // the state never claims a session that is not ready.
@@ -782,22 +748,16 @@ impl Workspace {
         .detach();
     }
 
-    /// Rebuild the transport underneath the live view.
+    /// Rebuild one session's transport underneath its live view.
     ///
     /// Everything the session needs is done before `ConnectSucceeded` is fed
     /// in: the connection, the tmux attach, the pty swap, the pump, and the
     /// port forwards. The machine only returns to Connected once the session
     /// is genuinely usable, rather than announcing it and then catching up.
-    async fn reattach(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+    async fn reattach(this: &WeakEntity<Self>, id: u64, cx: &mut AsyncApp) {
         let Ok(Some((host, slug, view))) = this.read_with(cx, |this, _| {
-            let Pane::Session(view) = &this.pane else {
-                return None;
-            };
-            Some((
-                this.session_host.clone()?,
-                this.session_slug.clone(),
-                view.clone(),
-            ))
+            let tab = this.tab(id)?;
+            Some((tab.host.clone(), tab.slug.clone(), tab.view.clone()))
         }) else {
             return;
         };
@@ -815,7 +775,9 @@ impl Workspace {
                     tracing::warn!(%error, "reattach failed");
                 }
                 let _ = this.update(cx, |this, cx| {
-                    this.reconnect.handle(Event::ConnectFailed);
+                    if let Some(tab) = this.tab_mut(id) {
+                        tab.reconnect.handle(Event::ConnectFailed);
+                    }
                     cx.notify();
                 });
                 return;
@@ -826,26 +788,113 @@ impl Workspace {
         // session reported usable with its ports dead. The old forwarders are
         // dropped first: their listeners belong to a connection that no longer
         // exists, and holding them would keep the local ports bound to nothing.
-        let _ = this.update(cx, |this, _| this.forwarders.clear());
+        let _ = this.update(cx, |this, _| {
+            if let Some(tab) = this.tab_mut(id) {
+                tab.forwarders.clear();
+            }
+        });
         let forwarders = session::start_forwards(attached.connection.clone(), &forwards).await;
 
         let _ = this.update(cx, |this, cx| {
-            this.connection = Some(attached.connection.clone());
-            this.forwarders = forwarders;
-            view.update(cx, |view, cx| {
+            let Some(tab) = this.tab_mut(id) else {
+                return;
+            };
+            tab.connection = attached.connection.clone();
+            tab.forwarders = forwarders;
+            let alias = tab.host.alias.clone();
+            tab.view.update(cx, |view, cx| {
                 // The grid is untouched. tmux's repaint overwrites it in place.
                 view.swap_pty(attached.pty.clone());
                 session::start_pump(&cx.entity(), attached.events, cx);
             });
-            let step = this.reconnect.handle(Event::ConnectSucceeded);
-            tracing::info!(
-                state = ?step.state,
-                forwards = this.forwarders.len(),
-                "reattached"
-            );
+            let step = tab.reconnect.handle(Event::ConnectSucceeded);
+            let forwards = tab.forwarders.len();
+            tracing::info!(%alias, state = ?step.state, forwards, "reattached");
+            this.statuses
+                .insert(alias, HostStatus::Connection(step.state));
             cx.notify();
         });
     }
+
+    /// A first RTT sample for the status bar.
+    fn measure_rtt(&self, id: u64, cx: &mut Context<Self>) {
+        let Some(connection) = self.tab(id).map(|t| t.connection.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Ok(Some(rtt)) = runtime::spawn(session::round_trip(connection)).await {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(tab) = this.tab_mut(id) {
+                        tab.rtt = Some(rtt);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Drive the real render loop for a benchmark, then quit.
+    async fn run_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        let Some(mode) = crate::bench::Bench::from_env() else {
+            return;
+        };
+        let Ok(Some((view, pty, connection))) = this.read_with(cx, |this, _| {
+            let tab = this.active_tab()?;
+            Some((
+                tab.view.downgrade(),
+                tab.view.read_with(cx, |v, _| v.pty())?,
+                tab.connection.clone(),
+            ))
+        }) else {
+            return;
+        };
+
+        let report = match mode {
+            crate::bench::Bench::Cat => {
+                let prepared = runtime::spawn({
+                    let connection = connection.clone();
+                    async move {
+                        connection
+                            .exec(&crate::bench::create_file_command())
+                            .await
+                            .map(|o| o.stdout_string().trim().to_string())
+                    }
+                })
+                .await;
+                println!("benchmark file bytes: {prepared:?}");
+                crate::bench::run_cat(
+                    view,
+                    pty,
+                    std::time::Duration::from_secs(
+                        std::env::var("BERTH_BENCH_SETTLE")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(20),
+                    ),
+                    cx,
+                )
+                .await
+            }
+            crate::bench::Bench::Keys => {
+                crate::bench::run_keys(view, pty, 40, refresh_hz(), cx).await
+            }
+        };
+        println!("\n{}", report.text);
+        let _ = runtime::spawn(async move {
+            let _ = connection.exec(&crate::bench::remove_file_command()).await;
+        })
+        .await;
+        if !report.passed {
+            // Exit non-zero so a regression is a failure, not a number someone
+            // has to notice.
+            eprintln!("benchmark did not meet its criteria");
+            std::process::exit(1);
+        }
+        cx.update(|cx| cx.quit());
+    }
+
+    // -- rendering ---------------------------------------------------------
 
     fn warnings(&self) -> impl IntoElement {
         let theme = self.theme;
@@ -864,6 +913,7 @@ impl Workspace {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut list = div().flex().flex_col().gap(px(2.0));
+        let showing = self.active_tab().map(|t| t.host.alias.clone());
 
         for (index, host) in self.hosts.iter().enumerate() {
             let status = self
@@ -873,14 +923,13 @@ impl Workspace {
                 .unwrap_or(HostStatus::Connection(ConnectionState::Disconnected));
             let needs_verify = matches!(status, HostStatus::NeedsVerify);
             let dot = if needs_verify {
-                theme.warning
+                theme.warning.into()
             } else {
-                theme.state_colour(status.state())
+                hsla(theme.state_colour(status.state()))
             };
 
             let alias = host.alias.clone();
-            let showing = matches!(self.pane, Pane::Session(_))
-                && self.session_host.as_ref().is_some_and(|h| h.alias == alias);
+            let on_screen = showing.as_deref() == Some(alias.as_str());
 
             let mut row = div()
                 .id(("host", index))
@@ -901,13 +950,13 @@ impl Workspace {
                         .w(px(6.0))
                         .h(px(6.0))
                         .rounded(px(3.0))
-                        .bg(hsla(dot)),
+                        .bg(dot),
                 )
                 .child(div().text_color(hsla(theme.text)).child(host.alias.clone()));
 
             // The row on screen is marked, so a sidebar of connected hosts
             // still says which one is being looked at.
-            if showing {
+            if on_screen {
                 row = row.bg(hsla(theme.border));
             }
 
@@ -942,7 +991,11 @@ impl Workspace {
             list = list.child(row);
         }
 
-        for (index, forward) in self.forwarders.iter().map(|f| f.forward()).enumerate() {
+        let forwards = self
+            .active_tab()
+            .map(|t| t.forwarders.iter().map(|f| f.forward()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (index, forward) in forwards.into_iter().enumerate() {
             list = list.child(
                 div()
                     .id(("forward", index))
@@ -985,6 +1038,109 @@ impl Workspace {
             .child(self.warnings())
     }
 
+    /// One tab per open session.
+    ///
+    /// Each carries the host's own colour and its connection state, so a row of
+    /// tabs answers "which host" and "is it up" without being read word by
+    /// word. The close and kill actions are on the active tab only: an inactive
+    /// tab is a place to go, and putting a destructive control on it invites
+    /// hitting one while aiming for the other.
+    fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let mut strip = div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .h(px(30.0))
+            .px(px(6.0))
+            .bg(hsla(theme.surface))
+            .border_b(px(1.0))
+            .border_color(hsla(theme.border));
+
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let id = tab.id;
+            let active = index == self.active;
+            let colour = theme.host_colour(&tab.host.alias, tab.host.is_prod());
+
+            let mut row = div()
+                .id(("tab", id as usize))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.activate(id, cx)))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(4.0))
+                .text_xs()
+                .hover(|t| t.bg(hsla(theme.border)))
+                // The host's colour, as a bar rather than a dot, so it is not
+                // mistaken for the state indicator beside it.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(3.0))
+                        .h(px(12.0))
+                        .rounded(px(2.0))
+                        .bg(colour),
+                )
+                .child(
+                    div()
+                        .text_color(hsla(if active { theme.text } else { theme.text_muted }))
+                        .child(tab.host.alias.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(hsla(theme.state_colour(tab.state()))),
+                );
+
+            if active {
+                row = row
+                    .bg(hsla(theme.background))
+                    .child(
+                        div()
+                            .id(("detach", id as usize))
+                            .cursor_pointer()
+                            .px(px(4.0))
+                            .text_color(hsla(theme.text_muted))
+                            .hover(|b| b.text_color(hsla(theme.text)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.close(id, cx)))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| Note {
+                                    text: strings::TAB_DETACH_TOOLTIP.into(),
+                                    theme,
+                                })
+                                .into()
+                            })
+                            .child(strings::TAB_DETACH),
+                    )
+                    .child(
+                        div()
+                            .id(("kill", id as usize))
+                            .cursor_pointer()
+                            .px(px(4.0))
+                            .text_color(hsla(theme.text_muted))
+                            .hover(|b| b.text_color(hsla(theme.warning)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.ask_kill(id, cx)))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| Note {
+                                    text: strings::TAB_KILL_TOOLTIP.into(),
+                                    theme,
+                                })
+                                .into()
+                            })
+                            .child(strings::TAB_KILL),
+                    );
+            }
+            strip = strip.child(row);
+        }
+        strip
+    }
+
     fn first_run(&self) -> impl IntoElement {
         let theme = self.theme;
         let path = self
@@ -1019,38 +1175,18 @@ impl Workspace {
             )
     }
 
-    /// The host key question, over everything else.
+    /// A modal, over everything else.
     ///
-    /// Modal on purpose: this is the one moment where a wrong click means
-    /// trusting a machine the user did not mean to, so it does not sit in a
-    /// corner competing with a terminal for attention.
-    fn key_prompt(&self, prompt: &Prompt, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Modal on purpose: both questions it asks are ones where a wrong click
+    /// costs something that is awkward to undo, so neither sits in a corner
+    /// competing with a terminal for attention. Escape is always no and Enter
+    /// is always yes, which is why the two share this shell.
+    fn modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
-            .child(
-                div()
-                    .w(px(480.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .p(px(16.0))
-                    .rounded(px(4.0))
-                    .bg(hsla(theme.surface))
-                    .border_1()
-                    .border_color(hsla(theme.border))
-                    .child(
-                        div()
-                            .text_color(hsla(theme.text))
-                            .child(strings::VERIFY_TITLE),
-                    )
+        let mut body = div().flex().flex_col().gap(px(10.0));
+        let (title, accept, reject, danger) = match self.modal.as_ref() {
+            Some(Modal::Verify(prompt)) => {
+                body = body
                     .child(
                         div()
                             .text_sm()
@@ -1073,9 +1209,6 @@ impl Workspace {
                                     .text_color(hsla(theme.text_muted))
                                     .child(strings::VERIFY_FINGERPRINT_LABEL),
                             )
-                            // Selectable would be better, but reading it aloud
-                            // against the server is what this is for and the
-                            // full string has to be visible to do that.
                             .child(
                                 div()
                                     .text_color(hsla(theme.text))
@@ -1093,7 +1226,68 @@ impl Workspace {
                             .text_xs()
                             .text_color(hsla(theme.text_muted))
                             .child(strings::VERIFY_RECORDS),
+                    );
+                (
+                    strings::VERIFY_TITLE,
+                    strings::VERIFY_ACCEPT,
+                    strings::VERIFY_REJECT,
+                    false,
+                )
+            }
+            Some(Modal::Kill { alias, session, .. }) => {
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::kill_body(alias, session)),
                     )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::KILL_ALTERNATIVE),
+                    );
+                (
+                    strings::KILL_TITLE,
+                    strings::KILL_ACCEPT,
+                    strings::KILL_REJECT,
+                    true,
+                )
+            }
+            None => return div(),
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .track_focus(&self.modal_focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => this.dismiss(cx),
+                    "enter" => this.confirm(cx),
+                    _ => {}
+                }
+            }))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+            .child(
+                div()
+                    .w(px(480.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .p(px(16.0))
+                    .rounded(px(4.0))
+                    .bg(hsla(theme.surface))
+                    .border_1()
+                    .border_color(hsla(if danger { theme.warning } else { theme.border }))
+                    .child(div().text_color(hsla(theme.text)).child(title))
+                    .child(body)
                     .child(
                         div()
                             .flex()
@@ -1101,7 +1295,7 @@ impl Workspace {
                             .justify_end()
                             .child(
                                 div()
-                                    .id("reject")
+                                    .id("modal-reject")
                                     .cursor_pointer()
                                     .px(px(12.0))
                                     .py(px(6.0))
@@ -1110,20 +1304,20 @@ impl Workspace {
                                     .border_color(hsla(theme.border))
                                     .text_color(hsla(theme.text))
                                     .hover(|b| b.bg(hsla(theme.border)))
-                                    .on_click(cx.listener(|this, _, _, cx| this.reject(cx)))
-                                    .child(strings::VERIFY_REJECT),
+                                    .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx)))
+                                    .child(reject),
                             )
                             .child(
                                 div()
-                                    .id("accept")
+                                    .id("modal-accept")
                                     .cursor_pointer()
                                     .px(px(12.0))
                                     .py(px(6.0))
                                     .rounded(px(4.0))
-                                    .bg(hsla(theme.accent))
+                                    .bg(hsla(if danger { theme.warning } else { theme.accent }))
                                     .text_color(hsla(theme.background))
-                                    .on_click(cx.listener(|this, _, _, cx| this.accept(cx)))
-                                    .child(strings::VERIFY_ACCEPT),
+                                    .on_click(cx.listener(|this, _, _, cx| this.confirm(cx)))
+                                    .child(accept),
                             ),
                     ),
             )
@@ -1131,7 +1325,8 @@ impl Workspace {
 
     fn status_bar(&self) -> impl IntoElement {
         let theme = self.theme;
-        let rtt = match self.rtt {
+        let tab = self.active_tab();
+        let rtt = match tab.and_then(|t| t.rtt) {
             Some(rtt) => format!("{} ms", rtt.as_millis()),
             None => "-".to_string(),
         };
@@ -1146,17 +1341,16 @@ impl Workspace {
             .border_color(hsla(theme.border))
             .text_xs()
             .text_color(hsla(theme.text_muted))
-            .child(match &self.pane {
-                // The host actually on screen, which with warming is whichever
-                // answered first and not necessarily the first in the file.
-                Pane::Session(_) | Pane::Connecting(_) => self
-                    .session_host
-                    .as_ref()
-                    .map(|h| h.alias.clone())
+            // The host actually on screen, which with warming is whichever
+            // answered first and not necessarily the first in the file.
+            .child(
+                tab.map(|t| t.host.alias.clone())
                     .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
-                _ => strings::STATUS_NO_HOST.to_string(),
-            })
-            .child(strings::connection_state(self.reconnect.state()))
+            )
+            .child(strings::connection_state(
+                tab.map(|t| t.state())
+                    .unwrap_or(ConnectionState::Disconnected),
+            ))
             .child(rtt)
             .child(strings::STATUS_NOT_RECORDING)
     }
@@ -1168,32 +1362,46 @@ impl Render for Workspace {
         self.theme = Theme::for_appearance(window.appearance().into());
         let theme = self.theme;
 
-        if let Pane::Session(view) = &self.pane
-            && !self.focused
-            // A dialog is in front of the terminal, and the terminal must not
-            // take the keyboard out from under it.
-            && self.prompt.is_none()
+        // A modal takes the keyboard, so Escape and Enter reach it rather than
+        // the terminal underneath.
+        if self.modal.is_some() {
+            if !self.modal_focused {
+                window.focus(&self.modal_focus, cx);
+                self.modal_focused = true;
+                self.focused_tab = None;
+            }
+        } else if let Some(tab) = self.tabs.get(self.active)
+            && self.focused_tab != Some(tab.id)
         {
-            // Without this the terminal never receives a keystroke.
-            window.focus(&view.focus_handle(cx), cx);
-            self.focused = true;
+            // Without this the terminal never receives a keystroke, and after a
+            // switch it would be the wrong terminal receiving them.
+            window.focus(&tab.view.focus_handle(cx), cx);
+            self.focused_tab = Some(tab.id);
         }
 
-        let main = match &self.pane {
-            Pane::Session(view) => div().flex().flex_1().child(view.clone()),
-            Pane::Connecting(alias) => centred(
-                div()
-                    .text_color(hsla(theme.text_muted))
-                    .child(format!("{} {alias}", strings::STATE_CONNECTING)),
-            ),
-            Pane::Failed(error) => centred(
-                div()
-                    .max_w(px(560.0))
-                    .text_color(hsla(theme.warning))
-                    .child(error.clone()),
-            ),
-            Pane::FirstRun => centred(self.first_run()),
+        let main = match self.tabs.get(self.active) {
+            Some(tab) => div().flex().flex_1().child(tab.view.clone()),
+            None => match &self.empty {
+                Empty::Connecting(alias) => centred(
+                    div()
+                        .text_color(hsla(theme.text_muted))
+                        .child(format!("{} {alias}", strings::STATE_CONNECTING)),
+                ),
+                Empty::Failed(error) => centred(
+                    div()
+                        .max_w(px(560.0))
+                        .text_color(hsla(theme.warning))
+                        .child(error.clone()),
+                ),
+                Empty::FirstRun => centred(self.first_run()),
+            },
         };
+
+        let mut pane = div().flex().flex_col().flex_1();
+        if !self.tabs.is_empty() {
+            pane = pane.child(self.tabs(cx));
+        }
+        pane = pane.child(main);
 
         let mut root = div()
             .size_full()
@@ -1202,11 +1410,11 @@ impl Render for Workspace {
             .flex_col()
             .bg(hsla(theme.background))
             .text_sm()
-            .child(div().flex().flex_1().child(self.sidebar(cx)).child(main))
+            .child(div().flex().flex_1().child(self.sidebar(cx)).child(pane))
             .child(self.status_bar());
 
-        if let Some(prompt) = &self.prompt {
-            root = root.child(self.key_prompt(prompt, cx));
+        if self.modal.is_some() {
+            root = root.child(self.modal(cx));
         }
         root
     }

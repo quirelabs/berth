@@ -45,6 +45,16 @@ impl Session {
         )
     }
 
+    /// End the session and everything running in it.
+    ///
+    /// Never reached without an explicit confirmation. Closing a tab detaches,
+    /// which is reversible and loses nothing; this is the other thing, and the
+    /// two are kept as separate commands so no code path can reach this one by
+    /// meaning the other.
+    pub fn kill_command(&self) -> String {
+        format!("tmux kill-session -t {}", shell_quote(&self.tmux_name()))
+    }
+
     /// Fallback when the server has no tmux. The UI shows a banner offering to
     /// install it; Berth never installs anything itself.
     pub fn plain_shell_command() -> &'static str {
@@ -78,6 +88,28 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_names_only_this_session() {
+        let s = Session::new("main", 80, 24);
+        let command = s.kill_command();
+        assert_eq!(command, "tmux kill-session -t 'berth/main'");
+        // Anything that could end more than the one session named here.
+        assert!(!command.contains("kill-server"), "{command}");
+        assert!(!command.contains("-a"), "{command}");
+    }
+
+    /// A slug is user input and reaches a shell, so it stays quoted.
+    #[test]
+    fn kill_quotes_a_hostile_slug() {
+        let s = Session::new("main'; rm -rf /; echo '", 80, 24);
+        let command = s.kill_command();
+        assert!(!command.contains("rm -rf /;"), "{command}");
+        assert!(
+            command.starts_with("tmux kill-session -t 'berth/"),
+            "{command}"
+        );
+    }
 
     #[test]
     fn attach_command_matches_the_spec() {
