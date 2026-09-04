@@ -99,6 +99,9 @@ impl Workspace {
         let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
+            // Resolved once here, against what the platform actually has, so
+            // the grid is not built on a proportional substitute.
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
             let result = runtime::spawn(session::connect(host, slug, 80, 24, palette))
                 .await
                 .map_err(|_| "the runtime dropped the connection task".to_string())
@@ -113,7 +116,11 @@ impl Workspace {
                             TerminalView::new(
                                 terminal,
                                 Some(pty),
-                                crate::terminal_style::TerminalStyle::default(),
+                                {
+                                    let mut style = crate::terminal_style::TerminalStyle::default();
+                                    style.resolve_family(&installed);
+                                    style
+                                },
                                 cx,
                             )
                         });

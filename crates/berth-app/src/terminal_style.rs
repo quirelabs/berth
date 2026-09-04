@@ -96,12 +96,41 @@ pub struct TerminalStyle {
     pub strikethrough_thickness: f32,
 }
 
+impl TerminalStyle {
+    /// Replace the requested family with the first one in the chain that the
+    /// platform actually has installed.
+    ///
+    /// gpui's `FontFallbacks` does not do this. It is glyph-level: it covers a
+    /// character the chosen face lacks, not a face that is not there at all. A
+    /// family that fails to resolve falls through to the platform's UI font,
+    /// which is proportional, and a terminal grid built on a proportional face
+    /// has the wrong width for every cell. Nothing errors; the text merely
+    /// comes out unevenly spaced, which is how this survived until the
+    /// benchmark header started comparing the advance of `m` against `i`.
+    pub fn resolve_family(&mut self, installed: &[String]) {
+        let has = |name: &str| installed.iter().any(|f| f.eq_ignore_ascii_case(name));
+        if has(&self.font_family) {
+            return;
+        }
+        if let Some(found) = self
+            .font_fallbacks
+            .iter()
+            .find(|name| has(name))
+            .map(|name| name.to_string())
+        {
+            self.font_family = found;
+        }
+        // Nothing in the chain is installed, so the request stands and the
+        // platform substitutes. Better than silently picking something worse.
+    }
+}
+
 impl Default for TerminalStyle {
     fn default() -> Self {
         Self {
             font_family: "JetBrains Mono".to_string(),
-            // Tried in order when JetBrains Mono is not installed. The last is
-            // the platform's generic monospace, which always resolves.
+            // Walked by `resolve_family`, which has to be called before this
+            // style is used. gpui will not walk it: see that method.
             font_fallbacks: vec![
                 "Cascadia Mono".to_string(),
                 "SF Mono".to_string(),
@@ -194,6 +223,44 @@ mod tests {
 
     /// The point of the fallback list: JetBrains Mono is not installed
     /// everywhere, and the chain must end at something that always resolves.
+    #[test]
+    fn the_requested_family_is_kept_when_it_is_installed() {
+        let mut s = TerminalStyle::default();
+        s.resolve_family(&["Menlo".to_string(), "JetBrains Mono".to_string()]);
+        assert_eq!(s.font_family, "JetBrains Mono");
+    }
+
+    /// The case that was silently wrong: the requested family is absent, and
+    /// gpui would have substituted the proportional UI font rather than
+    /// walking the chain.
+    #[test]
+    fn the_first_installed_fallback_is_taken_when_it_is_not() {
+        let mut s = TerminalStyle::default();
+        s.resolve_family(&["Helvetica".to_string(), "Menlo".to_string()]);
+        assert_eq!(s.font_family, "Menlo");
+    }
+
+    #[test]
+    fn the_chain_is_walked_in_order() {
+        let mut s = TerminalStyle::default();
+        s.resolve_family(&["Menlo".to_string(), "SF Mono".to_string()]);
+        assert_eq!(s.font_family, "SF Mono", "SF Mono comes first in the chain");
+    }
+
+    #[test]
+    fn an_empty_font_list_leaves_the_request_alone() {
+        let mut s = TerminalStyle::default();
+        s.resolve_family(&[]);
+        assert_eq!(s.font_family, "JetBrains Mono");
+    }
+
+    #[test]
+    fn family_matching_ignores_case() {
+        let mut s = TerminalStyle::default();
+        s.resolve_family(&["menlo".to_string()]);
+        assert_eq!(s.font_family, "Menlo");
+    }
+
     #[test]
     fn the_fallback_chain_ends_at_generic_monospace() {
         let s = TerminalStyle::default();
