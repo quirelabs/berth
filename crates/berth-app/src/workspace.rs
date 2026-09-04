@@ -11,6 +11,7 @@ use gpui::{
 use berth_core::config::SshConfig;
 use berth_core::connection::ConnectionState;
 use berth_core::connection::state::{Action, Event};
+use berth_core::forward::Forwarder;
 use berth_core::host::Host;
 use berth_core::transport::Connection;
 
@@ -33,6 +34,10 @@ pub struct Workspace {
     /// and so the same slug lands in the same tmux session every time.
     session_host: Option<Host>,
     session_slug: String,
+    /// Live forwards for the current session. Dropping one closes its
+    /// listener, which is how a reconnect retires the forwards belonging to
+    /// the connection that died.
+    forwarders: Vec<Forwarder>,
     warnings: Vec<String>,
     ssh_config_path: Option<String>,
     theme: Theme,
@@ -67,6 +72,7 @@ impl Workspace {
             pane: Pane::FirstRun,
             session_host: None,
             session_slug: String::new(),
+            forwarders: Vec::new(),
             reconnect: crate::reconnect::Driver::new(),
             connection: None,
             rtt: None,
@@ -105,6 +111,7 @@ impl Workspace {
         let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
         self.session_host = Some(host.clone());
         self.session_slug = slug.clone();
+        let forwards = host.forwards.clone();
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             // Resolved once here, against what the platform actually has, so
@@ -117,6 +124,9 @@ impl Workspace {
 
             match result {
                 Ok(connected) => {
+                    // Same ordering as a reconnect: ports before the state.
+                    let forwarders =
+                        session::start_forwards(connected.connection.clone(), &forwards).await;
                     let _ = this.update(cx, |this, cx| {
                         let terminal = connected.terminal.clone();
                         let pty = connected.pty.clone();
@@ -136,6 +146,7 @@ impl Workspace {
                             session::start_pump(&cx.entity(), connected.events, cx);
                         });
                         this.connection = Some(connected.connection.clone());
+                        this.forwarders = forwarders;
                         this.reconnect.handle(Event::ConnectSucceeded);
                         this.pane = Pane::Session(view.clone());
                         this.drive(cx);
@@ -320,6 +331,7 @@ impl Workspace {
         }) else {
             return;
         };
+        let forwards = host.forwards.clone();
 
         // Attach at the size the grid already is, so tmux repaints into the
         // same shape and nothing reflows on the way back.
@@ -340,22 +352,27 @@ impl Workspace {
             }
         };
 
-        // Port forwards belong here, before the state goes back to Connected.
-        // There are none to restore yet; establishing them is its own M1 item,
-        // and this is the seam it lands in.
-        let forwards_restored = true;
+        // Forwards come back before the state does, so nothing ever sees a
+        // session reported usable with its ports dead. The old forwarders are
+        // dropped first: their listeners belong to a connection that no longer
+        // exists, and holding them would keep the local ports bound to nothing.
+        let _ = this.update(cx, |this, _| this.forwarders.clear());
+        let forwarders = session::start_forwards(attached.connection.clone(), &forwards).await;
 
         let _ = this.update(cx, |this, cx| {
             this.connection = Some(attached.connection.clone());
+            this.forwarders = forwarders;
             view.update(cx, |view, cx| {
                 // The grid is untouched. tmux's repaint overwrites it in place.
                 view.swap_pty(attached.pty.clone());
                 session::start_pump(&cx.entity(), attached.events, cx);
             });
-            if forwards_restored {
-                let step = this.reconnect.handle(Event::ConnectSucceeded);
-                tracing::info!(state = ?step.state, "reattached");
-            }
+            let step = this.reconnect.handle(Event::ConnectSucceeded);
+            tracing::info!(
+                state = ?step.state,
+                forwards = this.forwarders.len(),
+                "reattached"
+            );
             cx.notify();
         });
     }

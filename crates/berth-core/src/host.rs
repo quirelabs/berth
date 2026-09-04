@@ -8,6 +8,8 @@ pub struct Host {
     pub user: Option<String>,
     pub proxy_jump: Option<String>,
     pub identity_agent: Option<String>,
+    /// Local forwards declared for this host, restored on every reconnect.
+    pub forwards: Vec<crate::forward::Forward>,
     /// From berth.toml, e.g. "prod".
     pub tags: Vec<String>,
     pub group: Option<String>,
@@ -23,6 +25,7 @@ impl Host {
             user: None,
             proxy_jump: None,
             identity_agent: None,
+            forwards: Vec::new(),
             tags: Vec::new(),
             group: None,
         }

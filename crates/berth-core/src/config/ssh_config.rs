@@ -25,6 +25,7 @@ struct Stanza {
     user: Option<String>,
     proxy_jump: Option<String>,
     identity_agent: Option<String>,
+    forwards: Vec<crate::forward::Forward>,
 }
 
 impl SshConfig {
@@ -119,6 +120,14 @@ impl SshConfig {
                         "user" => stanza.user = Some(value.to_string()),
                         "proxyjump" => stanza.proxy_jump = Some(value.to_string()),
                         "identityagent" => stanza.identity_agent = Some(value.to_string()),
+                        // Repeatable, unlike most directives, so these
+                        // accumulate rather than overwrite. An unparseable one
+                        // is dropped rather than guessed at.
+                        "localforward" => {
+                            if let Some(forward) = crate::forward::parse_local_forward(value) {
+                                stanza.forwards.push(forward);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -162,6 +171,7 @@ impl SshConfig {
             host.user = stanza.user.clone();
             host.proxy_jump = stanza.proxy_jump.clone();
             host.identity_agent = stanza.identity_agent.clone();
+            host.forwards = stanza.forwards.clone();
             self.hosts.push(host);
         }
     }
@@ -273,6 +283,31 @@ mod tests {
         let c = parse("Match host bastion\n  User jump\nHost web\n  HostName w\n");
         assert_eq!(c.hosts.len(), 1);
         assert!(c.warnings.iter().any(|w| w.contains("Match")));
+    }
+
+    #[test]
+    fn local_forwards_accumulate_rather_than_overwrite() {
+        let c = parse(
+            "Host db\n  HostName h\n  LocalForward 5432 db.internal:5432\n  \
+             LocalForward 127.0.0.1:6379 cache:6379\n",
+        );
+        let host = c.get("db").unwrap();
+        assert_eq!(
+            host.forwards,
+            vec![
+                crate::forward::Forward::new(5432, "db.internal", 5432),
+                crate::forward::Forward::new(6379, "cache", 6379),
+            ]
+        );
+    }
+
+    /// A line that cannot be understood is dropped rather than guessed at: a
+    /// forward bound to the wrong port is worse than no forward.
+    #[test]
+    fn an_unparseable_local_forward_is_dropped() {
+        let c = parse("Host db\n  HostName h\n  LocalForward nonsense\n");
+        let host = c.get("db").unwrap();
+        assert!(host.forwards.is_empty());
     }
 
     #[test]

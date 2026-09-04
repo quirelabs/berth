@@ -14,6 +14,7 @@ use berth_core::transport::Connection;
 use berth_term::Terminal;
 use berth_term::size::{CellSize, TermSize};
 
+use crate::runtime;
 use crate::terminal_view::{SharedTerminal, TerminalView};
 
 /// Never gather more than this many events before painting, so a truly
@@ -161,6 +162,31 @@ pub async fn round_trip(connection: Arc<Connection>) -> Option<Duration> {
     let start = std::time::Instant::now();
     let out = connection.exec("true").await.ok()?;
     out.succeeded().then(|| start.elapsed())
+}
+
+/// Bring up every forward a host declares, on a fresh connection.
+///
+/// One that cannot bind is logged and skipped rather than failing the whole
+/// reconnect: a port taken by something else on this machine is not a reason to
+/// refuse the session, and the shell matters more than the tunnel.
+pub async fn start_forwards(
+    connection: Arc<berth_core::transport::Connection>,
+    forwards: &[berth_core::forward::Forward],
+) -> Vec<berth_core::forward::Forwarder> {
+    let mut started = Vec::new();
+    for forward in forwards {
+        match runtime::spawn(berth_core::forward::Forwarder::start(
+            connection.clone(),
+            forward.clone(),
+        ))
+        .await
+        {
+            Ok(Ok(forwarder)) => started.push(forwarder),
+            Ok(Err(error)) => tracing::warn!(%forward, %error, "forward could not be restored"),
+            Err(_) => tracing::warn!(%forward, "the runtime dropped the forward task"),
+        }
+    }
+    started
 }
 
 #[cfg(test)]

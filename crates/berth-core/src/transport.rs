@@ -213,6 +213,28 @@ impl Connection {
         crate::pty::open(channel, None, cols, rows).await
     }
 
+    /// Open a `direct-tcpip` channel to `host:port` as seen from the remote.
+    ///
+    /// This is the outbound half of a local forward: the listener is ours, the
+    /// far end of the channel is the server's connection to the target.
+    pub async fn open_forward_channel(
+        &self,
+        host: &str,
+        port: u16,
+        origin: std::net::SocketAddr,
+    ) -> Result<russh::Channel<russh::client::Msg>> {
+        let channel = self
+            .handle
+            .channel_open_direct_tcpip(
+                host,
+                u32::from(port),
+                &origin.ip().to_string(),
+                u32::from(origin.port()),
+            )
+            .await?;
+        Ok(channel)
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         self.handle
             .disconnect(Disconnect::ByApplication, "", "en")
