@@ -24,6 +24,11 @@ pub enum Error {
     )]
     HostKeyChanged { line: usize, fingerprint: String },
 
+    /// The user accepted a key and it could not be recorded, so the next
+    /// connect would ask again. Reported rather than swallowed.
+    #[error("could not record the host key: {0}")]
+    KnownHosts(String),
+
     #[error("ssh agent: {0}")]
     Agent(String),
 

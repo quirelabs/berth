@@ -4,9 +4,26 @@
 //! is a question for the user. A key that has *changed* is never a question:
 //! it is a hard error, because that is what a man-in-the-middle looks like.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use russh::keys::ssh_key::PublicKey;
+pub use russh::keys::ssh_key::PublicKey;
+
+/// An override for the known_hosts file, so a test can exercise the trust path
+/// against a fixture. Berth writes to this file when the user accepts a key,
+/// and a test must never do that to the user's own.
+pub fn path_override() -> Option<PathBuf> {
+    std::env::var("BERTH_KNOWN_HOSTS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn keys_for(host: &str, port: u16) -> Result<Vec<(usize, PublicKey)>, russh::keys::Error> {
+    match path_override() {
+        Some(path) => russh::keys::known_hosts::known_host_keys_path(host, port, path),
+        None => russh::keys::known_hosts::known_host_keys(host, port),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -31,7 +48,7 @@ impl Verdict {
 }
 
 /// What the user, or a policy, decided to do about a non-trusted key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum TrustPolicy {
     /// Refuse anything not already recorded. The safe default, and what a
     /// headless test should use.
@@ -40,6 +57,12 @@ pub enum TrustPolicy {
     /// Accept an unknown host and record it. Set only after the user has
     /// answered the trust-on-first-use prompt. A changed key is still refused.
     TrustOnFirstUse,
+    /// Refuse every key, recorded or not.
+    ///
+    /// For looking at a host's key without connecting to it. The handshake
+    /// stops at the key check, so no identity is ever offered to a host the
+    /// user has not accepted, and no session is opened on one they then reject.
+    Refuse,
 }
 
 pub fn fingerprint(key: &PublicKey) -> String {
@@ -57,7 +80,7 @@ pub fn fingerprint(key: &PublicKey) -> String {
 /// This deliberately says nothing about whether the key still matches. That
 /// question needs the server's key and is answered by [`verify`] on connect.
 pub fn is_known(host: &str, port: u16) -> bool {
-    russh::keys::known_hosts::known_host_keys(host, port)
+    keys_for(host, port)
         .map(|entries| !entries.is_empty())
         .unwrap_or(false)
 }
@@ -69,7 +92,7 @@ pub fn is_known_in(host: &str, port: u16, path: &Path) -> bool {
 }
 
 pub fn verify(host: &str, port: u16, key: &PublicKey) -> Verdict {
-    match russh::keys::known_hosts::known_host_keys(host, port) {
+    match keys_for(host, port) {
         Ok(entries) => decide(key, entries),
         // An unreadable or absent file means nothing is known yet, which is the
         // same question as an unrecorded host rather than a failure.
@@ -119,16 +142,38 @@ fn decide(key: &PublicKey, entries: Vec<(usize, PublicKey)>) -> Verdict {
 }
 
 /// Record a newly trusted host. Only ever called after an explicit yes.
+///
+/// The entry is written by russh in the standard OpenSSH known_hosts format,
+/// appended to the same file `ssh` reads, so trusting a host in Berth means
+/// `ssh` to it stops asking too. Berth deliberately does not keep its own
+/// parallel trust store.
 pub fn learn(host: &str, port: u16, key: &PublicKey) -> Result<(), russh::keys::Error> {
-    russh::keys::known_hosts::learn_known_hosts(host, port, key)
+    match path_override() {
+        Some(path) => learn_in(host, port, key, &path),
+        None => russh::keys::known_hosts::learn_known_hosts(host, port, key),
+    }
+}
+
+/// As [`learn`], against an explicit file.
+pub fn learn_in(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+) -> Result<(), russh::keys::Error> {
+    russh::keys::known_hosts::learn_known_hosts_path(host, port, key, path)
 }
 
 /// Decide whether a connection may continue.
-pub fn accepts(verdict: &Verdict, policy: TrustPolicy) -> bool {
-    match verdict {
-        Verdict::Trusted => true,
-        Verdict::Changed { .. } => false,
-        Verdict::Unknown { .. } => policy == TrustPolicy::TrustOnFirstUse,
+pub fn accepts(verdict: &Verdict, policy: &TrustPolicy) -> bool {
+    match (verdict, policy) {
+        // Nothing gets through a probe, so it can never open a session.
+        (_, TrustPolicy::Refuse) => false,
+        (Verdict::Trusted, _) => true,
+        // Never, under any policy. This is what a man-in-the-middle looks like.
+        (Verdict::Changed { .. }, _) => false,
+        (Verdict::Unknown { .. }, TrustPolicy::KnownHostsOnly) => false,
+        (Verdict::Unknown { .. }, TrustPolicy::TrustOnFirstUse) => true,
     }
 }
 
@@ -193,8 +238,8 @@ mod tests {
             "got {verdict:?}"
         );
         assert!(verdict.is_fatal());
-        assert!(!accepts(&verdict, TrustPolicy::TrustOnFirstUse));
-        assert!(!accepts(&verdict, TrustPolicy::KnownHostsOnly));
+        assert!(!accepts(&verdict, &TrustPolicy::TrustOnFirstUse));
+        assert!(!accepts(&verdict, &TrustPolicy::KnownHostsOnly));
     }
 
     #[test]
@@ -213,8 +258,8 @@ mod tests {
         let unknown = Verdict::Unknown {
             fingerprint: fingerprint(&key),
         };
-        assert!(!accepts(&unknown, TrustPolicy::default()));
-        assert!(accepts(&unknown, TrustPolicy::TrustOnFirstUse));
+        assert!(!accepts(&unknown, &TrustPolicy::default()));
+        assert!(accepts(&unknown, &TrustPolicy::TrustOnFirstUse));
     }
 
     #[test]
@@ -265,6 +310,62 @@ mod tests {
             verify_in("example.com", 22, &a_key(), &path),
             Verdict::Trusted
         );
+    }
+
+    /// A probe looks and never touches. Even a key it would have trusted must
+    /// not open a session, or rejecting the prompt would leave one open.
+    #[test]
+    fn a_probe_refuses_every_key_including_a_trusted_one() {
+        let key = a_key();
+        for verdict in [
+            Verdict::Trusted,
+            Verdict::Unknown {
+                fingerprint: fingerprint(&key),
+            },
+            Verdict::Changed {
+                line: 3,
+                fingerprint: fingerprint(&key),
+            },
+        ] {
+            assert!(
+                !accepts(&verdict, &TrustPolicy::Refuse),
+                "a probe accepted {verdict:?}"
+            );
+        }
+    }
+
+    /// Accepting must write an entry the rest of the world can read: the same
+    /// file `ssh` uses, in the format it expects.
+    #[test]
+    fn learning_writes_an_entry_that_verifies() {
+        let key = a_key();
+        let (_dir, path) = known_hosts_with(&[]);
+        assert!(!is_known_in("example.com", 22, &path));
+
+        learn_in("example.com", 22, &key, &path).unwrap();
+
+        assert!(is_known_in("example.com", 22, &path));
+        assert_eq!(verify_in("example.com", 22, &key, &path), Verdict::Trusted);
+        let written = std::fs::read_to_string(&path).unwrap();
+        // russh leads with a newline so it can never append to an unterminated
+        // last line, which leaves a blank one at the top of a fresh file.
+        let line = written
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .expect("an entry was written");
+        assert!(line.starts_with("example.com "), "{line}");
+        assert!(line.contains("ssh-ed25519 "), "{line}");
+    }
+
+    /// A non-default port is recorded in bracket form, or `ssh` on port 22
+    /// would silently inherit trust it was never given.
+    #[test]
+    fn learning_a_nonstandard_port_does_not_trust_port_22() {
+        let key = a_key();
+        let (_dir, path) = known_hosts_with(&[]);
+        learn_in("example.com", 2222, &key, &path).unwrap();
+        assert!(is_known_in("example.com", 2222, &path));
+        assert!(!is_known_in("example.com", 22, &path));
     }
 
     #[test]

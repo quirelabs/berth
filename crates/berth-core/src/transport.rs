@@ -19,9 +19,10 @@ use crate::session::Session;
 /// Keepalive interval, matching the reconnect state machine.
 pub const KEEPALIVE: Duration = Duration::from_secs(15);
 
-/// Records what the handler decided so the caller can report it precisely.
+/// Records what the handler decided, and the key it decided about, so the
+/// caller can report it precisely and record exactly what it verified.
 #[derive(Clone, Default)]
-struct Seen(Arc<Mutex<Option<Verdict>>>);
+struct Seen(Arc<Mutex<Option<(Verdict, PublicKey)>>>);
 
 /// The russh callback side of a connection.
 struct Client {
@@ -45,9 +46,9 @@ impl Handler for Client {
             }
         };
         let verdict = verify(&self.host, self.port, &public);
-        let allowed = accepts(&verdict, self.policy);
+        let allowed = accepts(&verdict, &self.policy);
         if let Ok(mut slot) = self.seen.0.lock() {
-            *slot = Some(verdict);
+            *slot = Some((verdict, public));
         }
         Ok(allowed)
     }
@@ -139,11 +140,47 @@ impl Connection {
         })
     }
 
+    /// Ask a host for its key and stop there.
+    ///
+    /// The handshake runs only as far as the key check, which refuses whatever
+    /// it is shown. Nothing is authenticated: a host the user has not accepted
+    /// never sees an identity, and one they go on to reject is left with no
+    /// session open. What comes back is the key the server put on the wire,
+    /// which is the one the user is then asked about and the one recorded if
+    /// they say yes.
+    pub async fn offered_key(host: &Host) -> Result<(Verdict, PublicKey)> {
+        let seen = Seen::default();
+        let client = Client {
+            host: host.hostname.clone(),
+            port: host.port,
+            policy: TrustPolicy::Refuse,
+            seen: seen.clone(),
+        };
+        let outcome = russh::client::connect(
+            Arc::new(Config::default()),
+            (host.hostname.as_str(), host.port),
+            client,
+        )
+        .await;
+
+        if let Ok(slot) = seen.0.lock()
+            && let Some(pair) = slot.clone()
+        {
+            return Ok(pair);
+        }
+        // The handshake never reached the key: a name that does not resolve, a
+        // refused socket, something that is not an ssh server. That failure is
+        // the honest answer, and there is no fingerprint to show.
+        Err(outcome.err().unwrap_or_else(|| {
+            Error::Config("the host completed a handshake without offering a key".into())
+        }))
+    }
+
     /// Turn a connect-time failure into the host key error when that is what
     /// actually happened, since russh only reports a rejected key generically.
     fn explain(seen: &Seen, error: Error) -> Error {
         if let Ok(slot) = seen.0.lock()
-            && let Some(verdict) = slot.as_ref()
+            && let Some((verdict, _)) = slot.as_ref()
         {
             match verdict {
                 Verdict::Changed { line, fingerprint } => {
@@ -165,7 +202,24 @@ impl Connection {
 
     /// What the host key check concluded, for the UI to display.
     pub fn host_key_verdict(&self) -> Option<Verdict> {
-        self.seen.0.lock().ok().and_then(|s| s.clone())
+        self.seen
+            .0
+            .lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|(v, _)| v.clone()))
+    }
+
+    /// The key this connection actually verified.
+    ///
+    /// Returned so the accept path records the key it just checked rather than
+    /// asking the server a second time, which would leave a gap for a different
+    /// key to be recorded than the one that was approved.
+    pub fn host_key(&self) -> Option<PublicKey> {
+        self.seen
+            .0
+            .lock()
+            .ok()
+            .and_then(|s| s.as_ref().map(|(_, k)| k.clone()))
     }
 
     /// Run one command on an exec channel and collect everything it produced.

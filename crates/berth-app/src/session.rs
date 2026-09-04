@@ -39,6 +39,54 @@ pub struct Attached {
     pub events: mpsc::Receiver<PtyEvent>,
 }
 
+/// What a host offered when asked for its key, without being trusted.
+pub enum Offer {
+    /// Nothing is recorded for this host. The key to put in front of the user,
+    /// and the one written if they accept it.
+    Unknown {
+        key: Box<berth_core::known_hosts::PublicKey>,
+        fingerprint: String,
+    },
+    /// Recorded and matching after all, so there is nothing to ask.
+    Trusted,
+    /// A different key is recorded. Never a question and never offered as one.
+    Changed { line: usize, fingerprint: String },
+}
+
+/// Ask a host what key it presents, so the user can be shown a fingerprint.
+///
+/// A host already in known_hosts is answered from the file without touching the
+/// network. Only an unrecorded one is probed, and that probe refuses whatever it
+/// is shown, so nothing is authenticated and no session is left open behind a
+/// prompt the user has not answered yet.
+pub async fn scout(host: Host) -> berth_core::Result<Offer> {
+    if berth_core::known_hosts::is_known(&host.hostname, host.port) {
+        return Ok(Offer::Trusted);
+    }
+    match Connection::offered_key(&host).await? {
+        (berth_core::known_hosts::Verdict::Trusted, _) => Ok(Offer::Trusted),
+        (berth_core::known_hosts::Verdict::Unknown { fingerprint }, key) => Ok(Offer::Unknown {
+            key: Box::new(key),
+            fingerprint,
+        }),
+        (berth_core::known_hosts::Verdict::Changed { line, fingerprint }, _) => {
+            Ok(Offer::Changed { line, fingerprint })
+        }
+    }
+}
+
+/// Record the key the user just accepted.
+///
+/// Written straight to known_hosts, in OpenSSH's own format and to the file
+/// `ssh` reads. The key recorded is the one whose fingerprint was displayed,
+/// not one fetched again afterwards, so what the user approved and what is
+/// stored cannot differ. If the server presents something else on the next
+/// connect, that is a changed key and fails loudly.
+pub fn trust(host: &Host, key: &berth_core::known_hosts::PublicKey) -> berth_core::Result<()> {
+    berth_core::known_hosts::learn(&host.hostname, host.port, key)
+        .map_err(|e| berth_core::Error::KnownHosts(e.to_string()))
+}
+
 /// Open a connection and attach to the session named by `slug`.
 ///
 /// `Session::new` uses `new-session -A`, so the same slug lands in the same
