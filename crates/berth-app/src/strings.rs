@@ -25,7 +25,35 @@ pub const STATE_VERIFY: &str = "Verify";
 pub const VERIFY_TOOLTIP: &str = "Not connected at startup because this host is not in known_hosts, and \
      warming it would have asked you to trust a key before you asked for it. \
      Open this host to see the fingerprint and decide.";
+/// The probe is in flight: Berth is asking the host for its key, and has not
+/// authenticated to it.
+pub const STATE_VERIFYING: &str = "Verifying";
 pub const STATE_FAILED: &str = "Failed";
+
+pub const VERIFY_TITLE: &str = "Trust this host key?";
+pub const VERIFY_FINGERPRINT_LABEL: &str = "SHA256";
+/// The only instruction that actually makes the answer meaningful. A
+/// fingerprint nobody compares against anything is a dialog, not a check.
+pub const VERIFY_HINT: &str = "Compare this against the server before accepting. On the host, \
+     run: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub";
+pub const VERIFY_ACCEPT: &str = "Trust and connect";
+pub const VERIFY_REJECT: &str = "Not now";
+pub const VERIFY_RECORDS: &str =
+    "Accepting appends it to your known_hosts, so ssh stops asking too.";
+
+pub const RUNTIME_DROPPED: &str = "the runtime dropped the task";
+
+pub fn verify_body(alias: &str, endpoint: &str) -> String {
+    format!("{alias} ({endpoint}) is not in your known_hosts, so Berth has not connected to it.")
+}
+
+/// Never phrased as a question. There is nothing to accept here.
+pub fn changed_key(line: usize, fingerprint: &str) -> String {
+    format!(
+        "Host key has CHANGED. known_hosts line {line} records a different key; \
+         this host offered {fingerprint}. Berth will not connect."
+    )
+}
 
 /// Shown on a forward's row, because this is where someone will be looking
 /// when it confuses them.

@@ -50,6 +50,9 @@ pub enum HostStatus {
     /// trust-on-first-use prompt. Ten dialogs on launch is a bad first run, so
     /// this host waits to be asked for and shows its fingerprint then.
     NeedsVerify,
+    /// The probe is in flight. Berth is looking at the host's key and has
+    /// authenticated to nothing.
+    Verifying,
     /// Whatever the connection is doing, as the reconnect machine sees it.
     Connection(ConnectionState),
     /// Warming failed. Recorded per host so one bad host cannot stop the rest.
@@ -62,6 +65,7 @@ impl HostStatus {
     pub fn state(&self) -> ConnectionState {
         match self {
             HostStatus::Connection(state) => *state,
+            HostStatus::Verifying => ConnectionState::Connecting,
             HostStatus::NeedsVerify | HostStatus::Failed(_) => ConnectionState::Disconnected,
         }
     }
@@ -69,10 +73,35 @@ impl HostStatus {
     pub fn label(&self) -> &'static str {
         match self {
             HostStatus::NeedsVerify => strings::STATE_VERIFY,
+            HostStatus::Verifying => strings::STATE_VERIFYING,
             HostStatus::Failed(_) => strings::STATE_FAILED,
             HostStatus::Connection(state) => strings::connection_state(*state),
         }
     }
+}
+
+/// A session that is up but not on screen.
+///
+/// The connection travels with the view because switching hosts has to carry
+/// the transport too, and the forwards travel with it because dropping a
+/// `Forwarder` closes its listener: a forward whose port is in use must not go
+/// down just because its host is no longer the one being looked at.
+struct Warm {
+    view: Entity<TerminalView>,
+    connection: Arc<Connection>,
+    forwarders: Vec<Forwarder>,
+}
+
+/// A host key the user is being asked about.
+///
+/// Holds the key itself, not just its fingerprint, so accepting records exactly
+/// what was displayed rather than asking the server again and recording
+/// whatever comes back the second time.
+struct Prompt {
+    alias: String,
+    endpoint: String,
+    fingerprint: String,
+    key: Box<berth_core::known_hosts::PublicKey>,
 }
 
 /// What the main area is showing.
@@ -95,7 +124,9 @@ pub struct Workspace {
     forwarders: Vec<Forwarder>,
     /// Sessions brought up at startup but not on screen, so switching to one
     /// is instant rather than a fresh connect and attach.
-    warmed: std::collections::BTreeMap<String, Entity<TerminalView>>,
+    warmed: std::collections::BTreeMap<String, Warm>,
+    /// The host key question currently in front of the user, if any.
+    prompt: Option<Prompt>,
     /// Per-host status, so the sidebar can show hosts landing independently.
     statuses: std::collections::BTreeMap<String, HostStatus>,
     /// When the process started, for the cold-start measurement.
@@ -114,6 +145,10 @@ pub struct Workspace {
     rtt: Option<Duration>,
     /// The terminal takes focus once, when it first appears.
     focused: bool,
+    /// Which host the keepalive loop belongs to. Switching hosts starts a new
+    /// loop, and the old one exits when it sees a number that is not its own,
+    /// so two loops can never tick the same machine.
+    driving: u64,
 }
 
 impl Workspace {
@@ -149,6 +184,7 @@ impl Workspace {
             session_slug: String::new(),
             forwarders: Vec::new(),
             warmed: std::collections::BTreeMap::new(),
+            prompt: None,
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -156,6 +192,7 @@ impl Workspace {
             connection: None,
             rtt: None,
             focused: false,
+            driving: 0,
         };
 
         this.warm(cx);
@@ -183,12 +220,20 @@ impl Workspace {
             let visible = only.as_deref() == Some(host.alias.as_str());
 
             if !berth_core::known_hosts::is_known(&host.hostname, host.port) {
-                tracing::info!(
-                    alias = %host.alias,
-                    "not warming: no known_hosts entry, waiting for the user to verify"
-                );
                 self.statuses
                     .insert(host.alias.clone(), HostStatus::NeedsVerify);
+                // The one host the user asked for by name is not warming: it is
+                // the same request a click makes, so it gets the same answer,
+                // a fingerprint to look at. Showing an empty pane instead would
+                // be a launch that silently did nothing.
+                if visible {
+                    self.verify(host, cx);
+                } else {
+                    tracing::info!(
+                        alias = %host.alias,
+                        "not warming: no known_hosts entry, waiting for the user to verify"
+                    );
+                }
                 continue;
             }
 
@@ -219,7 +264,11 @@ impl Workspace {
 
             match result {
                 Ok(connected) => {
-                    let _ = session::start_forwards(connected.connection.clone(), &forwards).await;
+                    // A warmed host's forwards come up with it and stay up. The
+                    // port is wanted by whatever is using it, not by whichever
+                    // host happens to be on screen.
+                    let forwarders =
+                        session::start_forwards(connected.connection.clone(), &forwards).await;
                     let _ = this.update(cx, |this, cx| {
                         let view = cx.new(|cx| {
                             TerminalView::new(
@@ -251,12 +300,20 @@ impl Workspace {
                             this.session_slug = std::env::var("BERTH_SESSION")
                                 .unwrap_or_else(|_| "main".to_string());
                             this.connection = Some(connected.connection.clone());
+                            this.forwarders = forwarders;
                             this.reconnect.handle(Event::Open);
                             this.reconnect.handle(Event::ConnectSucceeded);
                             this.pane = Pane::Session(view.clone());
                             this.drive(cx);
                         } else {
-                            this.warmed.insert(alias.clone(), view);
+                            this.warmed.insert(
+                                alias.clone(),
+                                Warm {
+                                    view,
+                                    connection: connected.connection.clone(),
+                                    forwarders,
+                                },
+                            );
                         }
                         this.report_cold_start(&alias);
                         cx.notify();
@@ -293,6 +350,196 @@ impl Workspace {
             "cold start to a live session"
         );
         println!("COLD_START {} ms via {alias}", elapsed.as_millis());
+    }
+
+    /// Act on a click on a host row.
+    ///
+    /// What happens is decided from what is true now rather than from the
+    /// status the sidebar last drew: a warm host is shown, a host with no
+    /// recorded key is verified first, anything else is connected. So a failed
+    /// row is retried by clicking it, and a row that failed because it was
+    /// never trusted asks the question instead of retrying the failure.
+    fn open(&mut self, alias: String, cx: &mut Context<Self>) {
+        // One question at a time, and never a connection started behind the
+        // dialog that is asking whether to make one.
+        if self.prompt.is_some() {
+            return;
+        }
+        if matches!(self.statuses.get(&alias), Some(HostStatus::Verifying)) {
+            return;
+        }
+        if self.warmed.contains_key(&alias) {
+            self.show(&alias, cx);
+            return;
+        }
+        if matches!(self.pane, Pane::Session(_))
+            && self.session_host.as_ref().is_some_and(|h| h.alias == alias)
+        {
+            return;
+        }
+        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+        if berth_core::known_hosts::is_known(&host.hostname, host.port) {
+            self.statuses
+                .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
+            self.connect(host, cx);
+        } else {
+            self.verify(host, cx);
+        }
+    }
+
+    /// Put an already-warm session on screen, parking the one it replaces.
+    ///
+    /// Parking rather than dropping: the outgoing connection, its grid and its
+    /// forwards all stay up, so coming back costs the same nothing that going
+    /// did, and a port someone is using does not close because the user looked
+    /// at another host.
+    fn show(&mut self, alias: &str, cx: &mut Context<Self>) {
+        let Some(warm) = self.warmed.remove(alias) else {
+            return;
+        };
+        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+
+        if let Pane::Session(view) = &self.pane
+            && let (Some(previous), Some(connection)) =
+                (self.session_host.clone(), self.connection.clone())
+        {
+            let parked = Warm {
+                view: view.clone(),
+                connection,
+                forwarders: std::mem::take(&mut self.forwarders),
+            };
+            self.statuses.insert(
+                previous.alias.clone(),
+                HostStatus::Connection(ConnectionState::Connected),
+            );
+            self.warmed.insert(previous.alias, parked);
+        }
+
+        self.session_host = Some(host);
+        self.session_slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
+        self.connection = Some(warm.connection);
+        self.forwarders = warm.forwarders;
+        self.pane = Pane::Session(warm.view);
+        // The incoming terminal has to take the keyboard, or the user is
+        // looking at one session and typing into another.
+        self.focused = false;
+
+        // The machine follows the visible session, so a parked host is not
+        // watched: if its link died while parked, that is noticed on the first
+        // keepalive after it comes back rather than at the moment it happened.
+        // Removing that is tabs' job, when each session gets its own machine.
+        self.reconnect = crate::reconnect::Driver::new();
+        self.reconnect.handle(Event::Open);
+        self.reconnect.handle(Event::ConnectSucceeded);
+        self.statuses.insert(
+            alias.to_string(),
+            HostStatus::Connection(ConnectionState::Connected),
+        );
+        self.drive(cx);
+        cx.notify();
+    }
+
+    /// Ask a host for its key and put the fingerprint in front of the user.
+    fn verify(&mut self, host: Host, cx: &mut Context<Self>) {
+        let alias = host.alias.clone();
+        let endpoint = format!("{}:{}", host.hostname, host.port);
+        tracing::info!(%alias, "asking the host for its key");
+        self.statuses.insert(alias.clone(), HostStatus::Verifying);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let offer = runtime::spawn(session::scout(host)).await;
+            let _ = this.update(cx, |this, cx| {
+                match offer {
+                    Ok(Ok(session::Offer::Unknown { key, fingerprint })) => {
+                        this.statuses.insert(alias.clone(), HostStatus::NeedsVerify);
+                        this.prompt = Some(Prompt {
+                            alias,
+                            endpoint,
+                            fingerprint,
+                            key,
+                        });
+                    }
+                    // Recorded between startup and the click, so there is
+                    // nothing to ask and the click meant "open this".
+                    Ok(Ok(session::Offer::Trusted)) => {
+                        if let Some(host) = this.hosts.iter().find(|h| h.alias == alias).cloned() {
+                            this.statuses
+                                .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
+                            this.connect(host, cx);
+                        }
+                    }
+                    // Never offered as a question. There is nothing here a user
+                    // can usefully be asked to accept.
+                    Ok(Ok(session::Offer::Changed { line, fingerprint })) => {
+                        tracing::error!(%alias, %line, %fingerprint, "host key has changed");
+                        this.statuses.insert(
+                            alias,
+                            HostStatus::Failed(strings::changed_key(line, &fingerprint)),
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%alias, %error, "could not reach the host to see its key");
+                        this.statuses
+                            .insert(alias, HostStatus::Failed(error.to_string()));
+                    }
+                    Err(_) => {
+                        this.statuses.insert(
+                            alias,
+                            HostStatus::Failed(strings::RUNTIME_DROPPED.to_string()),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Record the key the user accepted, then open the host.
+    fn accept(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        let Some(host) = self.hosts.iter().find(|h| h.alias == prompt.alias).cloned() else {
+            return;
+        };
+        match session::trust(&host, &prompt.key) {
+            Ok(()) => {
+                tracing::info!(
+                    alias = %prompt.alias,
+                    fingerprint = %prompt.fingerprint,
+                    "host key accepted and recorded"
+                );
+                self.statuses.insert(
+                    prompt.alias,
+                    HostStatus::Connection(ConnectionState::Connecting),
+                );
+                self.connect(host, cx);
+            }
+            Err(error) => {
+                // Nothing was written, so the host stays a question. Connecting
+                // anyway would be trusting a key that was never recorded, and
+                // would ask again on the next launch with no explanation.
+                tracing::error!(%error, alias = %prompt.alias, "could not record the accepted key");
+                self.warnings.push(error.to_string());
+                self.statuses.insert(prompt.alias, HostStatus::NeedsVerify);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Decline. Nothing is written and the host goes back to waiting.
+    fn reject(&mut self, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.prompt.take() {
+            tracing::info!(alias = %prompt.alias, "host key declined");
+            self.statuses.insert(prompt.alias, HostStatus::NeedsVerify);
+        }
+        cx.notify();
     }
 
     fn startup_host(&self) -> Option<Host> {
@@ -463,11 +710,20 @@ impl Workspace {
     /// The loop sleeps until the machine's own next deadline rather than
     /// polling, and exits when the machine says it is resting, because only an
     /// external event can move it from there.
-    fn drive(&self, cx: &mut Context<Self>) {
+    fn drive(&mut self, cx: &mut Context<Self>) {
+        self.driving += 1;
+        let mine = self.driving;
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok(Some(wait)) = this.read_with(cx, |this, _| this.reconnect.next_wait())
-                else {
+                let Ok(Some(wait)) = this.read_with(cx, |this, _| {
+                    // A loop that no longer owns the visible session exits.
+                    // Two loops on one machine would tick it twice and send
+                    // keepalives at double the interval the machine expects.
+                    if this.driving != mine {
+                        return None;
+                    }
+                    this.reconnect.next_wait()
+                }) else {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
@@ -605,7 +861,7 @@ impl Workspace {
         list
     }
 
-    fn sidebar(&self) -> impl IntoElement {
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut list = div().flex().flex_col().gap(px(2.0));
 
@@ -622,8 +878,15 @@ impl Workspace {
                 theme.state_colour(status.state())
             };
 
+            let alias = host.alias.clone();
+            let showing = matches!(self.pane, Pane::Session(_))
+                && self.session_host.as_ref().is_some_and(|h| h.alias == alias);
+
             let mut row = div()
                 .id(("host", index))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.open(alias.clone(), cx)))
+                .hover(|row| row.bg(hsla(theme.border)))
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -642,9 +905,15 @@ impl Workspace {
                 )
                 .child(div().text_color(hsla(theme.text)).child(host.alias.clone()));
 
+            // The row on screen is marked, so a sidebar of connected hosts
+            // still says which one is being looked at.
+            if showing {
+                row = row.bg(hsla(theme.border));
+            }
+
             // Only the states that need explaining carry a label. Connected is
             // the dot's job; "waiting for you" and "this one broke" are not.
-            if needs_verify || matches!(status, HostStatus::Failed(_)) {
+            if needs_verify || matches!(status, HostStatus::Verifying | HostStatus::Failed(_)) {
                 row = row.child(
                     div()
                         .text_xs()
@@ -659,7 +928,7 @@ impl Workspace {
             let note: Option<gpui::SharedString> = match &status {
                 HostStatus::Failed(reason) => Some(reason.clone().into()),
                 HostStatus::NeedsVerify => Some(strings::VERIFY_TOOLTIP.into()),
-                HostStatus::Connection(_) => None,
+                HostStatus::Verifying | HostStatus::Connection(_) => None,
             };
             if let Some(note) = note {
                 row = row.tooltip(move |_, cx| {
@@ -750,6 +1019,116 @@ impl Workspace {
             )
     }
 
+    /// The host key question, over everything else.
+    ///
+    /// Modal on purpose: this is the one moment where a wrong click means
+    /// trusting a machine the user did not mean to, so it does not sit in a
+    /// corner competing with a terminal for attention.
+    fn key_prompt(&self, prompt: &Prompt, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+            .child(
+                div()
+                    .w(px(480.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .p(px(16.0))
+                    .rounded(px(4.0))
+                    .bg(hsla(theme.surface))
+                    .border_1()
+                    .border_color(hsla(theme.border))
+                    .child(
+                        div()
+                            .text_color(hsla(theme.text))
+                            .child(strings::VERIFY_TITLE),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::verify_body(&prompt.alias, &prompt.endpoint)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .items_center()
+                            .p(px(8.0))
+                            .rounded(px(4.0))
+                            .bg(hsla(theme.background))
+                            .border_1()
+                            .border_color(hsla(theme.border))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(hsla(theme.text_muted))
+                                    .child(strings::VERIFY_FINGERPRINT_LABEL),
+                            )
+                            // Selectable would be better, but reading it aloud
+                            // against the server is what this is for and the
+                            // full string has to be visible to do that.
+                            .child(
+                                div()
+                                    .text_color(hsla(theme.text))
+                                    .child(prompt.fingerprint.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::VERIFY_HINT),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::VERIFY_RECORDS),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .justify_end()
+                            .child(
+                                div()
+                                    .id("reject")
+                                    .cursor_pointer()
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(4.0))
+                                    .border_1()
+                                    .border_color(hsla(theme.border))
+                                    .text_color(hsla(theme.text))
+                                    .hover(|b| b.bg(hsla(theme.border)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.reject(cx)))
+                                    .child(strings::VERIFY_REJECT),
+                            )
+                            .child(
+                                div()
+                                    .id("accept")
+                                    .cursor_pointer()
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(4.0))
+                                    .bg(hsla(theme.accent))
+                                    .text_color(hsla(theme.background))
+                                    .on_click(cx.listener(|this, _, _, cx| this.accept(cx)))
+                                    .child(strings::VERIFY_ACCEPT),
+                            ),
+                    ),
+            )
+    }
+
     fn status_bar(&self) -> impl IntoElement {
         let theme = self.theme;
         let rtt = match self.rtt {
@@ -784,16 +1163,19 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Light and dark follow the OS.
         self.theme = Theme::for_appearance(window.appearance().into());
         let theme = self.theme;
 
         if let Pane::Session(view) = &self.pane
             && !self.focused
+            // A dialog is in front of the terminal, and the terminal must not
+            // take the keyboard out from under it.
+            && self.prompt.is_none()
         {
             // Without this the terminal never receives a keystroke.
-            window.focus(&view.focus_handle(_cx), _cx);
+            window.focus(&view.focus_handle(cx), cx);
             self.focused = true;
         }
 
@@ -813,14 +1195,20 @@ impl Render for Workspace {
             Pane::FirstRun => centred(self.first_run()),
         };
 
-        div()
+        let mut root = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(hsla(theme.background))
             .text_sm()
-            .child(div().flex().flex_1().child(self.sidebar()).child(main))
-            .child(self.status_bar())
+            .child(div().flex().flex_1().child(self.sidebar(cx)).child(main))
+            .child(self.status_bar());
+
+        if let Some(prompt) = &self.prompt {
+            root = root.child(self.key_prompt(prompt, cx));
+        }
+        root
     }
 }
 
