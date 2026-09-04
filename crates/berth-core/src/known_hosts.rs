@@ -47,6 +47,27 @@ pub fn fingerprint(key: &PublicKey) -> String {
 }
 
 /// Check a key against the user's known_hosts.
+/// Whether anything at all is recorded for this host.
+///
+/// Asked before a connection rather than after, because warming every host at
+/// startup must never raise a trust-on-first-use prompt: ten dialogs on launch
+/// is a bad first run. A host with no entry is left alone until the user asks
+/// for it and sees the fingerprint.
+///
+/// This deliberately says nothing about whether the key still matches. That
+/// question needs the server's key and is answered by [`verify`] on connect.
+pub fn is_known(host: &str, port: u16) -> bool {
+    russh::keys::known_hosts::known_host_keys(host, port)
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn is_known_in(host: &str, port: u16, path: &Path) -> bool {
+    russh::keys::known_hosts::known_host_keys_path(host, port, path)
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false)
+}
+
 pub fn verify(host: &str, port: u16, key: &PublicKey) -> Verdict {
     match russh::keys::known_hosts::known_host_keys(host, port) {
         Ok(entries) => decide(key, entries),
@@ -251,5 +272,51 @@ mod tests {
         let key = a_key();
         assert!(fingerprint(&key).starts_with("SHA256:"));
         assert_eq!(fingerprint(&key), fingerprint(&key));
+    }
+}
+
+#[cfg(test)]
+mod known_lookup_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn file_with(contents: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        f.write_all(contents.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    #[test]
+    fn a_recorded_host_is_known() {
+        let f = file_with(
+            "example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE/ffYdOAsp6Vvx81VjAzoFgvNYZGpEfkX0vZdwcZewo\n",
+        );
+        assert!(is_known_in("example.test", 22, f.path()));
+    }
+
+    #[test]
+    fn an_unrecorded_host_is_not_known() {
+        let f = file_with(
+            "example.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE/ffYdOAsp6Vvx81VjAzoFgvNYZGpEfkX0vZdwcZewo\n",
+        );
+        assert!(!is_known_in("other.test", 22, f.path()));
+    }
+
+    /// The question warming asks. An empty or missing file means every host
+    /// waits for the user rather than every host raising a prompt.
+    #[test]
+    fn an_empty_file_knows_nothing() {
+        let f = file_with("");
+        assert!(!is_known_in("example.test", 22, f.path()));
+    }
+
+    #[test]
+    fn a_missing_file_knows_nothing() {
+        assert!(!is_known_in(
+            "example.test",
+            22,
+            std::path::Path::new("/nonexistent/known_hosts")
+        ));
     }
 }

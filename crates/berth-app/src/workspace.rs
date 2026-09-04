@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AppContext, AsyncApp, Context, Entity, Focusable, IntoElement, ParentElement, Render, Styled,
-    WeakEntity, Window, div, px,
+    AppContext, AsyncApp, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
 };
+
+use std::path::PathBuf;
 
 use berth_core::config::SshConfig;
 use berth_core::connection::ConnectionState;
@@ -19,6 +21,59 @@ use crate::strings;
 use crate::terminal_view::TerminalView;
 use crate::theme::{Appearance, Theme, hsla};
 use crate::{runtime, session};
+
+/// A tooltip body. gpui wants a view, and this is the whole of it.
+struct Note {
+    text: gpui::SharedString,
+    theme: Theme,
+}
+
+impl Render for Note {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.0))
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(hsla(self.theme.surface))
+            .border_1()
+            .border_color(hsla(self.theme.border))
+            .text_xs()
+            .text_color(hsla(self.theme.text))
+            .child(self.text.clone())
+    }
+}
+
+/// What the sidebar shows for one host.
+#[derive(Debug, Clone)]
+pub enum HostStatus {
+    /// Nothing recorded in known_hosts, so warming it would raise a
+    /// trust-on-first-use prompt. Ten dialogs on launch is a bad first run, so
+    /// this host waits to be asked for and shows its fingerprint then.
+    NeedsVerify,
+    /// Whatever the connection is doing, as the reconnect machine sees it.
+    Connection(ConnectionState),
+    /// Warming failed. Recorded per host so one bad host cannot stop the rest.
+    Failed(String),
+}
+
+impl HostStatus {
+    /// The dot colour a host gets, with `NeedsVerify` deliberately not
+    /// borrowing Disconnected's grey: it is a thing to act on, not an absence.
+    pub fn state(&self) -> ConnectionState {
+        match self {
+            HostStatus::Connection(state) => *state,
+            HostStatus::NeedsVerify | HostStatus::Failed(_) => ConnectionState::Disconnected,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            HostStatus::NeedsVerify => strings::STATE_VERIFY,
+            HostStatus::Failed(_) => strings::STATE_FAILED,
+            HostStatus::Connection(state) => strings::connection_state(*state),
+        }
+    }
+}
 
 /// What the main area is showing.
 enum Pane {
@@ -38,6 +93,15 @@ pub struct Workspace {
     /// listener, which is how a reconnect retires the forwards belonging to
     /// the connection that died.
     forwarders: Vec<Forwarder>,
+    /// Sessions brought up at startup but not on screen, so switching to one
+    /// is instant rather than a fresh connect and attach.
+    warmed: std::collections::BTreeMap<String, Entity<TerminalView>>,
+    /// Per-host status, so the sidebar can show hosts landing independently.
+    statuses: std::collections::BTreeMap<String, HostStatus>,
+    /// When the process started, for the cold-start measurement.
+    started: std::time::Instant,
+    /// Reported once, when the first host reaches a prompt.
+    cold_start_reported: bool,
     warnings: Vec<String>,
     ssh_config_path: Option<String>,
     theme: Theme,
@@ -54,8 +118,19 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let path = SshConfig::default_path().map(|p| p.display().to_string());
-        let (hosts, warnings) = match SshConfig::load_default() {
+        // Overridable so a test can point at a fixture instead of the user's
+        // own ssh config, which Berth has no business writing to or depending
+        // on the contents of.
+        let override_path = std::env::var("BERTH_SSH_CONFIG").ok().map(PathBuf::from);
+        let path = override_path
+            .clone()
+            .or_else(SshConfig::default_path)
+            .map(|p| p.display().to_string());
+        let loaded = match &override_path {
+            Some(p) => SshConfig::load(p),
+            None => SshConfig::load_default(),
+        };
+        let (hosts, warnings) = match loaded {
             Ok(config) => (config.hosts, config.warnings),
             Err(error) => {
                 tracing::warn!(%error, "could not read ssh config");
@@ -73,19 +148,151 @@ impl Workspace {
             session_host: None,
             session_slug: String::new(),
             forwarders: Vec::new(),
+            warmed: std::collections::BTreeMap::new(),
+            statuses: std::collections::BTreeMap::new(),
+            started: std::time::Instant::now(),
+            cold_start_reported: false,
             reconnect: crate::reconnect::Driver::new(),
             connection: None,
             rtt: None,
             focused: false,
         };
 
-        // Connect straight away to the host named by BERTH_HOST, or the only
-        // host in ssh config. Anything more deliberate waits for the command
-        // palette in M1.
-        if let Some(host) = this.startup_host() {
-            this.connect(host, cx);
-        }
+        this.warm(cx);
         this
+    }
+
+    /// Open every host that is already trusted, in parallel, at startup.
+    ///
+    /// Warming is deliberately not a connection attempt for every host in the
+    /// file. A host with nothing in known_hosts would raise a trust-on-first-use
+    /// prompt, and a first run that opens ten dialogs is worse than one that
+    /// opens none: those hosts are marked `NeedsVerify` and wait to be asked
+    /// for, so the fingerprint is shown when the user is looking at that host
+    /// rather than at a pile of modals.
+    ///
+    /// Each host gets its own task. One that is slow or refuses cannot hold up
+    /// the others, which is the whole point of doing this at startup.
+    fn warm(&mut self, cx: &mut Context<Self>) {
+        let hosts = self.hosts.clone();
+        let only = self.startup_host().map(|h| h.alias);
+
+        for host in hosts {
+            // BERTH_HOST, or a single-host config, still picks what the pane
+            // shows. Warming decides what is connected, not what is visible.
+            let visible = only.as_deref() == Some(host.alias.as_str());
+
+            if !berth_core::known_hosts::is_known(&host.hostname, host.port) {
+                tracing::info!(
+                    alias = %host.alias,
+                    "not warming: no known_hosts entry, waiting for the user to verify"
+                );
+                self.statuses
+                    .insert(host.alias.clone(), HostStatus::NeedsVerify);
+                continue;
+            }
+
+            self.statuses.insert(
+                host.alias.clone(),
+                HostStatus::Connection(ConnectionState::Connecting),
+            );
+            if visible {
+                self.connect(host, cx);
+            } else {
+                self.warm_one(host, cx);
+            }
+        }
+    }
+
+    /// Bring a host up without showing it, so switching to it later is instant.
+    fn warm_one(&mut self, host: Host, cx: &mut Context<Self>) {
+        let alias = host.alias.clone();
+        let slug = std::env::var("BERTH_SESSION").unwrap_or_else(|_| "main".to_string());
+        let forwards = host.forwards.clone();
+        cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
+            let result = runtime::spawn(session::connect(host, slug, 80, 24, palette))
+                .await
+                .map_err(|_| "the runtime dropped the connection task".to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+
+            match result {
+                Ok(connected) => {
+                    let _ = session::start_forwards(connected.connection.clone(), &forwards).await;
+                    let _ = this.update(cx, |this, cx| {
+                        let view = cx.new(|cx| {
+                            TerminalView::new(
+                                connected.terminal.clone(),
+                                Some(connected.pty.clone()),
+                                {
+                                    let mut style = crate::terminal_style::TerminalStyle::default();
+                                    style.resolve_family(&installed);
+                                    style
+                                },
+                                cx,
+                            )
+                        });
+                        view.update(cx, |_, cx| {
+                            session::start_pump(&cx.entity(), connected.events, cx);
+                        });
+                        this.statuses.insert(
+                            alias.clone(),
+                            HostStatus::Connection(ConnectionState::Connected),
+                        );
+                        // Nothing on screen yet, so the first host to land gets
+                        // the pane. Showing the first-run screen while several
+                        // hosts are connected behind it is simply wrong, and
+                        // whichever host answered first is the one the user can
+                        // start typing into soonest.
+                        if matches!(this.pane, Pane::FirstRun | Pane::Connecting(_)) {
+                            this.session_host =
+                                this.hosts.iter().find(|h| h.alias == alias).cloned();
+                            this.session_slug = std::env::var("BERTH_SESSION")
+                                .unwrap_or_else(|_| "main".to_string());
+                            this.connection = Some(connected.connection.clone());
+                            this.reconnect.handle(Event::Open);
+                            this.reconnect.handle(Event::ConnectSucceeded);
+                            this.pane = Pane::Session(view.clone());
+                            this.drive(cx);
+                        } else {
+                            this.warmed.insert(alias.clone(), view);
+                        }
+                        this.report_cold_start(&alias);
+                        cx.notify();
+                    });
+                }
+                Err(error) => {
+                    // Recorded against this host only. A host that refuses must
+                    // not take the others down with it.
+                    tracing::warn!(%alias, %error, "warming failed");
+                    let _ = this.update(cx, |this, cx| {
+                        this.statuses
+                            .insert(alias.clone(), HostStatus::Failed(error));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Report the first host to come up, once.
+    ///
+    /// The number that matters is the fastest host, not the average: what a
+    /// user waits for at launch is something to type into.
+    fn report_cold_start(&mut self, alias: &str) {
+        if self.cold_start_reported {
+            return;
+        }
+        self.cold_start_reported = true;
+        let elapsed = self.started.elapsed();
+        tracing::info!(
+            alias = %alias,
+            ms = elapsed.as_millis(),
+            "cold start to a live session"
+        );
+        println!("COLD_START {} ms via {alias}", elapsed.as_millis());
     }
 
     fn startup_host(&self) -> Option<Host> {
@@ -149,6 +356,11 @@ impl Workspace {
                         this.forwarders = forwarders;
                         this.reconnect.handle(Event::ConnectSucceeded);
                         this.pane = Pane::Session(view.clone());
+                        this.statuses.insert(
+                            alias.clone(),
+                            HostStatus::Connection(this.reconnect.state()),
+                        );
+                        this.report_cold_start(&alias);
                         this.drive(cx);
                         cx.notify();
                     });
@@ -228,6 +440,8 @@ impl Workspace {
                 Err(error) => {
                     tracing::error!(%error, "connection failed");
                     let _ = this.update(cx, |this, cx| {
+                        this.statuses
+                            .insert(alias.clone(), HostStatus::Failed(error.clone()));
                         this.reconnect.handle(Event::ConnectFailed);
                         // A failure with a grid already on screen keeps it:
                         // the machine is Reconnecting, not Disconnected, and
@@ -395,29 +609,89 @@ impl Workspace {
         let theme = self.theme;
         let mut list = div().flex().flex_col().gap(px(2.0));
 
-        for host in &self.hosts {
-            let connected = matches!(self.pane, Pane::Session(_)) && self.hosts.len() == 1
-                || Some(host.alias.as_str()) == std::env::var("BERTH_HOST").ok().as_deref();
-            let state = if connected {
-                self.reconnect.state()
+        for (index, host) in self.hosts.iter().enumerate() {
+            let status = self
+                .statuses
+                .get(&host.alias)
+                .cloned()
+                .unwrap_or(HostStatus::Connection(ConnectionState::Disconnected));
+            let needs_verify = matches!(status, HostStatus::NeedsVerify);
+            let dot = if needs_verify {
+                theme.warning
             } else {
-                ConnectionState::Disconnected
+                theme.state_colour(status.state())
             };
+
+            let mut row = div()
+                .id(("host", index))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                // Never shrink: flex was collapsing this to nothing to make
+                // room for a long label, which took the state indicator away
+                // from exactly the host that most needed one.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(hsla(dot)),
+                )
+                .child(div().text_color(hsla(theme.text)).child(host.alias.clone()));
+
+            // Only the states that need explaining carry a label. Connected is
+            // the dot's job; "waiting for you" and "this one broke" are not.
+            if needs_verify || matches!(status, HostStatus::Failed(_)) {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(status.label()),
+                );
+            }
+
+            // Why it failed, or why it was left alone, goes on the row: for
+            // the same reason the forward note does, this is where someone is
+            // looking when they ask.
+            let note: Option<gpui::SharedString> = match &status {
+                HostStatus::Failed(reason) => Some(reason.clone().into()),
+                HostStatus::NeedsVerify => Some(strings::VERIFY_TOOLTIP.into()),
+                HostStatus::Connection(_) => None,
+            };
+            if let Some(note) = note {
+                row = row.tooltip(move |_, cx| {
+                    cx.new(|_| Note {
+                        text: note.clone(),
+                        theme,
+                    })
+                    .into()
+                });
+            }
+            list = list.child(row);
+        }
+
+        for (index, forward) in self.forwarders.iter().map(|f| f.forward()).enumerate() {
             list = list.child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
+                    .id(("forward", index))
                     .px(px(10.0))
-                    .py(px(4.0))
-                    .child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded(px(3.0))
-                            .bg(hsla(theme.state_colour(state))),
-                    )
-                    .child(div().text_color(hsla(theme.text)).child(host.alias.clone())),
+                    .py(px(2.0))
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .child(forward.to_string())
+                    // The bind clash is confusing exactly here and nowhere
+                    // else, so the explanation lives on the row rather than in
+                    // a document nobody has open at the time.
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| Note {
+                            text: strings::FORWARD_BIND_TOOLTIP.into(),
+                            theme,
+                        })
+                        .into()
+                    }),
             );
         }
 
@@ -494,9 +768,11 @@ impl Workspace {
             .text_xs()
             .text_color(hsla(theme.text_muted))
             .child(match &self.pane {
+                // The host actually on screen, which with warming is whichever
+                // answered first and not necessarily the first in the file.
                 Pane::Session(_) | Pane::Connecting(_) => self
-                    .hosts
-                    .first()
+                    .session_host
+                    .as_ref()
                     .map(|h| h.alias.clone())
                     .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
                 _ => strings::STATUS_NO_HOST.to_string(),
