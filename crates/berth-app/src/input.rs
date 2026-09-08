@@ -28,6 +28,34 @@ pub enum Clipboard {
 /// annoying thing a terminal can do. On macOS the platform modifier is used, as
 /// every other Mac application does, and Cmd is never sent to the remote
 /// anyway.
+/// A workspace command, as opposed to something the remote should see.
+///
+/// All of these are Cmd chords, which `berth_term` already refuses to send to
+/// the remote, so taking them costs the shell nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    NextPane,
+}
+
+pub fn command(keystroke: &Keystroke) -> Option<Command> {
+    let m = &keystroke.modifiers;
+    if !m.platform || m.control || m.alt {
+        return None;
+    }
+    match (keystroke.key.as_str(), m.shift) {
+        ("d", false) => Some(Command::SplitRight),
+        ("d", true) => Some(Command::SplitDown),
+        // Cmd+W closes the pane, not the window, which is what it means in
+        // every other terminal with splits.
+        ("w", false) => Some(Command::ClosePane),
+        ("]", _) => Some(Command::NextPane),
+        _ => None,
+    }
+}
+
 pub fn clipboard_action(keystroke: &Keystroke) -> Option<Clipboard> {
     let m = &keystroke.modifiers;
     let key = keystroke.key.as_str();
@@ -133,6 +161,7 @@ fn translate_with(keystroke: &Keystroke, option_composes: bool) -> Option<KeyEve
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use gpui::Modifiers as GpuiModifiers;
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: GpuiModifiers) -> Keystroke {
@@ -372,5 +401,57 @@ mod tests {
         };
         let ev = translate(&keystroke("k", Some("k"), mods)).unwrap();
         assert!(ev.mods.cmd, "cmd is a shortcut modifier, handled upstream");
+    }
+
+    fn cmd(key: &str, shift: bool) -> Keystroke {
+        keystroke(
+            key,
+            None,
+            GpuiModifiers {
+                platform: true,
+                shift,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn the_split_chords_are_distinct() {
+        assert_eq!(command(&cmd("d", false)), Some(Command::SplitRight));
+        assert_eq!(command(&cmd("d", true)), Some(Command::SplitDown));
+        assert_eq!(command(&cmd("w", false)), Some(Command::ClosePane));
+        assert_eq!(command(&cmd("]", false)), Some(Command::NextPane));
+    }
+
+    /// Every command is a Cmd chord, so nothing here can eat a key the shell
+    /// needs. Ctrl+D in particular has to stay an EOF.
+    #[test]
+    fn a_bare_key_is_never_a_command() {
+        for key in ["d", "w", "]", "c"] {
+            assert_eq!(
+                command(&keystroke(key, Some(key), plain())),
+                None,
+                "{key} was taken from the shell"
+            );
+            let ctrl = GpuiModifiers {
+                control: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                command(&keystroke(key, None, ctrl)),
+                None,
+                "ctrl+{key} was taken from the shell"
+            );
+        }
+    }
+
+    /// Copy and paste keep Cmd+C and Cmd+V; a command must not shadow them.
+    #[test]
+    fn commands_and_the_clipboard_do_not_overlap() {
+        for key in ["c", "v"] {
+            assert_eq!(command(&cmd(key, false)), None);
+        }
+        assert!(clipboard_action(&cmd("d", false)).is_none());
+        assert!(clipboard_action(&cmd("w", false)).is_none());
     }
 }

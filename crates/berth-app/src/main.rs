@@ -4,6 +4,7 @@
 mod bench;
 mod input;
 mod metrics;
+mod panes;
 mod reconnect;
 mod render_probe;
 mod runtime;

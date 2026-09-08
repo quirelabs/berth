@@ -18,6 +18,7 @@ use berth_core::forward::Forwarder;
 use berth_core::host::Host;
 use berth_core::transport::Connection;
 
+use crate::panes::{Axis, Node};
 use crate::strings;
 use crate::terminal_view::TerminalView;
 use crate::theme::{Appearance, Theme, hsla};
@@ -101,7 +102,7 @@ struct Conn {
 }
 
 /// One open session: a tmux session on a host, and the view onto it.
-struct Tab {
+struct Pane {
     /// Stable across reordering and closing, unlike an index.
     id: u64,
     host: Host,
@@ -109,10 +110,30 @@ struct Tab {
     view: Entity<TerminalView>,
 }
 
-impl Tab {
+impl Pane {
     fn tmux_name(&self) -> String {
         berth_core::session::Session::new(self.slug.clone(), 80, 24).tmux_name()
     }
+}
+
+/// Where a newly opened session goes.
+#[derive(Clone, Copy)]
+enum Place {
+    /// A tab of its own. `show` when the user asked for this host by name.
+    Tab { show: bool },
+    /// Beside an existing pane, splitting it.
+    Beside { pane: u64, axis: Axis },
+}
+
+/// A tab: a tree of panes, and which one has the keyboard.
+///
+/// The spec called for one tab per session. With splits that is the same thing
+/// read a level up: a tab holds a tree, an unsplit tab is one session, and the
+/// tab's label follows whichever pane is focused.
+struct Tab {
+    id: u64,
+    root: Node,
+    focus: u64,
 }
 
 /// A host key the user is being asked about.
@@ -136,7 +157,7 @@ enum Modal {
     /// Killing is not closing. This exists so the destructive one has to be
     /// asked for twice and can never be reached by meaning the other.
     Kill {
-        tab: u64,
+        pane: u64,
         alias: String,
         session: String,
     },
@@ -153,17 +174,20 @@ pub struct Workspace {
     hosts: Vec<Host>,
     /// One per host, shared by every session on it.
     conns: std::collections::BTreeMap<String, Conn>,
+    /// Every open session, flat. The trees hold ids into this.
+    panes: Vec<Pane>,
     tabs: Vec<Tab>,
     active: usize,
+    next_pane_id: u64,
     next_tab_id: u64,
     modal: Option<Modal>,
     /// The modal takes the keyboard so Escape and Enter reach it rather than
     /// the terminal underneath.
     modal_focus: FocusHandle,
     modal_focused: bool,
-    /// Which tab currently holds the keyboard, so switching moves it. Without
+    /// Which pane currently holds the keyboard, so switching moves it. Without
     /// this the user looks at one session and types into another.
-    focused_tab: Option<u64>,
+    focused_pane: Option<u64>,
     /// Per-host status, so the sidebar can show hosts landing independently.
     statuses: std::collections::BTreeMap<String, HostStatus>,
     /// When the process started, for the cold-start measurement.
@@ -206,13 +230,15 @@ impl Workspace {
             theme: Theme::for_appearance(Appearance::Dark),
             empty: Empty::FirstRun,
             conns: std::collections::BTreeMap::new(),
+            panes: Vec::new(),
             tabs: Vec::new(),
             active: 0,
+            next_pane_id: 0,
             next_tab_id: 0,
             modal: None,
             modal_focus: cx.focus_handle(),
             modal_focused: false,
-            focused_tab: None,
+            focused_pane: None,
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -224,38 +250,72 @@ impl Workspace {
 
     // -- sessions ----------------------------------------------------------
 
-    fn tab(&self, id: u64) -> Option<&Tab> {
-        self.tabs.iter().find(|t| t.id == id)
+    fn pane(&self, id: u64) -> Option<&Pane> {
+        self.panes.iter().find(|p| p.id == id)
     }
 
-    fn active_tab(&self) -> Option<&Tab> {
+    fn tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
 
-    fn tab_for(&self, alias: &str) -> Option<u64> {
-        self.tabs
-            .iter()
-            .find(|t| t.host.alias == alias)
-            .map(|t| t.id)
+    /// The pane with the keyboard, which is what most commands act on.
+    fn focused(&self) -> Option<&Pane> {
+        self.pane(self.tab()?.focus)
     }
 
-    /// The connection a tab's session runs on.
+    /// The tab holding a pane, by index.
+    fn tab_of(&self, pane: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.root.contains(pane))
+    }
+
+    /// A pane already showing this host, if there is one.
+    fn pane_for(&self, alias: &str) -> Option<u64> {
+        self.panes
+            .iter()
+            .find(|p| p.host.alias == alias)
+            .map(|p| p.id)
+    }
+
+    /// The connection a pane's session runs on.
     fn conn_of(&self, id: u64) -> Option<&Conn> {
-        self.tab(id).and_then(|t| self.conns.get(&t.host.alias))
+        self.pane(id).and_then(|p| self.conns.get(&p.host.alias))
     }
 
     /// How many sessions are still using a host's connection.
     ///
     /// The connection outlives any one of them, so it is only retired when the
-    /// last one goes. Splits make this greater than one.
+    /// last one goes. Splits are what make this greater than one.
     fn sessions_on(&self, alias: &str) -> usize {
-        self.tabs.iter().filter(|t| t.host.alias == alias).count()
+        self.panes.iter().filter(|p| p.host.alias == alias).count()
     }
 
     fn state_of(&self, id: u64) -> ConnectionState {
         self.conn_of(id)
             .map(|c| c.reconnect.state())
             .unwrap_or(ConnectionState::Disconnected)
+    }
+
+    /// A session name not already in use on this host.
+    ///
+    /// Splitting a host opens a second shell on it, which needs its own tmux
+    /// session or both panes would attach to the same one and mirror each
+    /// other. The base name is kept for the first, so an unsplit host still
+    /// lands in `berth/main` and nothing about the common case changes.
+    fn free_slug(&self, alias: &str) -> String {
+        let base = Self::slug();
+        let taken: Vec<&str> = self
+            .panes
+            .iter()
+            .filter(|p| p.host.alias == alias)
+            .map(|p| p.slug.as_str())
+            .collect();
+        if !taken.contains(&base.as_str()) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|candidate| !taken.contains(&candidate.as_str()))
+            .expect("the range is unbounded")
     }
 
     fn slug() -> String {
@@ -267,13 +327,15 @@ impl Workspace {
     ///
     /// Everything that makes a session a session happens here, once, so a first
     /// connect and a warm one cannot drift into behaving differently.
+    #[allow(clippy::too_many_arguments)]
     fn adopt(
         &mut self,
         host: Host,
+        slug: String,
         connected: session::Connected,
         forwarders: Vec<Forwarder>,
         installed: Vec<String>,
-        show: bool,
+        place: Place,
         cx: &mut Context<Self>,
     ) {
         let alias = host.alias.clone();
@@ -293,8 +355,8 @@ impl Workspace {
             session::start_pump(&cx.entity(), connected.events, cx);
         });
 
-        self.next_tab_id += 1;
-        let id = self.next_tab_id;
+        self.next_pane_id += 1;
+        let id = self.next_pane_id;
 
         // A second session on a host joins the connection that is already
         // there rather than opening another one.
@@ -314,23 +376,46 @@ impl Workspace {
             );
         }
 
-        self.tabs.push(Tab {
+        self.panes.push(Pane {
             id,
             host,
-            slug: Self::slug(),
+            slug,
             view,
         });
         self.statuses.insert(
             alias.clone(),
             HostStatus::Connection(ConnectionState::Connected),
         );
-        // The first session to land is shown whether or not it was asked for by
-        // name. Sitting on the first-run screen with a live session behind it
-        // would be wrong, and whichever host answered first is the one the user
-        // can start typing into soonest.
-        if show || self.tabs.len() == 1 {
-            self.active = self.tabs.len() - 1;
+
+        match place {
+            Place::Tab { show } => {
+                self.next_tab_id += 1;
+                self.tabs.push(Tab {
+                    id: self.next_tab_id,
+                    root: Node::leaf(id),
+                    focus: id,
+                });
+                // The first session to land is shown whether or not it was
+                // asked for by name. Sitting on the first-run screen with a
+                // live session behind it would be wrong, and whichever host
+                // answered first is the one the user can type into soonest.
+                if show || self.tabs.len() == 1 {
+                    self.active = self.tabs.len() - 1;
+                }
+            }
+            Place::Beside { pane, axis } => {
+                let Some(index) = self.tab_of(pane) else {
+                    return;
+                };
+                let tab = &mut self.tabs[index];
+                tab.root.split(pane, axis, id);
+                // The new pane takes the keyboard, as it does in every other
+                // splitting editor: you split in order to type in the new one.
+                tab.focus = id;
+                self.active = index;
+            }
         }
+
         self.report_cold_start(&alias);
         // One driver and one measurement per connection, not per session.
         if fresh {
@@ -387,22 +472,29 @@ impl Workspace {
         }
     }
 
-    /// Bring a host up, as a tab, shown or not.
+    /// Bring a host up in a tab of its own, shown or not.
     fn connect(&mut self, host: Host, show: bool, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
         tracing::info!(%alias, "connecting");
-        let slug = Self::slug();
+        let slug = self.free_slug(&alias);
         let forwards = host.forwards.clone();
+        let place = Place::Tab { show };
 
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             // Resolved once here, against what the platform actually has, so
             // the grid is not built on a proportional substitute.
             let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let result = runtime::spawn(session::connect(host.clone(), slug, 80, 24, palette))
-                .await
-                .map_err(|_| strings::RUNTIME_DROPPED.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()));
+            let result = runtime::spawn(session::connect(
+                host.clone(),
+                slug.clone(),
+                80,
+                24,
+                palette,
+            ))
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
 
             match result {
                 Ok(connected) => {
@@ -410,7 +502,7 @@ impl Workspace {
                     let forwarders =
                         session::start_forwards(connected.connection.clone(), &forwards).await;
                     let _ = this.update(cx, |this, cx| {
-                        this.adopt(host, connected, forwarders, installed, show, cx);
+                        this.adopt(host, slug, connected, forwarders, installed, place, cx);
                     });
 
                     // Benchmarks drive the real render loop, then quit.
@@ -482,8 +574,13 @@ impl Workspace {
         if matches!(self.statuses.get(&alias), Some(HostStatus::Verifying)) {
             return;
         }
-        if let Some(id) = self.tab_for(&alias) {
-            self.activate(id, cx);
+        // Already open somewhere: go to it rather than opening a second one.
+        if let Some(pane) = self.pane_for(&alias)
+            && let Some(index) = self.tab_of(pane)
+        {
+            self.active = index;
+            self.tabs[index].focus = pane;
+            cx.notify();
             return;
         }
         let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
@@ -498,14 +595,91 @@ impl Workspace {
         }
     }
 
-    fn activate(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+    fn activate(&mut self, tab: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
             self.active = index;
             cx.notify();
         }
     }
 
-    /// Close a tab. This detaches and never kills.
+    /// Give a pane the keyboard, and show the tab holding it.
+    fn focus_pane(&mut self, pane: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self.tab_of(pane) {
+            self.active = index;
+            self.tabs[index].focus = pane;
+            cx.notify();
+        }
+    }
+
+    /// Act on a workspace key chord.
+    fn run(&mut self, command: crate::input::Command, cx: &mut Context<Self>) {
+        use crate::input::Command;
+        match command {
+            Command::SplitRight => self.split(Axis::Horizontal, cx),
+            Command::SplitDown => self.split(Axis::Vertical, cx),
+            Command::ClosePane => {
+                if let Some(pane) = self.focused().map(|p| p.id) {
+                    self.close(pane, cx);
+                }
+            }
+            Command::NextPane => {
+                if let Some(next) = self.tab().and_then(|t| t.root.next_after(t.focus)) {
+                    self.focus_pane(next, cx);
+                }
+            }
+        }
+    }
+
+    /// Split the focused pane, opening a second session on the same host.
+    ///
+    /// The new session rides the connection that is already open, so splitting
+    /// a host four ways is four channels and one handshake. It gets its own
+    /// tmux session, because two panes attached to one would mirror each other
+    /// rather than being two shells.
+    fn split(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        let Some(pane) = self.focused() else {
+            return;
+        };
+        let host = pane.host.clone();
+        let alias = host.alias.clone();
+        let from = pane.id;
+        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
+            return;
+        };
+        let slug = self.free_slug(&alias);
+        tracing::info!(%alias, %slug, ?axis, "splitting");
+        let place = Place::Beside { pane: from, axis };
+
+        cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
+            let result =
+                runtime::spawn(session::open_on(connection, slug.clone(), 80, 24, palette))
+                    .await
+                    .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
+
+            match result {
+                Ok(connected) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.adopt(host, slug, connected, Vec::new(), installed, place, cx);
+                    });
+                }
+                Err(error) => {
+                    // The existing panes are untouched. A split that could not
+                    // open is one missing pane, not a broken tab.
+                    tracing::warn!(%alias, %error, "split failed");
+                    let _ = this.update(cx, |this, cx| {
+                        this.warnings.push(error);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Close a pane. This detaches and never kills.
     ///
     /// The connection goes and the forwards go with it, because both belong to
     /// this client. The tmux session on the server does not: it keeps running,
@@ -514,15 +688,31 @@ impl Workspace {
     /// sessions are tmux-backed, and it is why this is the cheap action.
     ///
     /// The connection is only retired with the host's last session, since every
-    /// session on a host shares it.
+    /// session on a host shares it, and the tab closes with its last pane.
     fn close(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+        let Some(index) = self.panes.iter().position(|p| p.id == id) else {
             return;
         };
-        let tab = self.tabs.remove(index);
-        let alias = tab.host.alias.clone();
-        tracing::info!(%alias, session = %tab.tmux_name(), "detached");
-        drop(tab);
+        let pane = self.panes.remove(index);
+        let alias = pane.host.alias.clone();
+        tracing::info!(%alias, session = %pane.tmux_name(), "detached");
+        drop(pane);
+
+        // Take the pane out of its tab, collapsing the split it was half of.
+        // A tab with nothing left goes with it.
+        if let Some(at) = self.tabs.iter().position(|t| t.root.contains(id)) {
+            let tab = self.tabs.remove(at);
+            if let Some(root) = tab.root.without(id) {
+                let focus = if tab.focus == id {
+                    root.panes().first().copied().unwrap_or(tab.focus)
+                } else {
+                    tab.focus
+                };
+                self.tabs.insert(at, Tab { root, focus, ..tab });
+            } else if self.active > at {
+                self.active -= 1;
+            }
+        }
 
         if self.sessions_on(&alias) == 0
             && let Some(mut conn) = self.conns.remove(&alias)
@@ -556,13 +746,13 @@ impl Workspace {
 
     /// Ask before ending a session. Never kill directly from a click.
     fn ask_kill(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(tab) = self.tab(id) else {
+        let Some(pane) = self.pane(id) else {
             return;
         };
         self.modal = Some(Modal::Kill {
-            tab: id,
-            alias: tab.host.alias.clone(),
-            session: tab.tmux_name(),
+            pane: id,
+            alias: pane.host.alias.clone(),
+            session: pane.tmux_name(),
         });
         self.modal_focused = false;
         cx.notify();
@@ -570,12 +760,12 @@ impl Workspace {
 
     /// End the tmux session and everything running in it, then close the tab.
     fn kill(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(tab) = self.tab(id) else {
+        let Some(pane) = self.pane(id) else {
             return;
         };
-        let name = tab.tmux_name();
-        let command = berth_core::session::Session::new(tab.slug.clone(), 80, 24).kill_command();
-        tracing::warn!(alias = %tab.host.alias, session = %name, "killing session");
+        let name = pane.tmux_name();
+        let command = berth_core::session::Session::new(pane.slug.clone(), 80, 24).kill_command();
+        tracing::warn!(alias = %pane.host.alias, session = %name, "killing session");
         let Some(connection) = self.conn_of(id).map(|c| c.connection.clone()) else {
             return;
         };
@@ -657,7 +847,7 @@ impl Workspace {
     fn confirm(&mut self, cx: &mut Context<Self>) {
         match self.modal.take() {
             Some(Modal::Verify(prompt)) => self.accept(prompt, cx),
-            Some(Modal::Kill { tab, .. }) => self.kill(tab, cx),
+            Some(Modal::Kill { pane, .. }) => self.kill(pane, cx),
             None => {}
         }
         cx.notify();
@@ -805,18 +995,18 @@ impl Workspace {
     /// genuinely usable, rather than announcing it and then catching up.
     async fn reattach(this: &WeakEntity<Self>, alias: &str, cx: &mut AsyncApp) {
         let Ok(Some(host)) = this.read_with(cx, |this, _| {
-            this.tabs
+            this.panes
                 .iter()
-                .find(|t| t.host.alias == alias)
-                .map(|t| t.host.clone())
+                .find(|p| p.host.alias == alias)
+                .map(|p| p.host.clone())
         }) else {
             return;
         };
         let Ok(sessions) = this.read_with(cx, |this, _| {
-            this.tabs
+            this.panes
                 .iter()
-                .filter(|t| t.host.alias == alias)
-                .map(|t| (t.id, t.slug.clone(), t.view.clone()))
+                .filter(|p| p.host.alias == alias)
+                .map(|p| (p.id, p.slug.clone(), p.view.clone()))
                 .collect::<Vec<_>>()
         }) else {
             return;
@@ -878,7 +1068,7 @@ impl Workspace {
 
         let _ = this.update(cx, |this, cx| {
             for (id, attached) in restored {
-                let Some(view) = this.tab(id).map(|t| t.view.clone()) else {
+                let Some(view) = this.pane(id).map(|p| p.view.clone()) else {
                     continue;
                 };
                 view.update(cx, |view, cx| {
@@ -925,11 +1115,11 @@ impl Workspace {
             return;
         };
         let Ok(Some((view, pty, connection))) = this.read_with(cx, |this, _| {
-            let tab = this.active_tab()?;
+            let pane = this.focused()?;
             Some((
-                tab.view.downgrade(),
-                tab.view.read_with(cx, |v, _| v.pty())?,
-                this.conn_of(tab.id)?.connection.clone(),
+                pane.view.downgrade(),
+                pane.view.read_with(cx, |v, _| v.pty())?,
+                this.conn_of(pane.id)?.connection.clone(),
             ))
         }) else {
             return;
@@ -998,7 +1188,7 @@ impl Workspace {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut list = div().flex().flex_col().gap(px(2.0));
-        let showing = self.active_tab().map(|t| t.host.alias.clone());
+        let showing = self.focused().map(|p| p.host.alias.clone());
 
         for (index, host) in self.hosts.iter().enumerate() {
             let status = self
@@ -1077,8 +1267,8 @@ impl Workspace {
         }
 
         let forwards = self
-            .active_tab()
-            .and_then(|t| self.conns.get(&t.host.alias))
+            .focused()
+            .and_then(|p| self.conns.get(&p.host.alias))
             .map(|c| c.forwarders.iter().map(|f| f.forward()).collect::<Vec<_>>())
             .unwrap_or_default();
         for (index, forward) in forwards.into_iter().enumerate() {
@@ -1144,14 +1334,22 @@ impl Workspace {
             .border_color(hsla(theme.border));
 
         for (index, tab) in self.tabs.iter().enumerate() {
-            let id = tab.id;
+            // A tab is named by its focused pane, so a split tab still says
+            // which host you are looking at rather than which one it started
+            // as.
+            let Some(pane) = self.pane(tab.focus) else {
+                continue;
+            };
+            let id = pane.id;
+            let tab_id = tab.id;
             let active = index == self.active;
-            let colour = theme.host_colour(&tab.host.alias, tab.host.is_prod());
+            let colour = theme.host_colour(&pane.host.alias, pane.host.is_prod());
+            let split_count = tab.root.panes().len();
 
             let mut row = div()
-                .id(("tab", id as usize))
+                .id(("tab", tab_id as usize))
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.activate(id, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| this.activate(tab_id, cx)))
                 .flex()
                 .items_center()
                 .gap(px(6.0))
@@ -1173,7 +1371,7 @@ impl Workspace {
                 .child(
                     div()
                         .text_color(hsla(if active { theme.text } else { theme.text_muted }))
-                        .child(tab.host.alias.clone()),
+                        .child(pane.host.alias.clone()),
                 )
                 .child(
                     div()
@@ -1184,12 +1382,22 @@ impl Workspace {
                         .bg(hsla(theme.state_colour(self.state_of(id)))),
                 );
 
+            // Split tabs say how many panes they hold, since only one of them
+            // can be named.
+            if split_count > 1 {
+                row = row.child(
+                    div()
+                        .text_color(hsla(theme.text_muted))
+                        .child(format!("{split_count}")),
+                );
+            }
+
             if active {
                 row = row
                     .bg(hsla(theme.background))
                     .child(
                         div()
-                            .id(("detach", id as usize))
+                            .id(("detach", tab_id as usize))
                             .cursor_pointer()
                             .px(px(4.0))
                             .text_color(hsla(theme.text_muted))
@@ -1206,7 +1414,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .id(("kill", id as usize))
+                            .id(("kill", tab_id as usize))
                             .cursor_pointer()
                             .px(px(4.0))
                             .text_color(hsla(theme.text_muted))
@@ -1409,14 +1617,75 @@ impl Workspace {
             )
     }
 
+    /// Lay the pane tree out, splits and all.
+    ///
+    /// The focused pane carries a border in the accent colour. With more than
+    /// one terminal on screen and no cursor blinking to give it away, there has
+    /// to be something that says where the keys are going.
+    fn render_node(&self, node: &Node, focus: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
+        match node {
+            Node::Leaf(id) => {
+                let theme = self.theme;
+                let focused = *id == focus;
+                let Some(pane) = self.pane(*id) else {
+                    return div().flex().flex_1().into_any_element();
+                };
+                let pane_id = *id;
+                div()
+                    .id(("pane", pane_id as usize))
+                    // Clicking a pane focuses it, which is the only thing that
+                    // makes several terminals on screen usable with a mouse.
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.focus_pane(pane_id, cx)),
+                    )
+                    .flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(hsla(if focused { theme.accent } else { theme.border }))
+                    .child(pane.view.clone())
+                    .into_any_element()
+            }
+            Node::Split {
+                axis,
+                first,
+                second,
+            } => {
+                let row = div().flex().flex_1().min_w_0().min_h_0();
+                let row = match axis {
+                    Axis::Horizontal => row.flex_row(),
+                    Axis::Vertical => row.flex_col(),
+                };
+                row.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(self.render_node(first, focus, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(self.render_node(second, focus, cx)),
+                )
+                .into_any_element()
+            }
+        }
+    }
+
     fn status_bar(&self) -> impl IntoElement {
         let theme = self.theme;
-        let tab = self.active_tab();
-        let rtt = match tab.and_then(|t| self.conns.get(&t.host.alias)?.rtt) {
+        let pane = self.focused();
+        let rtt = match pane.and_then(|p| self.conns.get(&p.host.alias)?.rtt) {
             Some(rtt) => format!("{} ms", rtt.as_millis()),
             None => "-".to_string(),
         };
-        div()
+        let mut bar = div()
             .h(px(24.0))
             .flex()
             .items_center()
@@ -1430,15 +1699,28 @@ impl Workspace {
             // The host actually on screen, which with warming is whichever
             // answered first and not necessarily the first in the file.
             .child(
-                tab.map(|t| t.host.alias.clone())
+                pane.map(|p| p.host.alias.clone())
                     .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
             )
             .child(strings::connection_state(
-                tab.map(|t| self.state_of(t.id))
+                pane.map(|p| self.state_of(p.id))
                     .unwrap_or(ConnectionState::Disconnected),
             ))
             .child(rtt)
-            .child(strings::STATUS_NOT_RECORDING)
+            .child(strings::STATUS_NOT_RECORDING);
+
+        // Only while there is nothing to see. A keyboard feature nobody can
+        // find does not exist, and one that keeps explaining itself after you
+        // have used it is worse.
+        if self.tab().is_some_and(|t| t.root.panes().len() == 1) {
+            bar = bar.child(
+                div()
+                    .ml_auto()
+                    .text_color(hsla(theme.border))
+                    .child(strings::SPLIT_HINT),
+            );
+        }
+        bar
     }
 }
 
@@ -1454,19 +1736,24 @@ impl Render for Workspace {
             if !self.modal_focused {
                 window.focus(&self.modal_focus, cx);
                 self.modal_focused = true;
-                self.focused_tab = None;
+                self.focused_pane = None;
             }
-        } else if let Some(tab) = self.tabs.get(self.active)
-            && self.focused_tab != Some(tab.id)
+        } else if let Some(pane) = self.focused()
+            && self.focused_pane != Some(pane.id)
         {
             // Without this the terminal never receives a keystroke, and after a
-            // switch it would be the wrong terminal receiving them.
-            window.focus(&tab.view.focus_handle(cx), cx);
-            self.focused_tab = Some(tab.id);
+            // switch or a split it would be the wrong terminal receiving them.
+            let handle = pane.view.focus_handle(cx);
+            self.focused_pane = Some(pane.id);
+            window.focus(&handle, cx);
         }
 
-        let main = match self.tabs.get(self.active) {
-            Some(tab) => div().flex().flex_1().child(tab.view.clone()),
+        let showing = self.tab().map(|t| (t.root.clone(), t.focus));
+        let main = match showing {
+            Some((root, focus)) => div()
+                .flex()
+                .flex_1()
+                .child(self.render_node(&root, focus, cx)),
             None => match &self.empty {
                 Empty::Connecting(alias) => centred(
                     div()
@@ -1492,6 +1779,18 @@ impl Render for Workspace {
         let mut root = div()
             .size_full()
             .relative()
+            // Workspace chords are handled here rather than in the terminal,
+            // because they are about the window and not about the shell. Every
+            // one is a Cmd chord, which berth-term already refuses to send to
+            // the remote, so the shell loses nothing.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.modal.is_some() {
+                    return;
+                }
+                if let Some(command) = crate::input::command(&event.keystroke) {
+                    this.run(command, cx);
+                }
+            }))
             .flex()
             .flex_col()
             .bg(hsla(theme.background))

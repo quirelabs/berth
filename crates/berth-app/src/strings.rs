@@ -70,6 +70,11 @@ pub const TAB_KILL: &str = "\u{25a0}";
 pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it stops and its scrollback \
      is gone. Asks first.";
 
+/// Shown once, under an unsplit tab, because a split that nobody can find is
+/// a feature that does not exist.
+pub const SPLIT_HINT: &str =
+    "Cmd+D splits right, Cmd+Shift+D splits down, Cmd+] moves between panes";
+
 pub const KILL_TITLE: &str = "End this session?";
 pub const KILL_ACCEPT: &str = "End session";
 pub const KILL_REJECT: &str = "Cancel";

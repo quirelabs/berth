@@ -130,6 +130,25 @@ pub async fn rejoin(
     })
 }
 
+/// As [`connect`], over a connection that is already open.
+///
+/// What splitting a host uses: a new channel and a new terminal, no handshake.
+pub async fn open_on(
+    connection: Arc<Connection>,
+    slug: String,
+    cols: u16,
+    rows: u16,
+    palette: berth_term::terminal::Palette,
+) -> berth_core::Result<Connected> {
+    let attached = rejoin(connection, slug, cols, rows).await?;
+    Ok(Connected {
+        connection: attached.connection,
+        pty: attached.pty,
+        terminal: terminal_for(cols, rows, palette),
+        events: attached.events,
+    })
+}
+
 /// Connect, attach to a tmux session, and prepare a terminal for it.
 pub async fn connect(
     host: Host,
@@ -139,17 +158,20 @@ pub async fn connect(
     palette: berth_term::terminal::Palette,
 ) -> berth_core::Result<Connected> {
     let attached = attach(host, slug, cols, rows).await?;
-    // The palette comes from TerminalStyle, so every visual constant stays in
-    // one struct rather than half of them living in berth-term's defaults.
-    let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
-    term.set_palette(palette);
-    let terminal: SharedTerminal = Arc::new(Mutex::new(term));
     Ok(Connected {
         connection: attached.connection,
         pty: attached.pty,
-        terminal,
+        terminal: terminal_for(cols, rows, palette),
         events: attached.events,
     })
+}
+
+/// The palette comes from TerminalStyle, so every visual constant stays in one
+/// struct rather than half of them living in berth-term's defaults.
+fn terminal_for(cols: u16, rows: u16, palette: berth_term::terminal::Palette) -> SharedTerminal {
+    let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
+    term.set_palette(palette);
+    Arc::new(Mutex::new(term))
 }
 
 /// Drain PTY output into the view, coalescing bursts into one repaint.
