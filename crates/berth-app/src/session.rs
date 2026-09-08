@@ -108,6 +108,28 @@ pub async fn attach(
     })
 }
 
+/// Attach another tmux session over a connection that is already open.
+///
+/// Splitting a host, or reattaching several of its sessions at once, must not
+/// present sshd with a handshake per session: `MaxStartups` is 10 unauthenticated
+/// connections by default, and a workspace of panes would trip it. One
+/// connection per host with a channel per session is the shape Berth has always
+/// claimed, and this is what makes it true.
+pub async fn rejoin(
+    connection: Arc<Connection>,
+    slug: String,
+    cols: u16,
+    rows: u16,
+) -> berth_core::Result<Attached> {
+    let session = Session::new(slug, cols, rows);
+    let (pty, events) = connection.open_session(&session).await?;
+    Ok(Attached {
+        connection,
+        pty,
+        events,
+    })
+}
+
 /// Connect, attach to a tmux session, and prepare a terminal for it.
 pub async fn connect(
     host: Host,

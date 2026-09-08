@@ -81,33 +81,35 @@ impl HostStatus {
     }
 }
 
-/// One open session.
+/// Everything that belongs to a host rather than to one of its sessions.
 ///
-/// Everything a session needs is here, including its own reconnect machine.
-/// That is the point: a machine per workspace could only ever watch whatever
-/// was on screen, so a background session that dropped went unnoticed until
-/// someone looked at it. A machine per session watches all of them.
-struct Tab {
-    /// Stable across reordering and closing, unlike an index. The keepalive
-    /// loop holds this and exits when it stops resolving, which is what makes
-    /// closing a tab end its loop with no separate bookkeeping.
-    id: u64,
-    host: Host,
-    slug: String,
-    view: Entity<TerminalView>,
+/// One connection per host, with a channel per session on it. Splitting a host
+/// four ways must not present sshd with four handshakes, and the thing that
+/// drops and comes back is the connection, so the reconnect machine lives here
+/// and every session on it returns together.
+///
+/// One machine per connection, never one per workspace: a machine per workspace
+/// could only watch whatever was on screen, so a background host that dropped
+/// went unnoticed until someone looked at it.
+struct Conn {
     connection: Arc<Connection>,
-    /// Dropping one closes its listener, which is how closing a tab retires
-    /// the forwards belonging to it.
+    /// Dropping one closes its listener, which is how retiring a host's last
+    /// session retires the forwards that belonged to it.
     forwarders: Vec<Forwarder>,
     reconnect: crate::reconnect::Driver,
     rtt: Option<Duration>,
 }
 
-impl Tab {
-    fn state(&self) -> ConnectionState {
-        self.reconnect.state()
-    }
+/// One open session: a tmux session on a host, and the view onto it.
+struct Tab {
+    /// Stable across reordering and closing, unlike an index.
+    id: u64,
+    host: Host,
+    slug: String,
+    view: Entity<TerminalView>,
+}
 
+impl Tab {
     fn tmux_name(&self) -> String {
         berth_core::session::Session::new(self.slug.clone(), 80, 24).tmux_name()
     }
@@ -149,6 +151,8 @@ enum Empty {
 
 pub struct Workspace {
     hosts: Vec<Host>,
+    /// One per host, shared by every session on it.
+    conns: std::collections::BTreeMap<String, Conn>,
     tabs: Vec<Tab>,
     active: usize,
     next_tab_id: u64,
@@ -201,6 +205,7 @@ impl Workspace {
             ssh_config_path: path,
             theme: Theme::for_appearance(Appearance::Dark),
             empty: Empty::FirstRun,
+            conns: std::collections::BTreeMap::new(),
             tabs: Vec::new(),
             active: 0,
             next_tab_id: 0,
@@ -223,10 +228,6 @@ impl Workspace {
         self.tabs.iter().find(|t| t.id == id)
     }
 
-    fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
-        self.tabs.iter_mut().find(|t| t.id == id)
-    }
-
     fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -236,6 +237,25 @@ impl Workspace {
             .iter()
             .find(|t| t.host.alias == alias)
             .map(|t| t.id)
+    }
+
+    /// The connection a tab's session runs on.
+    fn conn_of(&self, id: u64) -> Option<&Conn> {
+        self.tab(id).and_then(|t| self.conns.get(&t.host.alias))
+    }
+
+    /// How many sessions are still using a host's connection.
+    ///
+    /// The connection outlives any one of them, so it is only retired when the
+    /// last one goes. Splits make this greater than one.
+    fn sessions_on(&self, alias: &str) -> usize {
+        self.tabs.iter().filter(|t| t.host.alias == alias).count()
+    }
+
+    fn state_of(&self, id: u64) -> ConnectionState {
+        self.conn_of(id)
+            .map(|c| c.reconnect.state())
+            .unwrap_or(ConnectionState::Disconnected)
     }
 
     fn slug() -> String {
@@ -275,19 +295,30 @@ impl Workspace {
 
         self.next_tab_id += 1;
         let id = self.next_tab_id;
-        let mut reconnect = crate::reconnect::Driver::new();
-        reconnect.handle(Event::Open);
-        reconnect.handle(Event::ConnectSucceeded);
+
+        // A second session on a host joins the connection that is already
+        // there rather than opening another one.
+        let fresh = !self.conns.contains_key(&alias);
+        if fresh {
+            let mut reconnect = crate::reconnect::Driver::new();
+            reconnect.handle(Event::Open);
+            reconnect.handle(Event::ConnectSucceeded);
+            self.conns.insert(
+                alias.clone(),
+                Conn {
+                    connection: connected.connection.clone(),
+                    forwarders,
+                    reconnect,
+                    rtt: None,
+                },
+            );
+        }
 
         self.tabs.push(Tab {
             id,
             host,
             slug: Self::slug(),
             view,
-            connection: connected.connection.clone(),
-            forwarders,
-            reconnect,
-            rtt: None,
         });
         self.statuses.insert(
             alias.clone(),
@@ -301,8 +332,11 @@ impl Workspace {
             self.active = self.tabs.len() - 1;
         }
         self.report_cold_start(&alias);
-        self.drive(id, cx);
-        self.measure_rtt(id, cx);
+        // One driver and one measurement per connection, not per session.
+        if fresh {
+            self.drive(alias.clone(), cx);
+            self.measure_rtt(alias, cx);
+        }
         cx.notify();
     }
 
@@ -478,32 +512,38 @@ impl Workspace {
     /// and opening the host again re-attaches to the same shell with its
     /// scrollback and its running command intact. That is the whole reason
     /// sessions are tmux-backed, and it is why this is the cheap action.
+    ///
+    /// The connection is only retired with the host's last session, since every
+    /// session on a host shares it.
     fn close(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
-        if let Some(tab) = self.tab_mut(id) {
-            // Tell the machine rather than dropping it mid-backoff. Closing is
-            // the one action that releases a session's grid, and this is the
-            // one place that reaches the state which does.
-            tab.reconnect.handle(Event::Close);
-            debug_assert!(!tab.reconnect.holds_grid());
-        }
         let tab = self.tabs.remove(index);
-        tracing::info!(alias = %tab.host.alias, session = %tab.tmux_name(), "detached");
-        self.statuses.insert(
-            tab.host.alias.clone(),
-            HostStatus::Connection(ConnectionState::Disconnected),
-        );
-        // Politeness, not correctness: dropping the handle would end it anyway,
-        // but a clean disconnect saves the server a timeout.
-        let connection = tab.connection.clone();
+        let alias = tab.host.alias.clone();
+        tracing::info!(%alias, session = %tab.tmux_name(), "detached");
         drop(tab);
-        cx.background_executor()
-            .spawn(async move {
-                let _ = connection.disconnect().await;
-            })
-            .detach();
+
+        if self.sessions_on(&alias) == 0
+            && let Some(mut conn) = self.conns.remove(&alias)
+        {
+            // Tell the machine rather than dropping it mid-backoff. Closing is
+            // the one action that releases a grid, and this is the one place
+            // that reaches the state which does.
+            conn.reconnect.handle(Event::Close);
+            debug_assert!(!conn.reconnect.holds_grid());
+            self.statuses
+                .insert(alias, HostStatus::Connection(ConnectionState::Disconnected));
+            // Politeness, not correctness: dropping the handle would end it
+            // anyway, but a clean disconnect saves the server a timeout.
+            let connection = conn.connection.clone();
+            drop(conn);
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = connection.disconnect().await;
+                })
+                .detach();
+        }
 
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
@@ -533,10 +573,12 @@ impl Workspace {
         let Some(tab) = self.tab(id) else {
             return;
         };
-        let connection = tab.connection.clone();
         let name = tab.tmux_name();
         let command = berth_core::session::Session::new(tab.slug.clone(), 80, 24).kill_command();
         tracing::warn!(alias = %tab.host.alias, session = %name, "killing session");
+        let Some(connection) = self.conn_of(id).map(|c| c.connection.clone()) else {
+            return;
+        };
 
         cx.spawn(async move |_, _| {
             match runtime::spawn(async move { connection.exec(&command).await }).await {
@@ -665,35 +707,35 @@ impl Workspace {
         }
     }
 
-    // -- the connection machine, one per session ---------------------------
+    // -- the connection machine, one per host ------------------------------
 
-    /// Run one session's clock: keepalives while connected, the slide into
+    /// Run one connection's clock: keepalives while connected, the slide into
     /// Degraded when they stop being answered, and the backoff after that.
     ///
     /// The loop sleeps until that machine's own next deadline rather than
-    /// polling, and exits when the machine rests or when the tab is gone. The
-    /// tab id is what ends it: a closed tab stops resolving, so closing one
-    /// ends its loop with no separate bookkeeping and two loops can never tick
-    /// one machine.
-    fn drive(&mut self, id: u64, cx: &mut Context<Self>) {
+    /// polling, and exits when the machine rests or when the connection is
+    /// gone. The alias is what ends it: a retired connection stops resolving,
+    /// so closing a host's last session ends its loop with no separate
+    /// bookkeeping and two loops can never tick one machine.
+    fn drive(&mut self, alias: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(Some(wait)) = this.read_with(cx, |this, _| {
-                    this.tab(id).and_then(|t| t.reconnect.next_wait())
+                    this.conns.get(&alias).and_then(|c| c.reconnect.next_wait())
                 }) else {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
 
                 let Ok(Some(step)) = this.update(cx, |this, cx| {
-                    let step = this.tab_mut(id).map(|t| t.reconnect.handle(Event::Tick))?;
+                    let step = this
+                        .conns
+                        .get_mut(&alias)
+                        .map(|c| c.reconnect.handle(Event::Tick))?;
                     if step.changed {
-                        let alias = this.tab(id).map(|t| t.host.alias.clone());
-                        tracing::info!(?alias, state = ?step.state, "connection state");
-                        if let Some(alias) = alias {
-                            this.statuses
-                                .insert(alias, HostStatus::Connection(step.state));
-                        }
+                        tracing::info!(%alias, state = ?step.state, "connection state");
+                        this.statuses
+                            .insert(alias.clone(), HostStatus::Connection(step.state));
                         cx.notify();
                     }
                     Some(step)
@@ -705,7 +747,7 @@ impl Workspace {
                     match action {
                         Action::SendKeepalive => {
                             let Ok(Some(connection)) = this.read_with(cx, |this, _| {
-                                this.tab(id).map(|t| t.connection.clone())
+                                this.conns.get(&alias).map(|c| c.connection.clone())
                             }) else {
                                 return;
                             };
@@ -713,8 +755,9 @@ impl Workspace {
                             // dead link blocks until its own timeout, and the
                             // machine has to keep ticking through that or it
                             // can never reach Degraded.
-                            tracing::debug!(id, "keepalive");
+                            tracing::debug!(%alias, "keepalive");
                             let alive = this.clone();
+                            let alias = alias.clone();
                             cx.spawn(async move |cx| {
                                 if runtime::spawn(crate::reconnect::keepalive(connection))
                                     .await
@@ -722,9 +765,10 @@ impl Workspace {
                                 {
                                     let _ = alive.update(cx, |this, cx| {
                                         let changed = this
-                                            .tab_mut(id)
-                                            .map(|t| {
-                                                t.reconnect.handle(Event::KeepaliveAck).changed
+                                            .conns
+                                            .get_mut(&alias)
+                                            .map(|c| {
+                                                c.reconnect.handle(Event::KeepaliveAck).changed
                                             })
                                             .unwrap_or(false);
                                         if changed {
@@ -735,7 +779,7 @@ impl Workspace {
                             })
                             .detach();
                         }
-                        Action::Connect => Self::reattach(&this, id, cx).await,
+                        Action::Connect => Self::reattach(&this, &alias, cx).await,
                         // Emitted after the machine is already Connected. The
                         // work it names is done before that, in `reattach`, so
                         // the state never claims a session that is not ready.
@@ -748,84 +792,125 @@ impl Workspace {
         .detach();
     }
 
-    /// Rebuild one session's transport underneath its live view.
+    /// Rebuild a host's transport underneath its live views.
     ///
-    /// Everything the session needs is done before `ConnectSucceeded` is fed
-    /// in: the connection, the tmux attach, the pty swap, the pump, and the
-    /// port forwards. The machine only returns to Connected once the session
-    /// is genuinely usable, rather than announcing it and then catching up.
-    async fn reattach(this: &WeakEntity<Self>, id: u64, cx: &mut AsyncApp) {
-        let Ok(Some((host, slug, view))) = this.read_with(cx, |this, _| {
-            let tab = this.tab(id)?;
-            Some((tab.host.clone(), tab.slug.clone(), tab.view.clone()))
+    /// Every session on the host comes back together, because they share the
+    /// connection that dropped. Each one re-attaches to its own tmux session at
+    /// the size its grid already is, so tmux repaints into the same shape and
+    /// nothing reflows on the way back.
+    ///
+    /// Everything the sessions need is done before `ConnectSucceeded` is fed
+    /// in: the connection, the attaches, the pty swaps, the pumps, and the port
+    /// forwards. The machine only returns to Connected once the host is
+    /// genuinely usable, rather than announcing it and then catching up.
+    async fn reattach(this: &WeakEntity<Self>, alias: &str, cx: &mut AsyncApp) {
+        let Ok(Some(host)) = this.read_with(cx, |this, _| {
+            this.tabs
+                .iter()
+                .find(|t| t.host.alias == alias)
+                .map(|t| t.host.clone())
+        }) else {
+            return;
+        };
+        let Ok(sessions) = this.read_with(cx, |this, _| {
+            this.tabs
+                .iter()
+                .filter(|t| t.host.alias == alias)
+                .map(|t| (t.id, t.slug.clone(), t.view.clone()))
+                .collect::<Vec<_>>()
         }) else {
             return;
         };
         let forwards = host.forwards.clone();
 
-        // Attach at the size the grid already is, so tmux repaints into the
-        // same shape and nothing reflows on the way back.
-        let size = view.read_with(cx, |view, _| view.grid_size());
-
-        let attached = runtime::spawn(session::attach(host, slug, size.cols, size.rows)).await;
-        let attached = match attached {
-            Ok(Ok(attached)) => attached,
-            failed => {
-                if let Ok(Err(error)) = failed {
-                    tracing::warn!(%error, "reattach failed");
+        // The first session rebuilds the connection; the rest join it.
+        let mut restored: Vec<(u64, session::Attached)> = Vec::new();
+        let mut connection = None;
+        for (id, slug, view) in sessions {
+            let size = view.read_with(cx, |view, _| view.grid_size());
+            let attached = match &connection {
+                None => {
+                    runtime::spawn(session::attach(host.clone(), slug, size.cols, size.rows)).await
                 }
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(tab) = this.tab_mut(id) {
-                        tab.reconnect.handle(Event::ConnectFailed);
+                Some(existing) => {
+                    runtime::spawn(session::rejoin(
+                        Arc::clone(existing),
+                        slug,
+                        size.cols,
+                        size.rows,
+                    ))
+                    .await
+                }
+            };
+            match attached {
+                Ok(Ok(attached)) => {
+                    connection.get_or_insert_with(|| attached.connection.clone());
+                    restored.push((id, attached));
+                }
+                failed => {
+                    if let Ok(Err(error)) = failed {
+                        tracing::warn!(%alias, %error, "reattach failed");
                     }
-                    cx.notify();
-                });
-                return;
+                    let _ = this.update(cx, |this, cx| {
+                        if let Some(conn) = this.conns.get_mut(alias) {
+                            conn.reconnect.handle(Event::ConnectFailed);
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
             }
+        }
+        let Some(connection) = connection else {
+            return;
         };
 
-        // Forwards come back before the state does, so nothing ever sees a
-        // session reported usable with its ports dead. The old forwarders are
-        // dropped first: their listeners belong to a connection that no longer
-        // exists, and holding them would keep the local ports bound to nothing.
+        // Forwards come back before the state does, so nothing ever sees a host
+        // reported usable with its ports dead. The old forwarders are dropped
+        // first: their listeners belong to a connection that no longer exists,
+        // and holding them would keep the local ports bound to nothing.
         let _ = this.update(cx, |this, _| {
-            if let Some(tab) = this.tab_mut(id) {
-                tab.forwarders.clear();
+            if let Some(conn) = this.conns.get_mut(alias) {
+                conn.forwarders.clear();
             }
         });
-        let forwarders = session::start_forwards(attached.connection.clone(), &forwards).await;
+        let forwarders = session::start_forwards(connection.clone(), &forwards).await;
 
         let _ = this.update(cx, |this, cx| {
-            let Some(tab) = this.tab_mut(id) else {
+            for (id, attached) in restored {
+                let Some(view) = this.tab(id).map(|t| t.view.clone()) else {
+                    continue;
+                };
+                view.update(cx, |view, cx| {
+                    // The grid is untouched. tmux repaints over it in place.
+                    view.swap_pty(attached.pty.clone());
+                    session::start_pump(&cx.entity(), attached.events, cx);
+                });
+            }
+            let Some(conn) = this.conns.get_mut(alias) else {
                 return;
             };
-            tab.connection = attached.connection.clone();
-            tab.forwarders = forwarders;
-            let alias = tab.host.alias.clone();
-            tab.view.update(cx, |view, cx| {
-                // The grid is untouched. tmux's repaint overwrites it in place.
-                view.swap_pty(attached.pty.clone());
-                session::start_pump(&cx.entity(), attached.events, cx);
-            });
-            let step = tab.reconnect.handle(Event::ConnectSucceeded);
-            let forwards = tab.forwarders.len();
+            conn.connection = connection;
+            conn.forwarders = forwarders;
+            let step = conn.reconnect.handle(Event::ConnectSucceeded);
+            let forwards = conn.forwarders.len();
             tracing::info!(%alias, state = ?step.state, forwards, "reattached");
             this.statuses
-                .insert(alias, HostStatus::Connection(step.state));
+                .insert(alias.to_string(), HostStatus::Connection(step.state));
             cx.notify();
         });
     }
 
     /// A first RTT sample for the status bar.
-    fn measure_rtt(&self, id: u64, cx: &mut Context<Self>) {
-        let Some(connection) = self.tab(id).map(|t| t.connection.clone()) else {
+    fn measure_rtt(&self, alias: String, cx: &mut Context<Self>) {
+        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
             return;
         };
         cx.spawn(async move |this, cx| {
             if let Ok(Some(rtt)) = runtime::spawn(session::round_trip(connection)).await {
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(tab) = this.tab_mut(id) {
-                        tab.rtt = Some(rtt);
+                    if let Some(conn) = this.conns.get_mut(&alias) {
+                        conn.rtt = Some(rtt);
                         cx.notify();
                     }
                 });
@@ -844,7 +929,7 @@ impl Workspace {
             Some((
                 tab.view.downgrade(),
                 tab.view.read_with(cx, |v, _| v.pty())?,
-                tab.connection.clone(),
+                this.conn_of(tab.id)?.connection.clone(),
             ))
         }) else {
             return;
@@ -993,7 +1078,8 @@ impl Workspace {
 
         let forwards = self
             .active_tab()
-            .map(|t| t.forwarders.iter().map(|f| f.forward()).collect::<Vec<_>>())
+            .and_then(|t| self.conns.get(&t.host.alias))
+            .map(|c| c.forwarders.iter().map(|f| f.forward()).collect::<Vec<_>>())
             .unwrap_or_default();
         for (index, forward) in forwards.into_iter().enumerate() {
             list = list.child(
@@ -1095,7 +1181,7 @@ impl Workspace {
                         .w(px(6.0))
                         .h(px(6.0))
                         .rounded(px(3.0))
-                        .bg(hsla(theme.state_colour(tab.state()))),
+                        .bg(hsla(theme.state_colour(self.state_of(id)))),
                 );
 
             if active {
@@ -1326,7 +1412,7 @@ impl Workspace {
     fn status_bar(&self) -> impl IntoElement {
         let theme = self.theme;
         let tab = self.active_tab();
-        let rtt = match tab.and_then(|t| t.rtt) {
+        let rtt = match tab.and_then(|t| self.conns.get(&t.host.alias)?.rtt) {
             Some(rtt) => format!("{} ms", rtt.as_millis()),
             None => "-".to_string(),
         };
@@ -1348,7 +1434,7 @@ impl Workspace {
                     .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
             )
             .child(strings::connection_state(
-                tab.map(|t| t.state())
+                tab.map(|t| self.state_of(t.id))
                     .unwrap_or(ConnectionState::Disconnected),
             ))
             .child(rtt)
