@@ -55,7 +55,7 @@ fn parse(line: &str) -> Option<Geometry> {
 
 #[test]
 fn a_glyph_reaches_the_framebuffer() {
-    if std::env::var("BERTH_PIXEL_CHECK").is_err() {
+    if std::env::var(berth_core::env::PIXEL_CHECK).is_err() {
         eprintln!("skipping: BERTH_PIXEL_CHECK is not set");
         return;
     }

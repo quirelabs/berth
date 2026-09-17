@@ -16,8 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
@@ -25,7 +26,8 @@ jobs:
       - run: cargo test -p berth-core -p berth-probe -p berth-term -p berth-timeline
 
   # gpui only compiles as part of berth-app, and only on the platforms Berth
-  # ships to. Compile check only; the interactive criteria are verified by hand.
+  # ships to. Everything that can be judged without a person at the window is
+  # judged here; the interactive criteria are in the runbook.
   app:
     strategy:
       fail-fast: false
@@ -34,9 +36,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p berth-app
+
+      # This is the largest crate and the one that changes most, and for a
+      # while it was the only one CI never linted or ran. --all-targets so the
+      # tests are linted too, and because it compiles what a bare check would.
+      - run: cargo clippy -p berth-app --all-targets
+
+      # The theme, the pane tree, the text field, the input encoding and the
+      # reconnect wiring are all pure and all tested. None of it needs a
+      # window: the one test that does gates itself on BERTH_PIXEL_CHECK and
+      # gets its own step below.
+      - run: cargo test -p berth-app
 
       # A compile check would not have caught B5: Berth built, opened a window
       # and drew no text for a day, because gpui_platform was built without

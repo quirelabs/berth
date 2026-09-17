@@ -77,6 +77,30 @@ pub fn clipboard_action(keystroke: &Keystroke) -> Option<Clipboard> {
     None
 }
 
+/// A chord that moves Berth's own view through the scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollKey {
+    PageUp,
+    PageDown,
+}
+
+/// Recognise a local scroll chord.
+///
+/// Shift is what makes these local, and it has to be: a bare PageUp is the key
+/// `less`, `vim` and every pager on the far side are waiting for, so taking it
+/// would break scrolling in exactly the programs people scroll in most.
+pub fn scroll_action(keystroke: &Keystroke) -> Option<ScrollKey> {
+    let m = &keystroke.modifiers;
+    if !m.shift || m.control || m.alt || m.platform {
+        return None;
+    }
+    match keystroke.key.as_str() {
+        "pageup" => Some(ScrollKey::PageUp),
+        "pagedown" => Some(ScrollKey::PageDown),
+        _ => None,
+    }
+}
+
 /// True where the platform composes a character for Option chords rather than
 /// reporting them as Meta. macOS does; nothing else Berth targets does.
 const OPTION_COMPOSES: bool = cfg!(target_os = "macos");
@@ -413,6 +437,43 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    fn shift(key: &str) -> Keystroke {
+        keystroke(
+            key,
+            None,
+            GpuiModifiers {
+                shift: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn shift_and_a_page_key_scrolls_berth() {
+        assert_eq!(scroll_action(&shift("pageup")), Some(ScrollKey::PageUp));
+        assert_eq!(scroll_action(&shift("pagedown")), Some(ScrollKey::PageDown));
+    }
+
+    /// The one that matters: a pager on the far side must keep getting its
+    /// page keys, so a bare PageUp is not ours to take.
+    #[test]
+    fn a_bare_page_key_belongs_to_the_remote() {
+        assert_eq!(scroll_action(&keystroke("pageup", None, plain())), None);
+        assert_eq!(scroll_action(&keystroke("pagedown", None, plain())), None);
+        assert!(translate(&keystroke("pageup", None, plain())).is_some());
+    }
+
+    #[test]
+    fn a_page_key_with_another_modifier_is_not_a_scroll() {
+        assert_eq!(scroll_action(&cmd("pageup", true)), None);
+        let ctrl_shift = GpuiModifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(scroll_action(&keystroke("pageup", None, ctrl_shift)), None);
     }
 
     #[test]

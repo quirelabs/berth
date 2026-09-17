@@ -31,7 +31,7 @@ use berth_term::size::{CellSize, TermSize};
 static CONNECT_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 
 fn target() -> Option<berth_core::Host> {
-    let alias = std::env::var("BERTH_TEST_HOST").ok()?;
+    let alias = std::env::var(berth_core::env::TEST_HOST).ok()?;
     SshConfig::load_default().ok()?.get(&alias).cloned()
 }
 

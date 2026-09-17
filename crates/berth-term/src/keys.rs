@@ -249,6 +249,21 @@ fn function_key(n: u8, mods: Modifiers) -> Option<Vec<u8>> {
     Some(tilde_key(csi_number, mods))
 }
 
+/// Arrow keys for a wheel notch on the alternate screen.
+///
+/// A full-screen program has no scrollback for Berth to move through, but
+/// nearly all of them move with the arrow keys, which is what the remote is
+/// asking for when it sets alternate scroll. Positive is back into the
+/// history, so up.
+///
+/// Encoded through [`encode`] rather than written out, so application cursor
+/// mode is honoured here for free and cannot drift from the real arrow keys.
+pub fn alt_scroll(lines: i32, mode: TermMode) -> Vec<u8> {
+    let key = if lines > 0 { Key::Up } else { Key::Down };
+    let once = encode(KeyEvent::new(key, Modifiers::NONE), mode).unwrap_or_default();
+    once.repeat(lines.unsigned_abs() as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +499,26 @@ mod tests {
                 prop_assert!(out.iter().all(|b| *b >= 0x20 || *b == 0x7f) || out == c.to_string().into_bytes());
             }
         }
+    }
+
+    /// Three notches up is three ups, and the encoding is the real arrow key
+    /// rather than a second copy of it.
+    #[test]
+    fn alt_scroll_repeats_the_arrow_key() {
+        assert_eq!(alt_scroll(3, TermMode::default()), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(alt_scroll(-2, TermMode::default()), b"\x1b[B\x1b[B");
+    }
+
+    #[test]
+    fn alt_scroll_follows_application_cursor_mode() {
+        let mode = TermMode {
+            application_cursor: true,
+        };
+        assert_eq!(alt_scroll(1, mode), b"\x1bOA");
+    }
+
+    #[test]
+    fn a_wheel_notch_of_nothing_sends_nothing() {
+        assert!(alt_scroll(0, TermMode::default()).is_empty());
     }
 }

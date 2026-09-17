@@ -29,6 +29,23 @@ pub enum Error {
     #[error("could not record the host key: {0}")]
     KnownHosts(String),
 
+    /// A pty on this machine would not open, start a shell, or be read. Not a
+    /// configuration problem, and it must not read as one.
+    #[error("local shell: {0}")]
+    Pty(String),
+
+    /// The connection did something the protocol allows and Berth does not
+    /// expect. Rare, and worth saying out loud rather than folding into a
+    /// nearby variant.
+    #[error("ssh transport: {0}")]
+    Transport(String),
+
+    /// The host accepted nothing in time: a dropped packet, a machine that is
+    /// asleep, or something listening that is not an ssh server. Named rather
+    /// than left to the OS, whose own answer takes over a minute.
+    #[error("no answer from {endpoint} after {seconds}s")]
+    Timeout { endpoint: String, seconds: u64 },
+
     #[error("ssh agent: {0}")]
     Agent(String),
 

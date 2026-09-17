@@ -10,6 +10,11 @@ pub const FIRST_RUN_PATH_LABEL: &str = "Looking for";
 pub const FIRST_RUN_PATH_MISSING: &str = "not found";
 
 pub const SIDEBAR_HOSTS: &str = "Hosts";
+pub const SIDEBAR_LOCAL: &str = "This machine";
+
+/// What a local session is called everywhere a host would be named. Not a host
+/// alias: a config with an entry called `local` must not collide with it.
+pub const LOCAL_ALIAS: &str = "local";
 
 pub const STATE_DISCONNECTED: &str = "Disconnected";
 pub const STATE_CONNECTING: &str = "Connecting";
@@ -66,6 +71,11 @@ pub const TAB_DETACH: &str = "\u{00d7}";
 pub const TAB_DETACH_TOOLTIP: &str = "Detach. The connection closes and the tab goes, but the tmux \
      session keeps running on the server with everything in it. Opening the \
      host again re-attaches to the same shell.";
+/// A local shell has nothing running behind it once its window goes, so its
+/// control says close rather than detach. Same glyph, honest word.
+pub const TAB_CLOSE: &str = "\u{00d7}";
+pub const TAB_CLOSE_TOOLTIP: &str =
+    "Close. A local shell ends with its pane; there is nothing to reattach to.";
 pub const TAB_KILL: &str = "\u{25a0}";
 pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it stops and its scrollback \
      is gone. Asks first.";
@@ -74,6 +84,23 @@ pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it st
 /// a feature that does not exist.
 pub const SPLIT_HINT: &str =
     "Cmd+D splits right, Cmd+Shift+D splits down, Cmd+] moves between panes";
+
+/// Says presence and nothing else. Berth does not know whether the agent is
+/// working, waiting or finished, and a tooltip that implied otherwise would be
+/// the first step towards pretending it does.
+pub const AGENT_TOOLTIP: &str = "An agent is running in this session.";
+
+pub const RENAME_TITLE: &str = "Name this session";
+pub const RENAME_ACCEPT: &str = "Rename";
+pub const RENAME_REJECT: &str = "Cancel";
+pub const RENAME_BODY: &str =
+    "Renames the tmux session on the server too, so reconnecting still finds it.";
+pub const RENAME_BODY_LOCAL: &str =
+    "A local session has no tmux behind it, so this is just a label.";
+
+pub fn rename_taken(slug: &str, alias: &str) -> String {
+    format!("{alias} already has a session called {slug}")
+}
 
 pub const KILL_TITLE: &str = "End this session?";
 pub const KILL_ACCEPT: &str = "End session";

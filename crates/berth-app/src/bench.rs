@@ -4,6 +4,8 @@
 //! neither number means anything measured anywhere else. Driven by
 //! `BERTH_BENCH`, which is never set in normal use.
 
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{AsyncApp, WeakEntity};
@@ -29,6 +31,27 @@ pub const BENCH_BYTES: usize = 50 * 1024 * 1024;
 /// either side must not quietly reintroduce one bug while fixing the other.
 pub const CAT_P99_CEILING_MS: u32 = 8;
 
+/// Whether a benchmark has failed its criteria.
+///
+/// A failed run has to leave a non-zero exit code, so a regression is a build
+/// failure rather than a number someone has to notice. It used to do that with
+/// `process::exit` from inside the window, which skips every destructor: the
+/// server saw a dropped socket instead of a disconnect. The flag is set there
+/// and read once in `main`, so there is one way out of the process.
+static FAILED: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_failed() {
+    FAILED.store(true, Ordering::Relaxed);
+}
+
+pub fn exit_code() -> ExitCode {
+    if FAILED.load(Ordering::Relaxed) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bench {
     /// `cat` a 50 MB file and histogram the frame times.
@@ -39,7 +62,7 @@ pub enum Bench {
 
 impl Bench {
     pub fn from_env() -> Option<Self> {
-        match std::env::var("BERTH_BENCH").ok()?.as_str() {
+        match berth_core::env::bench()?.as_str() {
             "cat" => Some(Bench::Cat),
             "keys" => Some(Bench::Keys),
             other => {

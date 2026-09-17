@@ -17,7 +17,7 @@ use berth_core::known_hosts::{
 use berth_core::transport::Connection;
 
 fn target() -> Option<berth_core::Host> {
-    let alias = std::env::var("BERTH_TEST_HOST").ok()?;
+    let alias = std::env::var(berth_core::env::TEST_HOST).ok()?;
     let config = SshConfig::load_default().expect("ssh config should be readable");
     Some(
         config

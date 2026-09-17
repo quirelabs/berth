@@ -11,9 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 berth-core.workspace = true
-berth-probe.workspace = true
 berth-term.workspace = true
-berth-timeline.workspace = true
 
 gpui.workspace = true
 gpui_platform.workspace = true

@@ -19,6 +19,18 @@ use crate::session::Session;
 /// Keepalive interval, matching the reconnect state machine.
 pub const KEEPALIVE: Duration = Duration::from_secs(15);
 
+/// How long a host has to complete the handshake before Berth gives up.
+///
+/// Without this the OS decides, which is over a minute on macOS and can be
+/// several on Windows, and a single asleep machine in the ssh config leaves a
+/// row spinning at every launch with nothing to click. Ten seconds is long
+/// enough for a slow link and a busy server to finish a key exchange, and short
+/// enough that the answer arrives while someone is still looking.
+///
+/// The same number for the probe and the session on purpose: they do the same
+/// work up to the key, and two numbers would only differ by accident.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Records what the handler decided, and the key it decided about, so the
 /// caller can report it precisely and record exactly what it verified.
 #[derive(Clone, Default)]
@@ -84,6 +96,15 @@ pub struct Connection {
 impl Connection {
     /// Connect, verify the host key, and authenticate with the agent.
     pub async fn connect(host: &Host, policy: TrustPolicy) -> Result<Self> {
+        Self::connect_within(host, policy, CONNECT_TIMEOUT).await
+    }
+
+    /// [`connect`](Self::connect) with the deadline named, so a test can use a
+    /// short one rather than making the suite wait out the real one.
+    ///
+    /// The deadline covers the handshake only. Authentication follows it and
+    /// talks to the local agent, which fails fast on its own.
+    async fn connect_within(host: &Host, policy: TrustPolicy, within: Duration) -> Result<Self> {
         let user = host
             .user
             .clone()
@@ -103,10 +124,16 @@ impl Connection {
             seen: seen.clone(),
         };
 
-        let mut handle =
-            russh::client::connect(config, (host.hostname.as_str(), host.port), client)
-                .await
-                .map_err(|e| Self::explain(&seen, e))?;
+        let mut handle = tokio::time::timeout(
+            within,
+            russh::client::connect(config, (host.hostname.as_str(), host.port), client),
+        )
+        .await
+        .map_err(|_| Error::Timeout {
+            endpoint: endpoint(host),
+            seconds: within.as_secs(),
+        })?
+        .map_err(|e| Self::explain(&seen, e))?;
 
         let mut agent = match &host.identity_agent {
             Some(path) => Agent::connect_at(&shellexpand::tilde(path)).await,
@@ -149,6 +176,12 @@ impl Connection {
     /// which is the one the user is then asked about and the one recorded if
     /// they say yes.
     pub async fn offered_key(host: &Host) -> Result<(Verdict, PublicKey)> {
+        Self::offered_key_within(host, CONNECT_TIMEOUT).await
+    }
+
+    /// [`offered_key`](Self::offered_key) with the deadline named. See
+    /// [`connect_within`](Self::connect_within).
+    async fn offered_key_within(host: &Host, within: Duration) -> Result<(Verdict, PublicKey)> {
         let seen = Seen::default();
         let client = Client {
             host: host.hostname.clone(),
@@ -156,12 +189,22 @@ impl Connection {
             policy: TrustPolicy::Refuse,
             seen: seen.clone(),
         };
-        let outcome = russh::client::connect(
-            Arc::new(Config::default()),
-            (host.hostname.as_str(), host.port),
-            client,
+        let outcome = match tokio::time::timeout(
+            within,
+            russh::client::connect(
+                Arc::new(Config::default()),
+                (host.hostname.as_str(), host.port),
+                client,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => Err(Error::Timeout {
+                endpoint: endpoint(host),
+                seconds: within.as_secs(),
+            }),
+        };
 
         if let Ok(slot) = seen.0.lock()
             && let Some(pair) = slot.clone()
@@ -172,7 +215,7 @@ impl Connection {
         // refused socket, something that is not an ssh server. That failure is
         // the honest answer, and there is no fingerprint to show.
         Err(outcome.err().unwrap_or_else(|| {
-            Error::Config("the host completed a handshake without offering a key".into())
+            Error::Transport("the host completed a handshake without offering a key".into())
         }))
     }
 
@@ -321,6 +364,12 @@ async fn drain(channel: &mut russh::Channel<russh::client::Msg>) -> Result<Outpu
     Ok(out)
 }
 
+/// What to call a host in an error. The name plus the port, because the port is
+/// half of why a connection to the right machine can still find nothing.
+fn endpoint(host: &Host) -> String {
+    format!("{}:{}", host.hostname, host.port)
+}
+
 fn whoami() -> Option<String> {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -345,6 +394,76 @@ mod tests {
         assert!(!out.succeeded());
         out.exit_code = None;
         assert!(!out.succeeded(), "an unknown exit code is not a success");
+    }
+
+    /// A listener that completes the TCP handshake and then says nothing, ever.
+    /// This is what an asleep machine, a dropped SYN-ACK and a firewall that
+    /// swallows the banner all look like from here, and none of them is
+    /// reachable from a CI runner, so it is built rather than found.
+    async fn a_socket_that_never_speaks() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        tokio::spawn(async move {
+            // Hold the accepted socket open. Dropping it would send a FIN, and
+            // a closed connection is a different failure than a silent one.
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        port
+    }
+
+    fn silent_host(port: u16) -> Host {
+        let mut host = Host::new("silent", "127.0.0.1");
+        host.port = port;
+        host
+    }
+
+    /// Without a deadline this waits for the OS, which is over a minute on
+    /// macOS, with the row stuck in Connecting and nothing to click.
+    #[tokio::test]
+    async fn a_host_that_never_answers_gives_up_and_says_so() {
+        let port = a_socket_that_never_speaks().await;
+        let started = std::time::Instant::now();
+        let error = Connection::connect_within(
+            &silent_host(port),
+            TrustPolicy::KnownHostsOnly,
+            Duration::from_millis(200),
+        )
+        .await
+        // Not `expect_err`: that wants a `Debug` `Ok` type, and a live
+        // connection is not one.
+        .err()
+        .expect("a socket that never speaks cannot connect");
+
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "reported as {error} rather than a timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "gave up after {:?}, so the deadline is not the one being used",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains(&port.to_string()), "{error}");
+    }
+
+    /// The probe has its own connect call, and an unverified host is exactly
+    /// the one most likely to be unreachable.
+    #[tokio::test]
+    async fn a_probe_of_a_silent_host_gives_up_too() {
+        let port = a_socket_that_never_speaks().await;
+        let started = std::time::Instant::now();
+        let error = Connection::offered_key_within(&silent_host(port), Duration::from_millis(200))
+            .await
+            .expect_err("a socket that never speaks offers no key");
+
+        assert!(
+            matches!(error, Error::Timeout { .. }),
+            "reported as {error} rather than a timeout"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

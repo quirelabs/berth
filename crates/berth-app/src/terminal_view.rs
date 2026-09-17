@@ -477,7 +477,13 @@ impl Element for TerminalElement {
         // One lock, held only long enough to resize and copy the grid out.
         let snapshot = {
             let view = self.view.read(cx);
-            let mut term = view.terminal.lock().expect("terminal lock poisoned");
+            // Poisoned means the pump panicked mid-`advance`, so the grid may
+            // be half-updated. Paint it anyway: this runs every frame, and
+            // panicking here would turn one bad frame into a dead window.
+            let mut term = view
+                .terminal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             term.resize(size, cell);
             term.snapshot()
         };

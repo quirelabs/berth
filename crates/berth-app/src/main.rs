@@ -2,6 +2,7 @@
 //! connection exists. The SSH transport lands on top of this shell.
 
 mod bench;
+mod icons;
 mod input;
 mod metrics;
 mod panes;
@@ -12,6 +13,7 @@ mod session;
 mod strings;
 mod terminal_style;
 mod terminal_view;
+mod text_field;
 mod theme;
 mod workspace;
 
@@ -33,7 +35,7 @@ fn self_check() {
     // is eleven, which is what a text system with no font source reports.
     const FLOOR: usize = 30;
 
-    application().run(|cx| {
+    application().with_assets(crate::icons::Icons).run(|cx| {
         let names = cx.text_system().all_font_names();
         let count = names.len();
         if count < FLOOR {
@@ -54,7 +56,7 @@ fn self_check() {
 /// Prints the window's bounds so the test does not have to duplicate them, then
 /// stays up until killed.
 fn render_probe() {
-    application().run(|cx| {
+    application().with_assets(crate::icons::Icons).run(|cx| {
         let bounds = crate::render_probe::window_bounds();
         let window = cx.open_window(
             WindowOptions {
@@ -91,7 +93,7 @@ fn render_probe() {
     });
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -101,15 +103,15 @@ fn main() {
 
     if std::env::args().any(|a| a == "--render-probe") {
         render_probe();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     if std::env::args().any(|a| a == "--self-check") {
         self_check();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
-    application().run(|cx| {
+    application().with_assets(crate::icons::Icons).run(|cx| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
         let window = cx.open_window(
             WindowOptions {
@@ -132,4 +134,8 @@ fn main() {
         }
         cx.activate(true);
     });
+
+    // Zero unless a benchmark run failed its criteria. Everything else that
+    // ends the process does so through `cx.quit()` and lands here.
+    bench::exit_code()
 }

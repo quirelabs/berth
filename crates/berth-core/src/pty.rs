@@ -13,8 +13,12 @@ use crate::session::TERM;
 /// How many output events may queue before the reader applies backpressure.
 /// Output arrives far faster than a UI can paint during something like a large
 /// `cat`, so this bounds memory rather than trying to keep every wakeup.
-const OUTPUT_QUEUE: usize = 256;
-const INPUT_QUEUE: usize = 256;
+///
+/// Crate-visible because the local pty uses the same two numbers. A second
+/// backend queueing differently would be a second set of latency behaviour to
+/// reason about, for no reason.
+pub(crate) const OUTPUT_QUEUE_SIZE: usize = 256;
+pub(crate) const INPUT_QUEUE_SIZE: usize = 256;
 
 /// Something that happened on the remote side.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,9 +31,11 @@ pub enum PtyEvent {
     Closed,
 }
 
-/// Something the UI wants to do to the remote side.
+/// Something the UI wants to do to the other side.
+///
+/// Visible to the crate so a backend other than ssh can drive the same handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PtyInput {
+pub(crate) enum PtyInput {
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
     Close,
@@ -39,7 +45,7 @@ enum PtyInput {
 /// channel.
 #[derive(Debug, Clone)]
 pub struct Pty {
-    input: mpsc::Sender<PtyInput>,
+    pub(crate) input: mpsc::Sender<PtyInput>,
 }
 
 impl Pty {
@@ -91,8 +97,8 @@ pub(crate) async fn open(
         None => channel.request_shell(true).await?,
     }
 
-    let (input_tx, mut input_rx) = mpsc::channel::<PtyInput>(INPUT_QUEUE);
-    let (output_tx, output_rx) = mpsc::channel::<PtyEvent>(OUTPUT_QUEUE);
+    let (input_tx, mut input_rx) = mpsc::channel::<PtyInput>(INPUT_QUEUE_SIZE);
+    let (output_tx, output_rx) = mpsc::channel::<PtyEvent>(OUTPUT_QUEUE_SIZE);
 
     tokio::spawn(async move {
         loop {

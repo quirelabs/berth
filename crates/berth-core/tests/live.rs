@@ -16,7 +16,7 @@ use tokio::time::timeout;
 
 /// The host under test, or `None` when the suite should be skipped.
 fn target() -> Option<berth_core::Host> {
-    let alias = std::env::var("BERTH_TEST_HOST").ok()?;
+    let alias = std::env::var(berth_core::env::TEST_HOST).ok()?;
     let config = SshConfig::load_default().expect("ssh config should be readable");
     Some(
         config

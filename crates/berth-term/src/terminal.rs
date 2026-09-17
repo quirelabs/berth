@@ -19,6 +19,36 @@ use crate::size::{CellSize, TermSize};
 /// Local scrollback. tmux keeps far more on the remote.
 pub const SCROLLBACK_LINES: usize = 10_000;
 
+/// A movement through the scrollback.
+///
+/// Berth's own enum rather than alacritty's, because nothing above this crate
+/// depends on alacritty and this is the type the app has to name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    /// Positive goes back into the history, negative returns towards the live
+    /// grid. Matches a wheel, where pushing up shows what came before.
+    Lines(i32),
+    PageUp,
+    PageDown,
+    /// Back to the live grid, wherever the view was.
+    Bottom,
+}
+
+/// What a wheel notch means here, which is not ours to decide alone: the
+/// remote sets modes that claim it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelAction {
+    /// The program asked for mouse events, so the notch is reported to it and
+    /// moves nothing locally.
+    Report,
+    /// The alternate screen with alternate scroll set: a full-screen program
+    /// with no scrollback of its own that expects arrow keys. This is what
+    /// makes the wheel work in `less` and `man`.
+    Arrows,
+    /// Berth moves its own view through its own scrollback.
+    View,
+}
+
 /// Collects the events alacritty raises while parsing.
 #[derive(Clone, Default)]
 pub struct Listener {
@@ -279,6 +309,61 @@ impl Terminal {
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// How far back the view sits, in lines. Zero is the live grid.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Move the view through the scrollback.
+    ///
+    /// Does nothing on the alternate screen, which has no history: a
+    /// full-screen program owns the whole grid and there is nothing behind it.
+    /// [`Terminal::wheel_action`] is what decides that a notch should have gone
+    /// to the program instead.
+    pub fn scroll(&mut self, scroll: Scroll) {
+        use alacritty_terminal::grid::Scroll as GridScroll;
+
+        if self.alternate_screen() {
+            return;
+        }
+        let before = self.display_offset();
+        self.term.scroll_display(match scroll {
+            Scroll::Lines(lines) => GridScroll::Delta(lines),
+            Scroll::PageUp => GridScroll::PageUp,
+            Scroll::PageDown => GridScroll::PageDown,
+            Scroll::Bottom => GridScroll::Bottom,
+        });
+        // Only a move is a repaint. Wheeling against the top of the history
+        // would otherwise burn a frame per notch.
+        if self.display_offset() != before {
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// What a wheel notch should do, given the modes the remote has set.
+    ///
+    /// Shift takes the wheel back from the program. Every terminal does this,
+    /// and without it a mouse-reporting program leaves no way to look at
+    /// anything above the screen.
+    pub fn wheel_action(&self, shift: bool) -> WheelAction {
+        use alacritty_terminal::term::TermMode;
+
+        if shift {
+            return WheelAction::View;
+        }
+        if self.mouse_reporting() {
+            return WheelAction::Report;
+        }
+        if self
+            .term
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+        {
+            return WheelAction::Arrows;
+        }
+        WheelAction::View
     }
 
     /// The text inside a selection, as displayed.
@@ -810,5 +895,136 @@ mod tests {
         t.advance(&noise);
         let snap = t.snapshot();
         assert_eq!(snap.cells.len(), 20 * 5);
+    }
+
+    /// Five visible rows, so twenty lines of output leaves fifteen behind.
+    fn with_history() -> Terminal {
+        let mut t = terminal();
+        for n in 0..20 {
+            t.advance(format!("line{n}\r\n").as_bytes());
+        }
+        t
+    }
+
+    /// The gap this closes: the history was kept and could not be looked at.
+    #[test]
+    fn the_history_can_be_scrolled_into() {
+        let mut t = with_history();
+        assert_eq!(t.display_offset(), 0);
+        assert!(!text_of(&t).contains("line3|"));
+
+        t.scroll(Scroll::Lines(10));
+
+        assert_eq!(t.display_offset(), 10);
+        assert!(text_of(&t).contains("line6"), "{}", text_of(&t));
+    }
+
+    #[test]
+    fn scrolling_to_the_bottom_comes_back_to_the_live_grid() {
+        let mut t = with_history();
+        let live = text_of(&t);
+        t.scroll(Scroll::PageUp);
+        assert!(t.display_offset() > 0);
+
+        t.scroll(Scroll::Bottom);
+
+        assert_eq!(t.display_offset(), 0);
+        assert_eq!(text_of(&t), live);
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_oldest_line_it_has() {
+        let mut t = with_history();
+        t.scroll(Scroll::Lines(10_000));
+        let top = t.display_offset();
+        assert!(top > 0);
+
+        t.scroll(Scroll::Lines(10_000));
+
+        assert_eq!(t.display_offset(), top, "the top is the top");
+    }
+
+    /// A page down from the bottom must not walk into negative offsets, which
+    /// is the shape of bug that shows an empty grid.
+    #[test]
+    fn scrolling_down_from_the_bottom_does_nothing() {
+        let mut t = with_history();
+        t.scroll(Scroll::PageDown);
+        assert_eq!(t.display_offset(), 0);
+    }
+
+    /// Output arriving while scrolled back must not yank the view to the
+    /// bottom. Reading something while a build scrolls past is the whole point.
+    #[test]
+    fn new_output_does_not_move_a_scrolled_back_view() {
+        let mut t = with_history();
+        t.scroll(Scroll::Lines(8));
+        let showing = text_of(&t);
+
+        t.advance(b"noise\r\nmore noise\r\n");
+
+        assert_eq!(text_of(&t), showing, "the view followed the output");
+    }
+
+    /// The alternate screen has no history behind it, so there is nothing to
+    /// scroll into and a full-screen program owns the grid.
+    #[test]
+    fn the_alternate_screen_has_nothing_to_scroll_into() {
+        let mut t = with_history();
+        t.advance(b"\x1b[?1049h");
+        assert!(t.alternate_screen());
+
+        t.scroll(Scroll::PageUp);
+
+        assert_eq!(t.display_offset(), 0);
+    }
+
+    #[test]
+    fn a_move_that_changes_nothing_does_not_ask_for_a_repaint() {
+        let mut t = with_history();
+        let revision = t.revision();
+        t.scroll(Scroll::PageDown);
+        assert_eq!(t.revision(), revision);
+
+        t.scroll(Scroll::PageUp);
+        assert_ne!(t.revision(), revision);
+    }
+
+    #[test]
+    fn a_plain_grid_takes_the_wheel_itself() {
+        assert_eq!(terminal().wheel_action(false), WheelAction::View);
+    }
+
+    #[test]
+    fn a_mouse_reporting_program_gets_the_wheel() {
+        let mut t = terminal();
+        t.advance(b"\x1b[?1000h");
+        assert_eq!(t.wheel_action(false), WheelAction::Report);
+    }
+
+    /// Without this a program that grabs the mouse leaves no way to look at
+    /// anything above the screen.
+    #[test]
+    fn shift_takes_the_wheel_back_from_the_program() {
+        let mut t = terminal();
+        t.advance(b"\x1b[?1000h");
+        assert_eq!(t.wheel_action(true), WheelAction::View);
+    }
+
+    /// What makes the wheel work in `less` and `man`.
+    #[test]
+    fn alternate_scroll_asks_for_arrow_keys() {
+        let mut t = terminal();
+        t.advance(b"\x1b[?1049h\x1b[?1007h");
+        assert_eq!(t.wheel_action(false), WheelAction::Arrows);
+    }
+
+    /// The alternate screen alone is not enough: a program that turned
+    /// alternate scroll off means it.
+    #[test]
+    fn the_alternate_screen_alone_does_not_ask_for_arrows() {
+        let mut t = terminal();
+        t.advance(b"\x1b[?1049h\x1b[?1007l");
+        assert_eq!(t.wheel_action(false), WheelAction::View);
     }
 }

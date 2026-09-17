@@ -12,10 +12,7 @@ pub use russh::keys::ssh_key::PublicKey;
 /// against a fixture. Berth writes to this file when the user accepts a key,
 /// and a test must never do that to the user's own.
 pub fn path_override() -> Option<PathBuf> {
-    std::env::var("BERTH_KNOWN_HOSTS")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    crate::env::known_hosts()
 }
 
 fn keys_for(host: &str, port: u16) -> Result<Vec<(usize, PublicKey)>, russh::keys::Error> {

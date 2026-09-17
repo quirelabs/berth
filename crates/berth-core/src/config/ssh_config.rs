@@ -26,6 +26,48 @@ struct Stanza {
     proxy_jump: Option<String>,
     identity_agent: Option<String>,
     forwards: Vec<crate::forward::Forward>,
+    group: Option<String>,
+}
+
+/// Every directive Berth or ssh might see at the start of a line.
+///
+/// Used to tell a heading from a commented-out directive, because `# Host old`
+/// is disabled configuration and naming a group after it would be nonsense.
+const DIRECTIVES: &[&str] = &[
+    "host",
+    "hostname",
+    "port",
+    "user",
+    "proxyjump",
+    "proxycommand",
+    "identityagent",
+    "identityfile",
+    "localforward",
+    "remoteforward",
+    "match",
+    "include",
+    "forwardagent",
+    "serveraliveinterval",
+];
+
+/// The longest a comment can be and still be a heading rather than a note.
+const HEADING_MAX: usize = 40;
+
+/// A comment that names a group, or `None` if it is an ordinary remark.
+fn heading(comment: &str) -> Option<String> {
+    let text = comment.trim().trim_end_matches(':').trim();
+    if text.is_empty() || text.len() > HEADING_MAX {
+        return None;
+    }
+    // A row of dashes or equals signs is a separator, not a name.
+    if !text.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    let first = text.split_whitespace().next()?.to_ascii_lowercase();
+    if DIRECTIVES.contains(&first.as_str()) {
+        return None;
+    }
+    Some(text.to_string())
 }
 
 impl SshConfig {
@@ -70,10 +112,21 @@ impl SshConfig {
     fn parse_text(&mut self, text: &str, path: &Path, seen: &mut HashSet<PathBuf>, depth: usize) {
         let mut current: Option<Stanza> = None;
         let mut in_match = false;
+        let mut group: Option<String> = None;
 
         for raw in text.lines() {
             let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(comment) = line.strip_prefix('#') {
+                // A comment heading names the group for the hosts under it.
+                // People already write their ssh config this way, so groups
+                // cost no new file and no new syntax. A comment that does not
+                // look like a heading leaves the current group alone.
+                if let Some(heading) = heading(comment) {
+                    group = Some(heading);
+                }
                 continue;
             }
             let Some((key, value)) = split_directive(line) else {
@@ -89,6 +142,7 @@ impl SshConfig {
                     }
                     current = Some(Stanza {
                         patterns: value.split_whitespace().map(str::to_string).collect(),
+                        group: group.clone(),
                         ..Default::default()
                     });
                 }
@@ -172,6 +226,7 @@ impl SshConfig {
             host.proxy_jump = stanza.proxy_jump.clone();
             host.identity_agent = stanza.identity_agent.clone();
             host.forwards = stanza.forwards.clone();
+            host.group = stanza.group.clone();
             self.hosts.push(host);
         }
     }
@@ -230,6 +285,86 @@ fn expand_glob(candidate: &Path) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn parse(text: &str) -> SshConfig {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+        f.flush().unwrap();
+        SshConfig::load(f.path()).unwrap()
+    }
+
+    fn group_of<'a>(config: &'a SshConfig, alias: &str) -> Option<&'a str> {
+        config.get(alias)?.group.as_deref()
+    }
+
+    #[test]
+    fn a_comment_heading_names_the_hosts_under_it() {
+        let config = parse(
+            "# Production\nHost web-1\n  HostName 10.0.0.1\n\nHost web-2\n  HostName 10.0.0.2\n\n# Staging\nHost stage-1\n  HostName 10.0.1.1\n",
+        );
+        assert_eq!(group_of(&config, "web-1"), Some("Production"));
+        assert_eq!(
+            group_of(&config, "web-2"),
+            Some("Production"),
+            "a group runs until the next heading"
+        );
+        assert_eq!(group_of(&config, "stage-1"), Some("Staging"));
+    }
+
+    #[test]
+    fn a_config_without_comments_has_no_groups() {
+        let config = parse("Host solo\n  HostName 10.0.0.9\n");
+        assert_eq!(group_of(&config, "solo"), None);
+    }
+
+    /// `# Host old` is disabled configuration. Naming a group after it would
+    /// be nonsense, and this is the most likely comment in a real file.
+    #[test]
+    fn a_commented_out_directive_is_not_a_heading() {
+        let config = parse(
+            "# Production\nHost web-1\n  HostName 10.0.0.1\n# Host retired-box\n#   HostName 10.0.0.5\nHost web-2\n  HostName 10.0.0.2\n",
+        );
+        assert_eq!(group_of(&config, "web-2"), Some("Production"));
+    }
+
+    #[test]
+    fn a_separator_or_a_sentence_is_not_a_heading() {
+        let config = parse(
+            "# Production\nHost web-1\n  HostName 10.0.0.1\n# ----------------\nHost web-2\n  HostName 10.0.0.2\n",
+        );
+        assert_eq!(group_of(&config, "web-2"), Some("Production"));
+
+        let long = "# this box is the one that runs the nightly export job, do not reboot";
+        let config = parse(&format!(
+            "# Production\nHost web-1\n  HostName 10.0.0.1\n{long}\nHost web-2\n  HostName 10.0.0.2\n"
+        ));
+        assert_eq!(
+            group_of(&config, "web-2"),
+            Some("Production"),
+            "a sentence is a note, not a heading"
+        );
+    }
+
+    #[test]
+    fn a_trailing_colon_is_not_part_of_the_name() {
+        let config = parse("# Databases:\nHost db-1\n  HostName 10.0.2.1\n");
+        assert_eq!(group_of(&config, "db-1"), Some("Databases"));
+    }
+
+    #[test]
+    fn hosts_before_any_heading_are_ungrouped() {
+        let config = parse(
+            "Host loose\n  HostName 10.0.0.1\n# Production\nHost web-1\n  HostName 10.0.0.2\n",
+        );
+        assert_eq!(group_of(&config, "loose"), None);
+        assert_eq!(group_of(&config, "web-1"), Some("Production"));
+    }
 }
 
 #[cfg(test)]

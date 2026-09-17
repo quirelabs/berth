@@ -55,6 +55,20 @@ impl Session {
         format!("tmux kill-session -t {}", shell_quote(&self.tmux_name()))
     }
 
+    /// Rename this session on the server.
+    ///
+    /// The tmux name is what makes a reattach land in the same shell, so a
+    /// rename that changed only Berth's label would silently break reconnect:
+    /// the next attach would create a second session under the old name and
+    /// the running one would be orphaned. Both move together or neither does.
+    pub fn rename_command(&self, to: &Session) -> String {
+        format!(
+            "tmux rename-session -t {} {}",
+            shell_quote(&self.tmux_name()),
+            shell_quote(&to.tmux_name())
+        )
+    }
+
     /// Fallback when the server has no tmux. The UI shows a banner offering to
     /// install it; Berth never installs anything itself.
     pub fn plain_shell_command() -> &'static str {
@@ -88,6 +102,38 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_moves_one_session_to_another_name() {
+        let from = Session::new("main", 80, 24);
+        let to = Session::new("deploy", 80, 24);
+        assert_eq!(
+            from.rename_command(&to),
+            "tmux rename-session -t 'berth/main' 'berth/deploy'"
+        );
+    }
+
+    /// Both ends are user input reaching a shell, and the target is the half
+    /// that is easy to forget.
+    #[test]
+    fn rename_quotes_both_names() {
+        let from = Session::new("main", 80, 24);
+        let to = Session::new("x'; rm -rf /; echo '", 80, 24);
+        let command = from.rename_command(&to);
+        assert!(!command.contains("rm -rf /;"), "{command}");
+    }
+
+    /// A rename stays inside Berth's namespace, so it can never take over a
+    /// session the user runs by hand.
+    #[test]
+    fn rename_cannot_leave_the_berth_namespace() {
+        let from = Session::new("main", 80, 24);
+        let to = Session::new("../escape", 80, 24);
+        let command = from.rename_command(&to);
+        let target = command.rsplit(" -t ").next().unwrap();
+        assert_eq!(target.matches(SESSION_PREFIX).count(), 2, "{command}");
+        assert!(!command.contains(".."), "{command}");
+    }
 
     #[test]
     fn kill_names_only_this_session() {

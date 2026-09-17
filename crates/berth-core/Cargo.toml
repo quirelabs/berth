@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 russh.workspace = true
+portable-pty.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

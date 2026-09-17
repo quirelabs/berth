@@ -39,6 +39,30 @@ pub struct Attached {
     pub events: mpsc::Receiver<PtyEvent>,
 }
 
+/// A shell on this machine.
+///
+/// Deliberately not a `Connected`: there is no connection, and a field holding
+/// a fake one would be a lie the rest of the app would have to keep believing.
+pub struct Local {
+    pub pty: Pty,
+    pub terminal: SharedTerminal,
+    pub events: mpsc::Receiver<PtyEvent>,
+}
+
+/// Open a shell on this machine, with the same terminal a remote one gets.
+pub async fn open_local(
+    cols: u16,
+    rows: u16,
+    palette: berth_term::terminal::Palette,
+) -> berth_core::Result<Local> {
+    let (pty, events) = berth_core::local::open(cols, rows).await?;
+    Ok(Local {
+        pty,
+        terminal: terminal_for(cols, rows, palette),
+        events,
+    })
+}
+
 /// What a host offered when asked for its key, without being trusted.
 pub enum Offer {
     /// Nothing is recorded for this host. The key to put in front of the user,

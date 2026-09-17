@@ -11,7 +11,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]
@@ -42,6 +42,11 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33375c34
 # backend needs NASM to build on Windows, so ring is used instead.
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
 alacritty_terminal = "0.26"
+# Local PTYs on three platforms. Unix is openpty plus fork and exec, but Windows
+# ConPTY is fiddly enough that owning it would be days of work and then ours
+# forever. This is wezterm's, actively maintained, and the seam it sits behind
+# is one constructor, so replacing it later touches one file.
+portable-pty = "0.9"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 

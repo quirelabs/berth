@@ -9,8 +9,10 @@ pub mod shell;
 pub mod size;
 pub mod terminal;
 
-pub use keys::{Key, KeyEvent, Modifiers, TermMode, encode};
+pub use keys::{Key, KeyEvent, Modifiers, TermMode, alt_scroll, encode};
 pub use paste::{MouseButton, mouse_sgr, paste_bytes};
 pub use shell::{ShellEvent, ShellEventKind};
 pub use size::{CellSize, TermSize};
-pub use terminal::{Cell, Cursor, Palette, Rgb, Selection, Snapshot, Terminal};
+pub use terminal::{
+    Cell, Cursor, Palette, Rgb, Scroll, Selection, Snapshot, Terminal, WheelAction,
+};
