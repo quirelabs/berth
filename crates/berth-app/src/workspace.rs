@@ -187,14 +187,21 @@ enum Modal {
     /// Killing is not closing. This exists so the destructive one has to be
     /// asked for twice and can never be reached by meaning the other.
     Kill {
-        pane: u64,
+        /// The pane showing it, if it has one. A detached session has none.
+        pane: Option<u64>,
         alias: String,
+        slug: String,
         session: String,
     },
     /// Renaming a session. The tmux name moves with the label, or a reattach
     /// would find the old one and start a second shell beside it.
     Rename {
         pane: u64,
+        field: TextField,
+    },
+    /// Naming a host. Kept in Berth's settings, never written to ssh config.
+    RenameHost {
+        alias: String,
         field: TextField,
     },
 }
@@ -239,7 +246,9 @@ pub struct Workspace {
     ssh_config_path: Option<String>,
     theme: Theme,
     empty: Empty,
-    /// What Berth remembers between launches. One setting so far.
+    /// The right-click menu, what it is for and where it opened.
+    menu: Option<(crate::menu::Target, gpui::Point<gpui::Pixels>)>,
+    /// What Berth remembers between launches.
     settings: berth_core::settings::Settings,
 }
 
@@ -285,6 +294,7 @@ impl Workspace {
             focused_pane: None,
             running: std::collections::BTreeMap::new(),
             expanded: std::collections::BTreeMap::new(),
+            menu: None,
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -1082,9 +1092,23 @@ impl Workspace {
             return;
         };
         self.modal = Some(Modal::Kill {
-            pane: id,
+            pane: Some(id),
             alias: pane.alias().to_string(),
+            slug: pane.slug.clone(),
             session: pane.tmux_name(),
+        });
+        self.modal_focused = false;
+        cx.notify();
+    }
+
+    /// Ask before ending a session that has no tab.
+    fn ask_kill_detached(&mut self, alias: String, slug: String, cx: &mut Context<Self>) {
+        let session = berth_core::session::Session::new(slug.clone(), 80, 24).tmux_name();
+        self.modal = Some(Modal::Kill {
+            pane: None,
+            alias,
+            slug,
+            session,
         });
         self.modal_focused = false;
         cx.notify();
@@ -1169,19 +1193,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// End the tmux session and everything running in it, then close the tab.
-    fn kill(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane(id) else {
-            return;
-        };
-        let name = pane.tmux_name();
-        let command = berth_core::session::Session::new(pane.slug.clone(), 80, 24).kill_command();
-        tracing::warn!(alias = %pane.alias(), session = %name, "killing session");
-        let (alias, slug) = (pane.alias().to_string(), pane.slug.clone());
+    /// End a tmux session and everything running in it, and close its pane if
+    /// it has one.
+    fn kill(&mut self, alias: String, slug: String, pane: Option<u64>, cx: &mut Context<Self>) {
+        let session = berth_core::session::Session::new(slug.clone(), 80, 24);
+        let name = session.tmux_name();
+        let command = session.kill_command();
+        tracing::warn!(%alias, session = %name, "killing session");
         if let Some(listed) = self.running.get_mut(&alias) {
             listed.remove(&slug);
         }
-        let Some(connection) = self.conn_of(id).map(|c| c.connection.clone()) else {
+        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
             return;
         };
 
@@ -1195,7 +1217,102 @@ impl Workspace {
         })
         .detach();
 
-        self.close(id, cx);
+        if let Some(pane) = pane {
+            self.close(pane, cx);
+        }
+        cx.notify();
+    }
+
+    /// What a host is called on screen: the name it was given, or its alias.
+    fn host_label(&self, alias: &str) -> String {
+        self.settings.host_name(alias).unwrap_or(alias).to_string()
+    }
+
+    fn ask_rename_host(&mut self, alias: String, cx: &mut Context<Self>) {
+        let current = self.settings.host_name(&alias).unwrap_or("").to_string();
+        self.modal = Some(Modal::RenameHost {
+            alias,
+            field: TextField::new(current),
+        });
+        self.modal_focused = false;
+        cx.notify();
+    }
+
+    /// Name a host, or clear its name with an empty one.
+    fn rename_host(&mut self, alias: &str, name: &str, cx: &mut Context<Self>) {
+        if self.settings.set_host_name(alias, name) {
+            self.settings.save();
+            cx.notify();
+        }
+    }
+
+    // -- the right-click menu ----------------------------------------------
+
+    fn open_menu(
+        &mut self,
+        target: crate::menu::Target,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.menu = Some((target, at));
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// What the open menu offers, given what is true now.
+    fn menu_actions(&self) -> Vec<crate::menu::Action> {
+        use crate::menu::{Facts, Target};
+        let Some((target, _)) = &self.menu else {
+            return Vec::new();
+        };
+        let facts = match target {
+            Target::Pane(id) => Facts {
+                local: self.pane(*id).is_some_and(|p| p.is_local()),
+                connected: false,
+            },
+            Target::Host(alias) => Facts {
+                local: false,
+                connected: self.conns.contains_key(alias),
+            },
+            Target::Detached { .. } | Target::Local => Facts::default(),
+        };
+        crate::menu::actions(target, facts)
+    }
+
+    fn run_menu(&mut self, action: crate::menu::Action, cx: &mut Context<Self>) {
+        use crate::menu::{Action, Target};
+        let Some((target, _)) = self.menu.take() else {
+            return;
+        };
+        match (action, target) {
+            (Action::Rename, Target::Pane(id)) => self.ask_rename(id, cx),
+            (Action::Detach | Action::Close, Target::Pane(id)) => self.close(id, cx),
+            (Action::EndSession, Target::Pane(id)) => self.ask_kill(id, cx),
+            (Action::EndSession, Target::Detached { alias, slug }) => {
+                self.ask_kill_detached(alias, slug, cx)
+            }
+            (Action::Open, Target::Detached { alias, slug }) => self.open_session(alias, slug, cx),
+            (Action::NewTerminal, Target::Local) => {
+                self.new_terminal(crate::sidebar::Folder::Local, cx)
+            }
+            (Action::NewTerminal, Target::Host(alias)) => {
+                self.new_terminal(crate::sidebar::Folder::Host(alias), cx)
+            }
+            (Action::Connect, Target::Host(alias)) => self.open(alias, cx),
+            (Action::RenameHost, Target::Host(alias)) => self.ask_rename_host(alias, cx),
+            // The menu only lists what `actions` allows, so anything else is a
+            // menu built from one target and run against another.
+            (action, target) => tracing::debug!(?action, ?target, "menu action does not apply"),
+        }
+        cx.notify();
     }
 }
 

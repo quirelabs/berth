@@ -4,6 +4,7 @@
 mod bench;
 mod icons;
 mod input;
+mod menu;
 mod metrics;
 mod panes;
 mod reconnect;

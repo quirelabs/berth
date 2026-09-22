@@ -160,7 +160,7 @@ impl Workspace {
                 } else {
                     hsla(theme.state_colour(status.state()))
                 };
-                (alias.clone(), dot, Some(status))
+                (self.host_label(alias), dot, Some(status))
             }
         };
         let alias = match &folder {
@@ -173,8 +173,18 @@ impl Workspace {
         let no_local = self.panes.iter().all(|p| !p.is_local());
 
         let clicked = folder.clone();
+        let menu_target = match &folder {
+            Folder::Local => crate::menu::Target::Local,
+            Folder::Host(alias) => crate::menu::Target::Host(alias.clone()),
+        };
         let mut row = div()
             .id(("folder", index))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.open_menu(menu_target.clone(), event.position, cx)
+                }),
+            )
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 // An empty "This machine" has nothing to fold. A click on it
@@ -272,8 +282,24 @@ impl Workspace {
         let detached = pane.is_none();
 
         let slug = name.clone();
+        let menu_target = match (&folder, pane) {
+            (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
+            (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {
+                alias: alias.clone(),
+                slug: name.clone(),
+            }),
+            (crate::sidebar::Folder::Local, None) => None,
+        };
         let mut row = div()
             .id(("session", index))
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if let Some(target) = menu_target.clone() {
+                        this.open_menu(target, event.position, cx)
+                    }
+                }),
+            )
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| match (&folder, pane) {
                 (_, Some(pane)) => this.focus_pane(pane, cx),
@@ -359,9 +385,11 @@ impl Workspace {
             // A named session says its name; an unnamed one is just its host,
             // because `web-1/main` on every tab is noise.
             let label = if !local && pane.slug != berth_core::session::DEFAULT_SLUG {
-                format!("{}/{}", pane.alias(), pane.slug)
-            } else {
+                format!("{}/{}", self.host_label(pane.alias()), pane.slug)
+            } else if local {
                 pane.alias().to_string()
+            } else {
+                self.host_label(pane.alias())
             };
 
             // The cut name is still readable, on hover.
@@ -370,6 +398,12 @@ impl Workspace {
 
             let mut row = div()
                 .id(("tab", tab_id as usize))
+                .on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.open_menu(crate::menu::Target::Pane(id), event.position, cx)
+                    }),
+                )
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(tab_id, cx)))
                 .flex()
@@ -552,6 +586,61 @@ impl Workspace {
             )
     }
 
+    /// The right-click menu, over everything, at the pointer.
+    ///
+    /// A click anywhere outside it closes it without doing anything, as every
+    /// context menu does.
+    fn menu_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let Some((_, at)) = &self.menu else {
+            return div();
+        };
+        let mut list = div()
+            .absolute()
+            .left(at.x)
+            .top(at.y)
+            .min_w(px(160.0))
+            .flex()
+            .flex_col()
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(hsla(theme.surface))
+            .border_1()
+            .border_color(hsla(theme.border))
+            .text_xs()
+            // Clicks inside the menu are the menu's, not the backdrop's.
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        for (index, action) in self.menu_actions().into_iter().enumerate() {
+            let danger = action == crate::menu::Action::EndSession;
+            list = list.child(
+                div()
+                    .id(("menu-item", index))
+                    .cursor_pointer()
+                    .px(px(12.0))
+                    .py(px(4.0))
+                    .text_color(hsla(if danger { theme.warning } else { theme.text }))
+                    .hover(|row| row.bg(hsla(theme.border)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.run_menu(action, cx)))
+                    .child(menu_label(action)),
+            );
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
+            )
+            .child(list)
+    }
+
     /// A modal, over everything else.
     ///
     /// Modal on purpose: both questions it asks are ones where a wrong click
@@ -561,115 +650,112 @@ impl Workspace {
     fn modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let mut body = div().flex().flex_col().gap(px(10.0));
-        let (title, accept, reject, danger) =
-            match self.modal.as_ref() {
-                Some(Modal::Verify(prompt)) => {
-                    body = body
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::verify_body(&prompt.alias, &prompt.endpoint)),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(8.0))
-                                .items_center()
-                                .p(px(8.0))
-                                .rounded(px(4.0))
-                                .bg(hsla(theme.background))
-                                .border_1()
-                                .border_color(hsla(theme.border))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(hsla(theme.text_muted))
-                                        .child(strings::VERIFY_FINGERPRINT_LABEL),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(hsla(theme.text))
-                                        .child(prompt.fingerprint.clone()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::VERIFY_HINT),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::VERIFY_RECORDS),
-                        );
-                    (
-                        strings::VERIFY_TITLE,
-                        strings::VERIFY_ACCEPT,
-                        strings::VERIFY_REJECT,
-                        false,
+        let (title, accept, reject, danger) = match self.modal.as_ref() {
+            Some(Modal::Verify(prompt)) => {
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::verify_body(&prompt.alias, &prompt.endpoint)),
                     )
-                }
-                Some(Modal::Kill { alias, session, .. }) => {
-                    body = body
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::kill_body(alias, session)),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::KILL_ALTERNATIVE),
-                        );
-                    (
-                        strings::KILL_TITLE,
-                        strings::KILL_ACCEPT,
-                        strings::KILL_REJECT,
-                        true,
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .items_center()
+                            .p(px(8.0))
+                            .rounded(px(4.0))
+                            .bg(hsla(theme.background))
+                            .border_1()
+                            .border_color(hsla(theme.border))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(hsla(theme.text_muted))
+                                    .child(strings::VERIFY_FINGERPRINT_LABEL),
+                            )
+                            .child(
+                                div()
+                                    .text_color(hsla(theme.text))
+                                    .child(prompt.fingerprint.clone()),
+                            ),
                     )
-                }
-                Some(Modal::Rename { pane, field }) => {
-                    let local = self.pane(*pane).is_some_and(|p| p.is_local());
-                    let (before, after) = field.split();
-                    body = body
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .p(px(8.0))
-                                .rounded(px(4.0))
-                                .bg(hsla(theme.background))
-                                .border_1()
-                                .border_color(hsla(theme.accent))
-                                .text_color(hsla(theme.text))
-                                .child(before.to_string())
-                                // The cursor is a block between the halves rather
-                                // than a character in the string, so it can never
-                                // be saved as part of the name.
-                                .child(div().w(px(2.0)).h(px(16.0)).bg(hsla(theme.accent)))
-                                .child(after.to_string()),
-                        )
-                        .child(div().text_xs().text_color(hsla(theme.text_muted)).child(
-                            if local {
-                                strings::RENAME_BODY_LOCAL
-                            } else {
-                                strings::RENAME_BODY
-                            },
-                        ));
-                    (
-                        strings::RENAME_TITLE,
-                        strings::RENAME_ACCEPT,
-                        strings::RENAME_REJECT,
-                        false,
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::VERIFY_HINT),
                     )
-                }
-                None => return div(),
-            };
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::VERIFY_RECORDS),
+                    );
+                (
+                    strings::VERIFY_TITLE,
+                    strings::VERIFY_ACCEPT,
+                    strings::VERIFY_REJECT,
+                    false,
+                )
+            }
+            Some(Modal::Kill { alias, session, .. }) => {
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::kill_body(alias, session)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::KILL_ALTERNATIVE),
+                    );
+                (
+                    strings::KILL_TITLE,
+                    strings::KILL_ACCEPT,
+                    strings::KILL_REJECT,
+                    true,
+                )
+            }
+            Some(Modal::Rename { pane, field }) => {
+                let local = self.pane(*pane).is_some_and(|p| p.is_local());
+                body = body.child(field_box(field, theme)).child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(if local {
+                            strings::RENAME_BODY_LOCAL
+                        } else {
+                            strings::RENAME_BODY
+                        }),
+                );
+                (
+                    strings::RENAME_TITLE,
+                    strings::RENAME_ACCEPT,
+                    strings::RENAME_REJECT,
+                    false,
+                )
+            }
+            Some(Modal::RenameHost { alias, field }) => {
+                body = body.child(field_box(field, theme)).child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(strings::rename_host_body(alias)),
+                );
+                (
+                    strings::RENAME_HOST_TITLE,
+                    strings::RENAME_ACCEPT,
+                    strings::RENAME_REJECT,
+                    false,
+                )
+            }
+            None => return div(),
+        };
 
         div()
             .absolute()
@@ -683,7 +769,13 @@ impl Workspace {
                 // Anything but shift is a command, not typing, so a paste does
                 // not arrive in the name as a literal `v`.
                 let command = m.control || m.platform || m.alt || m.function;
-                if let Some(Modal::Rename { field, .. }) = this.modal.as_mut() {
+                let field = match this.modal.as_mut() {
+                    Some(Modal::Rename { field, .. } | Modal::RenameHost { field, .. }) => {
+                        Some(field)
+                    }
+                    _ => None,
+                };
+                if let Some(field) = field {
                     match field.handle(key, event.keystroke.key_char.as_deref(), command) {
                         Outcome::Edited => {
                             cx.notify();
@@ -928,6 +1020,10 @@ impl Render for Workspace {
                 if this.modal.is_some() {
                     return;
                 }
+                if this.menu.is_some() && event.keystroke.key == "escape" {
+                    this.close_menu(cx);
+                    return;
+                }
                 if let Some(command) = crate::input::command(&event.keystroke) {
                     this.run(command, cx);
                 }
@@ -939,10 +1035,47 @@ impl Render for Workspace {
             .child(div().flex().flex_1().child(self.sidebar(cx)).child(pane))
             .child(self.status_bar());
 
+        if self.menu.is_some() {
+            root = root.child(self.menu_overlay(cx));
+        }
         if self.modal.is_some() {
             root = root.child(self.modal(cx));
         }
         root
+    }
+}
+
+/// A one-line text field, drawn as its text with a cursor between the halves.
+fn field_box(field: &TextField, theme: Theme) -> gpui::Div {
+    let (before, after) = field.split();
+    div()
+        .flex()
+        .items_center()
+        .p(px(8.0))
+        .rounded(px(4.0))
+        .bg(hsla(theme.background))
+        .border_1()
+        .border_color(hsla(theme.accent))
+        .text_color(hsla(theme.text))
+        .child(before.to_string())
+        // The cursor is a block between the halves rather than a character in
+        // the string, so it can never be saved as part of the name.
+        .child(div().w(px(2.0)).h(px(16.0)).bg(hsla(theme.accent)))
+        .child(after.to_string())
+}
+
+/// What a menu item says.
+fn menu_label(action: crate::menu::Action) -> &'static str {
+    use crate::menu::Action;
+    match action {
+        Action::Rename => strings::MENU_RENAME,
+        Action::Detach => strings::MENU_DETACH,
+        Action::Close => strings::MENU_CLOSE,
+        Action::EndSession => strings::MENU_END_SESSION,
+        Action::Open => strings::MENU_OPEN,
+        Action::NewTerminal => strings::MENU_NEW_TERMINAL,
+        Action::Connect => strings::MENU_CONNECT,
+        Action::RenameHost => strings::MENU_RENAME_HOST,
     }
 }
 

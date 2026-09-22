@@ -107,6 +107,24 @@ pub fn rename_taken(slug: &str, alias: &str) -> String {
     format!("{alias} already has a session called {slug}")
 }
 
+pub const RENAME_HOST_TITLE: &str = "Name this host";
+
+pub fn rename_host_body(alias: &str) -> String {
+    format!(
+        "Shown in Berth instead of {alias}. Your ssh config is not changed. \
+         Leave it empty to show {alias} again."
+    )
+}
+
+pub const MENU_RENAME: &str = "Rename\u{2026}";
+pub const MENU_DETACH: &str = "Detach";
+pub const MENU_CLOSE: &str = "Close";
+pub const MENU_END_SESSION: &str = "End session\u{2026}";
+pub const MENU_OPEN: &str = "Open";
+pub const MENU_NEW_TERMINAL: &str = "New terminal";
+pub const MENU_CONNECT: &str = "Connect";
+pub const MENU_RENAME_HOST: &str = "Rename\u{2026}";
+
 pub const KILL_TITLE: &str = "End this session?";
 pub const KILL_ACCEPT: &str = "End session";
 pub const KILL_REJECT: &str = "Cancel";

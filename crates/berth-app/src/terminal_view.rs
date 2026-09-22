@@ -92,6 +92,10 @@ pub struct TerminalView {
     selection: Option<Selection>,
     /// Where a drag started, kept so the selection can be rebuilt as it moves.
     drag_anchor: Option<(u16, u16)>,
+    /// Whether the press that began the current gesture went to the program.
+    /// Decided once at the press, so letting go of shift mid-drag cannot send
+    /// the program a release it never saw the press for.
+    forwarding: bool,
     /// Grid origin and cell size from the last paint, so a mouse position can
     /// be turned into a cell. Set during paint because only the element knows
     /// the laid-out bounds.
@@ -124,6 +128,7 @@ impl TerminalView {
             resolved_font: None,
             selection: None,
             drag_anchor: None,
+            forwarding: false,
             geometry: None,
             scroll_px: 0.0,
         }
@@ -262,11 +267,12 @@ impl TerminalView {
             .unwrap_or(false)
     }
 
-    fn on_mouse_down(&mut self, position: Point<Pixels>) {
+    fn on_mouse_down(&mut self, position: Point<Pixels>, shift: bool) {
         let Some((line, column)) = self.cell_at(position) else {
             return;
         };
-        if self.forwards_mouse() {
+        self.forwarding = !click_is_local(self.forwards_mouse(), shift);
+        if self.forwarding {
             self.send_mouse(TermButton::Left, column, line, true);
             return;
         }
@@ -275,7 +281,7 @@ impl TerminalView {
     }
 
     fn on_mouse_drag(&mut self, position: Point<Pixels>) {
-        if self.forwards_mouse() {
+        if self.forwarding {
             return;
         }
         let (Some((anchor_line, anchor_column)), Some((line, column))) =
@@ -287,7 +293,7 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, position: Point<Pixels>) {
-        if self.forwards_mouse() {
+        if std::mem::take(&mut self.forwarding) {
             if let Some((line, column)) = self.cell_at(position) {
                 self.send_mouse(TermButton::Left, column, line, false);
             }
@@ -478,7 +484,7 @@ impl gpui::Render for TerminalView {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
-                    this.on_mouse_down(event.position);
+                    this.on_mouse_down(event.position, event.modifiers.shift);
                     cx.notify();
                 }),
             )
@@ -499,6 +505,16 @@ impl gpui::Render for TerminalView {
             )
             .child(element)
     }
+}
+
+/// Whether a click belongs to Berth's own selection rather than the program.
+///
+/// A program that asked for mouse events gets them, which is what makes
+/// clicking work in vim or htop. Shift takes the mouse back, as it takes the
+/// wheel back (D42), because otherwise a program like Claude Code that asks for
+/// the mouse leaves no way to select and copy anything on its screen.
+fn click_is_local(program_wants_mouse: bool, shift: bool) -> bool {
+    !program_wants_mouse || shift
 }
 
 pub struct TerminalElement {
@@ -882,7 +898,7 @@ fn batch_runs(snapshot: &Snapshot) -> Vec<CellRun> {
 
 #[cfg(test)]
 mod tests {
-    use super::whole_lines;
+    use super::{click_is_local, whole_lines};
 
     const LINE: f32 = 16.0;
 
@@ -1023,5 +1039,15 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].column, 0);
         assert_eq!(runs[1].column, 2);
+    }
+
+    /// Shift-drag is how text gets copied out of a program that took the
+    /// mouse. Without shift the program keeps its clicks.
+    #[test]
+    fn shift_takes_the_mouse_back_for_selection() {
+        assert!(click_is_local(false, false));
+        assert!(click_is_local(false, true));
+        assert!(!click_is_local(true, false));
+        assert!(click_is_local(true, true));
     }
 }

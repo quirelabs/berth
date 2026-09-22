@@ -69,8 +69,11 @@ impl Workspace {
     pub(super) fn confirm(&mut self, cx: &mut Context<Self>) {
         match self.modal.take() {
             Some(Modal::Verify(prompt)) => self.accept(prompt, cx),
-            Some(Modal::Kill { pane, .. }) => self.kill(pane, cx),
+            Some(Modal::Kill {
+                pane, alias, slug, ..
+            }) => self.kill(alias, slug, pane, cx),
             Some(Modal::Rename { pane, field }) => self.rename(pane, field.value().to_string(), cx),
+            Some(Modal::RenameHost { alias, field }) => self.rename_host(&alias, field.value(), cx),
             None => {}
         }
         cx.notify();
@@ -86,7 +89,7 @@ impl Workspace {
             Some(Modal::Kill { alias, .. }) => {
                 tracing::info!(%alias, "kill cancelled");
             }
-            Some(Modal::Rename { .. }) => {}
+            Some(Modal::Rename { .. } | Modal::RenameHost { .. }) => {}
             None => {}
         }
         cx.notify();
