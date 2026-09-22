@@ -2,6 +2,7 @@
 
 mod machine;
 mod render;
+mod saving;
 mod trust;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use berth_core::connection::ConnectionState;
 use berth_core::connection::state::{Action, Event};
 use berth_core::forward::Forwarder;
 use berth_core::host::Host;
+use berth_core::settings::{DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
 use berth_core::transport::Connection;
 
 use crate::panes::{Axis, Node};
@@ -117,6 +119,9 @@ struct Pane {
     host: Option<Host>,
     slug: String,
     view: Entity<TerminalView>,
+    /// A local session from a previous run whose tab has not been shown yet,
+    /// so its shell has not started (D46).
+    restored: Option<saving::Restored>,
 }
 
 impl Pane {
@@ -219,9 +224,11 @@ pub struct Workspace {
     /// Which pane currently holds the keyboard, so switching moves it. Without
     /// this the user looks at one session and types into another.
     focused_pane: Option<u64>,
-    /// tmux session names with an agent running in them, by host. Presence
-    /// only, never what the agent is doing (D34).
-    agents: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Berth's tmux sessions on each host, open or detached, with whether an
+    /// agent is running in each. Presence only, never what it is doing (D34).
+    running: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>>,
+    /// Sidebar folders opened or closed by hand.
+    expanded: std::collections::BTreeMap<crate::sidebar::Folder, bool>,
     /// Per-host status, so the sidebar can show hosts landing independently.
     statuses: std::collections::BTreeMap<String, HostStatus>,
     /// When the process started, for the cold-start measurement.
@@ -232,6 +239,8 @@ pub struct Workspace {
     ssh_config_path: Option<String>,
     theme: Theme,
     empty: Empty,
+    /// What Berth remembers between launches. One setting so far.
+    settings: berth_core::settings::Settings,
 }
 
 impl Workspace {
@@ -263,6 +272,7 @@ impl Workspace {
             ssh_config_path: path,
             theme: Theme::for_appearance(Appearance::Dark),
             empty: Empty::FirstRun,
+            settings: berth_core::settings::Settings::load(),
             conns: std::collections::BTreeMap::new(),
             panes: Vec::new(),
             tabs: Vec::new(),
@@ -273,13 +283,16 @@ impl Workspace {
             modal_focus: cx.focus_handle(),
             modal_focused: false,
             focused_pane: None,
-            agents: std::collections::BTreeMap::new(),
+            running: std::collections::BTreeMap::new(),
+            expanded: std::collections::BTreeMap::new(),
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
         };
 
+        this.restore_local(cx);
         this.warm(cx);
+        this.watch_saves(cx);
         this
     }
 
@@ -337,7 +350,23 @@ impl Workspace {
     /// session or both panes would attach to the same one and mirror each
     /// other. The base name is kept for the first, so an unsplit host still
     /// lands in `berth/main` and nothing about the common case changes.
+    ///
+    /// Detached sessions count as taken too: `new-session -A` would otherwise
+    /// attach a new terminal to one of them and mirror it.
     fn free_slug(&self, alias: &str) -> String {
+        let open = self.open_sessions();
+        let taken: Vec<&str> = crate::sidebar::taken(alias, &open, &self.running)
+            .into_iter()
+            .collect();
+        free_slug(&Self::slug(), &taken)
+    }
+
+    /// The session a host reattaches to when nothing more specific was asked
+    /// for: the default one, unless a pane here already shows it.
+    ///
+    /// Only open panes count. A detached `berth/main` is exactly what opening
+    /// the host should land back in.
+    fn first_slug(&self, alias: &str) -> String {
         let taken: Vec<&str> = self
             .panes
             .iter()
@@ -345,6 +374,18 @@ impl Workspace {
             .map(|p| p.slug.as_str())
             .collect();
         free_slug(&Self::slug(), &taken)
+    }
+
+    /// Every pane, as the sidebar sees it.
+    fn open_sessions(&self) -> Vec<crate::sidebar::OpenSession<'_>> {
+        self.panes
+            .iter()
+            .map(|p| crate::sidebar::OpenSession {
+                pane: p.id,
+                host: p.host.as_ref().map(|h| h.alias.as_str()),
+                slug: p.slug.as_str(),
+            })
+            .collect()
     }
 
     fn slug() -> String {
@@ -473,6 +514,7 @@ impl Workspace {
         place: Place,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let font_size = self.settings.font_size;
         let view = cx.new(|cx| {
             TerminalView::new(
                 terminal,
@@ -480,6 +522,7 @@ impl Workspace {
                 {
                     let mut style = crate::terminal_style::TerminalStyle::default();
                     style.resolve_family(&installed);
+                    style.font_size = font_size;
                     style
                 },
                 cx,
@@ -496,6 +539,7 @@ impl Workspace {
             host,
             slug,
             view,
+            restored: None,
         });
 
         match place {
@@ -553,7 +597,10 @@ impl Workspace {
         // shell here so there is something to type into immediately, and let
         // the sidebar explain where hosts come from.
         if hosts.is_empty() {
-            self.open_local(Place::Tab { show: true }, cx);
+            // Restored local tabs are already something to type into.
+            if self.tabs.is_empty() {
+                self.open_local(Place::Tab { show: true }, cx);
+            }
             return;
         }
 
@@ -585,15 +632,18 @@ impl Workspace {
             if asked_for {
                 self.empty = Empty::Connecting(host.alias.clone());
             }
-            self.connect(host, asked_for, cx);
+            self.connect(host, None, asked_for, cx);
         }
     }
 
     /// Bring a host up in a tab of its own, shown or not.
-    fn connect(&mut self, host: Host, show: bool, cx: &mut Context<Self>) {
+    ///
+    /// `slug` names the tmux session to attach, or `None` for the default one,
+    /// which is what warming and a click on a host have always reattached to.
+    fn connect(&mut self, host: Host, slug: Option<String>, show: bool, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
         tracing::info!(%alias, "connecting");
-        let slug = self.free_slug(&alias);
+        let slug = slug.unwrap_or_else(|| self.first_slug(&alias));
         let forwards = host.forwards.clone();
         let place = Place::Tab { show };
 
@@ -700,6 +750,7 @@ impl Workspace {
         {
             self.active = index;
             self.tabs[index].focus = pane;
+            self.wake_active(cx);
             cx.notify();
             return;
         }
@@ -709,15 +760,125 @@ impl Workspace {
         if berth_core::known_hosts::is_known(&host.hostname, host.port) {
             self.statuses
                 .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
-            self.connect(host, true, cx);
+            self.connect(host, None, true, cx);
         } else {
             self.verify(host, cx);
         }
     }
 
+    /// Act on a click on a folder row.
+    ///
+    /// A host with no connection is opened, exactly as a host row always was:
+    /// verified if it was never trusted, retried if it failed, reattached
+    /// otherwise. Only a live host has a listing to show, so only a live host
+    /// folds and unfolds.
+    fn click_folder(
+        &mut self,
+        folder: crate::sidebar::Folder,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let crate::sidebar::Folder::Host(alias) = &folder
+            && !self.conns.contains_key(alias)
+        {
+            self.expanded.insert(folder.clone(), true);
+            self.open(alias.clone(), cx);
+            return;
+        }
+        self.expanded.insert(folder, !expanded);
+        cx.notify();
+    }
+
+    /// Act on a click on a session row: show it if it is open, reattach it in a
+    /// tab of its own if it is running detached.
+    fn open_session(&mut self, alias: String, slug: String, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        if let Some(pane) = self
+            .panes
+            .iter()
+            .find(|p| p.host.as_ref().is_some_and(|h| h.alias == alias) && p.slug == slug)
+            .map(|p| p.id)
+        {
+            self.focus_pane(pane, cx);
+            return;
+        }
+        self.attach_new(alias, slug, cx);
+    }
+
+    /// A fresh terminal in a folder, in a tab of its own.
+    fn new_terminal(&mut self, folder: crate::sidebar::Folder, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        match folder {
+            crate::sidebar::Folder::Local => self.open_local(Place::Tab { show: true }, cx),
+            crate::sidebar::Folder::Host(alias) => {
+                let slug = self.free_slug(&alias);
+                self.attach_new(alias, slug, cx);
+            }
+        }
+    }
+
+    /// Attach a named session in a new tab, on the host's connection if it has
+    /// one and through a normal connect if it does not.
+    fn attach_new(&mut self, alias: String, slug: String, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
+            // Nothing to ride: the same path as opening the host, so trust is
+            // still asked for before anything connects.
+            if berth_core::known_hosts::is_known(&host.hostname, host.port) {
+                self.statuses
+                    .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
+                self.connect(host, Some(slug), true, cx);
+            } else {
+                self.verify(host, cx);
+            }
+            return;
+        };
+        tracing::info!(%alias, %slug, "attaching from the sidebar");
+        let place = Place::Tab { show: true };
+        cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
+            let result =
+                runtime::spawn(session::open_on(connection, slug.clone(), 80, 24, palette))
+                    .await
+                    .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
+            match result {
+                Ok(connected) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.adopt(
+                            Some(host),
+                            slug,
+                            connected,
+                            Vec::new(),
+                            installed,
+                            place,
+                            cx,
+                        );
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%alias, %error, "attach failed");
+                    let _ = this.update(cx, |this, cx| {
+                        this.warnings.push(error);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
     fn activate(&mut self, tab: u64, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
             self.active = index;
+            self.wake_active(cx);
             cx.notify();
         }
     }
@@ -726,6 +887,7 @@ impl Workspace {
     fn focus_pane(&mut self, pane: u64, cx: &mut Context<Self>) {
         if let Some(index) = self.tab_of(pane) {
             self.active = index;
+            self.wake_active(cx);
             self.tabs[index].focus = pane;
             cx.notify();
         }
@@ -747,7 +909,37 @@ impl Workspace {
                     self.focus_pane(next, cx);
                 }
             }
+            Command::FontBigger => self.nudge_font(FONT_SIZE_STEP, cx),
+            Command::FontSmaller => self.nudge_font(-FONT_SIZE_STEP, cx),
+            Command::FontReset => self.set_font_size(DEFAULT_FONT_SIZE, cx),
+            // There was no way to quit but closing the window. Quitting runs
+            // the quit hooks, which is where local tabs are saved.
+            Command::Quit => cx.quit(),
         }
+    }
+
+    fn nudge_font(&mut self, by: f32, cx: &mut Context<Self>) {
+        self.set_font_size(self.settings.font_size + by, cx);
+    }
+
+    /// Resize the text everywhere and remember it.
+    ///
+    /// Every pane, not the focused one: a split showing two sizes of the same
+    /// font is not a feature anybody asked for. Saved on each press rather than
+    /// on quit, because the one time it matters is the launch after a crash.
+    fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        if !self.settings.set_font_size(size) {
+            return;
+        }
+        let size = self.settings.font_size;
+        for pane in &self.panes {
+            pane.view.update(cx, |view, cx| {
+                view.set_font_size(size);
+                cx.notify();
+            });
+        }
+        self.settings.save();
+        cx.notify();
     }
 
     /// Split the focused pane, opening a second session on the same host.
@@ -823,6 +1015,7 @@ impl Workspace {
         };
         let pane = self.panes.remove(index);
         let alias = pane.alias().to_string();
+        let local = pane.is_local();
         tracing::info!(%alias, session = %pane.tmux_name(), "detached");
         drop(pane);
 
@@ -850,6 +1043,9 @@ impl Workspace {
             // that reaches the state which does.
             conn.reconnect.handle(Event::Close);
             debug_assert!(!conn.reconnect.holds_grid());
+            // With no connection nothing keeps the listing true, and a stale
+            // row would reattach to a session killed from somewhere else.
+            self.running.remove(&alias);
             self.statuses
                 .insert(alias, HostStatus::Connection(ConnectionState::Disconnected));
             // Politeness, not correctness: dropping the handle would end it
@@ -869,6 +1065,14 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.empty = Empty::FirstRun;
         }
+        // A closed local shell has ended, so it must not come back at the next
+        // launch. Saved now rather than at the next minute or at quit, which a
+        // crash would skip.
+        if local {
+            self.save_local(cx);
+        }
+        // Closing can put a restored tab on screen.
+        self.wake_active(cx);
         cx.notify();
     }
 
@@ -936,6 +1140,7 @@ impl Workspace {
             let command = berth_core::session::Session::new(from.clone(), 80, 24)
                 .rename_command(&berth_core::session::Session::new(to.clone(), 80, 24));
             let named = to.clone();
+            let from = from.clone();
             cx.spawn(async move |_, _| {
                 match runtime::spawn(async move { connection.exec(&command).await }).await {
                     Ok(Ok(out)) if out.succeeded() => {
@@ -951,6 +1156,13 @@ impl Workspace {
             .detach();
         }
 
+        // Moved here as well, or the tree shows the old name as a detached
+        // session until the next poll.
+        if let Some(listed) = self.running.get_mut(&alias)
+            && let Some(agent) = listed.remove(&from)
+        {
+            listed.insert(to.clone(), agent);
+        }
         if let Some(pane) = self.pane_mut(id) {
             pane.slug = to;
         }
@@ -965,6 +1177,10 @@ impl Workspace {
         let name = pane.tmux_name();
         let command = berth_core::session::Session::new(pane.slug.clone(), 80, 24).kill_command();
         tracing::warn!(alias = %pane.alias(), session = %name, "killing session");
+        let (alias, slug) = (pane.alias().to_string(), pane.slug.clone());
+        if let Some(listed) = self.running.get_mut(&alias) {
+            listed.remove(&slug);
+        }
         let Some(connection) = self.conn_of(id).map(|c| c.connection.clone()) else {
             return;
         };
@@ -1020,14 +1236,24 @@ fn startup_alias<'a>(hosts: &'a [Host], requested: Option<&'a str>) -> Option<&'
     }
 }
 
-/// Whether the set of sessions running an agent on one host has moved.
+/// Whether a tab carries a state dot.
+///
+/// Only when something is wrong. Connected is the normal case and the sidebar
+/// folder already says it, so a dot on every tab was colour that meant nothing.
+/// A local shell has no connection at all, and used to show one as
+/// disconnected.
+fn shows_state(local: bool, state: ConnectionState) -> bool {
+    !local && state != ConnectionState::Connected
+}
+
+/// Whether a host's sessions, or the agents in them, have moved.
 ///
 /// Nothing recorded and nothing found is not a change. Treating it as one made
 /// every host log its arrival at startup, for a picture that had always been
 /// empty.
 fn presence_changed(
-    existing: Option<&std::collections::BTreeSet<String>>,
-    found: &std::collections::BTreeSet<String>,
+    existing: Option<&std::collections::BTreeMap<String, bool>>,
+    found: &std::collections::BTreeMap<String, bool>,
 ) -> bool {
     match existing {
         Some(existing) => existing != found,
@@ -1092,8 +1318,8 @@ mod tests {
         assert_eq!(startup_alias(&hosts(&["a"]), Some("a")), Some("a"));
     }
 
-    fn sessions(names: &[&str]) -> std::collections::BTreeSet<String> {
-        names.iter().map(|n| n.to_string()).collect()
+    fn sessions(pairs: &[(&str, bool)]) -> std::collections::BTreeMap<String, bool> {
+        pairs.iter().map(|(n, a)| (n.to_string(), *a)).collect()
     }
 
     /// The startup case: nothing known and nothing running is not news.
@@ -1104,22 +1330,56 @@ mod tests {
 
     #[test]
     fn an_agent_appearing_or_leaving_is_a_change() {
-        assert!(presence_changed(None, &sessions(&["berth/main"])));
         assert!(presence_changed(
-            Some(&sessions(&["berth/main"])),
+            Some(&sessions(&[("main", false)])),
+            &sessions(&[("main", true)])
+        ));
+        assert!(presence_changed(
+            Some(&sessions(&[("main", true)])),
+            &sessions(&[("main", false)])
+        ));
+    }
+
+    /// The tree lists detached sessions, so one appearing or going is news
+    /// even with no agent anywhere.
+    #[test]
+    fn a_session_appearing_or_leaving_is_a_change() {
+        assert!(presence_changed(None, &sessions(&[("main", false)])));
+        assert!(presence_changed(
+            Some(&sessions(&[("main", false)])),
             &sessions(&[])
         ));
         assert!(presence_changed(
-            Some(&sessions(&["berth/main"])),
-            &sessions(&["berth/deploy"])
+            Some(&sessions(&[("main", false)])),
+            &sessions(&[("deploy", false)])
         ));
+    }
+
+    #[test]
+    fn a_healthy_tab_carries_no_state_dot() {
+        assert!(!shows_state(false, ConnectionState::Connected));
+        for state in [
+            ConnectionState::Disconnected,
+            ConnectionState::Connecting,
+            ConnectionState::Degraded,
+            ConnectionState::Reconnecting,
+        ] {
+            assert!(shows_state(false, state), "{state:?}");
+        }
+    }
+
+    /// A local shell has no connection, so there is no state to report.
+    #[test]
+    fn a_local_tab_never_carries_a_state_dot() {
+        assert!(!shows_state(true, ConnectionState::Disconnected));
+        assert!(!shows_state(true, ConnectionState::Connected));
     }
 
     /// The same picture twice must not repaint, or this is a wakeup every five
     /// seconds forever.
     #[test]
-    fn the_same_agents_are_not_a_change() {
-        let running = sessions(&["berth/main", "berth/deploy"]);
+    fn the_same_listing_is_not_a_change() {
+        let running = sessions(&[("main", true), ("deploy", false)]);
         assert!(!presence_changed(Some(&running), &running.clone()));
     }
 }

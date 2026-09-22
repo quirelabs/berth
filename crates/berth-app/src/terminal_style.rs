@@ -139,7 +139,7 @@ impl Default for TerminalStyle {
                 "DejaVu Sans Mono".to_string(),
                 "monospace".to_string(),
             ],
-            font_size: 13.0,
+            font_size: berth_core::settings::DEFAULT_FONT_SIZE,
             line_height: 1.2,
             padding_x: 8.0,
             padding_y: 0.0,
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(s.padding_x, 8.0);
         assert_eq!(s.line_height, 1.2);
         assert_eq!(s.font_family, "JetBrains Mono");
-        assert_eq!(s.font_size, 13.0);
+        assert_eq!(s.font_size, berth_core::settings::DEFAULT_FONT_SIZE);
     }
 
     /// The point of the fallback list: JetBrains Mono is not installed

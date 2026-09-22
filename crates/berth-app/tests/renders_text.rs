@@ -60,7 +60,13 @@ fn a_glyph_reaches_the_framebuffer() {
         return;
     }
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_berth"))
+    // On macOS the probe runs from inside a bundle. See `bundled_probe`.
+    #[cfg(target_os = "macos")]
+    let (_bundle, program) = bundled_probe();
+    #[cfg(not(target_os = "macos"))]
+    let program = std::path::PathBuf::from(env!("CARGO_BIN_EXE_berth"));
+
+    let mut child = Command::new(&program)
         .arg("--render-probe")
         .stdout(Stdio::piped())
         .spawn()
@@ -143,8 +149,12 @@ fn a_glyph_reaches_the_framebuffer() {
     assert!(
         text_ratio > 0.005,
         "no glyph reached the framebuffer: {:.3}% of the text band is lit. \
-         The window drew, and it drew nothing. See decisions.md B5.",
-        text_ratio * 100.0
+         The window drew, and it drew nothing. See decisions.md B5.\n\
+         Lit pixels by row, in points from the top of the capture, so a band \
+         that is merely in the wrong place can be told from a window that drew \
+         nothing:\n{}",
+        text_ratio * 100.0,
+        profile(&image, scale)
     );
 
     eprintln!(
@@ -153,6 +163,84 @@ fn a_glyph_reaches_the_framebuffer() {
         control_ratio * 100.0
     );
     let _ = (g.x, g.y, g.w);
+}
+
+/// Lit pixels per row of the capture, in points, as a single line.
+///
+/// Only built when something failed. A band with no text in it and a window
+/// with no text in it produce the same ratio, and this separates them: the
+/// first shows a run of lit rows somewhere else, the second shows none at all.
+fn profile(image: &image::RgbImage, scale: f32) -> String {
+    let (width, height) = image.dimensions();
+    let step = (10.0 * scale).max(1.0) as u32;
+    let mut out = String::new();
+    for y0 in (0..height).step_by(step as usize) {
+        let y1 = (y0 + step).min(height);
+        let mut lit = 0u64;
+        for y in y0..y1 {
+            for x in 0..width {
+                if image.get_pixel(x, y).0.iter().any(|c| *c > LIT) {
+                    lit += 1;
+                }
+            }
+        }
+        let total = u64::from(y1 - y0) * u64::from(width);
+        let percent = lit as f64 / total as f64 * 100.0;
+        if percent >= 0.1 {
+            out.push_str(&format!(
+                "  {:>4}pt {:>5.1}%\n",
+                (y0 as f32 / scale) as u32,
+                percent
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("  nothing lit anywhere in the capture\n");
+    }
+    out
+}
+
+/// A throwaway `.app` around the probe binary, deleted when the test ends.
+///
+/// A bare binary on macOS cannot be brought to the front, so the probe's window
+/// opens behind whatever was already there and `screencapture -R` over its
+/// rectangle photographs the wrong thing. The control band catches that, which
+/// is why this failed as "the capture is probably not the probe's window"
+/// rather than as a rendering fault. A process launched from inside a valid
+/// bundle gets an activation policy that lets it come forward.
+///
+/// Assembled here rather than by `scripts/bundle-macos.sh` so that `cargo test`
+/// is enough on its own, and from the same `Info.plist` the real bundle uses so
+/// the two cannot drift.
+#[cfg(target_os = "macos")]
+struct Bundle(std::path::PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for Bundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bundled_probe() -> (Bundle, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("berth_pixel_check_{}.app", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let contents = root.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).expect("a temp bundle should be creatable");
+
+    let template = include_str!("../macos/Info.plist");
+    std::fs::write(
+        contents.join("Info.plist"),
+        template.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+    )
+    .expect("the bundle needs its Info.plist");
+
+    let program = contents.join("MacOS").join("berth");
+    std::fs::copy(env!("CARGO_BIN_EXE_berth"), &program).expect("the probe binary should copy");
+
+    (Bundle(root), program)
 }
 
 #[cfg(target_os = "macos")]

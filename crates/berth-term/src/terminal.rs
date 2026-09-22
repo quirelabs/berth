@@ -457,6 +457,83 @@ impl Terminal {
         }
     }
 
+    /// The live screen as escape sequences that redraw it.
+    ///
+    /// Feeding this to a fresh terminal of the same size reproduces the
+    /// screen: characters, resolved colours, bold, italic, underline, strike
+    /// and the cursor position. It is how a local session's last screen is
+    /// kept across a quit. Always the live grid, never wherever the view was
+    /// scrolled to, and never the scrollback.
+    ///
+    /// Colours are written resolved, as truecolour, so the picture does not
+    /// depend on which palette reads it back. Trailing blanks on the default
+    /// background are left out, because a saved screen is mostly padding.
+    pub fn screen_ansi(&self) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        use std::fmt::Write as _;
+
+        let grid = self.term.grid();
+        let lines = self.size.screen_lines();
+        let columns = self.size.columns();
+        let mut out = String::from("\x1b[0m\x1b[H\x1b[2J");
+
+        for line in 0..lines {
+            let row = &grid[Line(line as i32)];
+            let mut cells = Vec::with_capacity(columns);
+            for column in 0..columns {
+                let cell = &row[Column(column)];
+                let flags = cell.flags;
+                if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let mut fg = self.palette.resolve(cell.fg, flags.contains(Flags::BOLD));
+                let mut bg = self.palette.resolve(cell.bg, false);
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let style = Style {
+                    fg,
+                    bg,
+                    bold: flags.contains(Flags::BOLD),
+                    italic: flags.contains(Flags::ITALIC),
+                    underline: flags.intersects(Flags::ALL_UNDERLINES),
+                    strikethrough: flags.contains(Flags::STRIKEOUT),
+                };
+                cells.push((cell.c, style));
+            }
+            while cells.last().is_some_and(|(c, style)| {
+                *c == ' ' && style.bg == self.palette.background && !style.marks_blank()
+            }) {
+                cells.pop();
+            }
+            if cells.is_empty() {
+                continue;
+            }
+
+            let _ = write!(out, "\x1b[{};1H", line + 1);
+            let mut current: Option<Style> = None;
+            for (c, style) in cells {
+                if current != Some(style) {
+                    style.write_sgr(&mut out);
+                    current = Some(style);
+                }
+                // A control character in a cell would be obeyed on the way back
+                // in rather than drawn.
+                out.push(if c.is_control() { ' ' } else { c });
+            }
+            out.push_str("\x1b[0m");
+        }
+
+        let cursor = grid.cursor.point;
+        let _ = write!(
+            out,
+            "\x1b[{};{}H",
+            cursor.line.0.max(0) + 1,
+            cursor.column.0 + 1
+        );
+        out
+    }
+
     /// The whole visible grid as text, for tests and for output indexing.
     pub fn visible_text(&self) -> String {
         let mut out = String::new();
@@ -472,6 +549,45 @@ impl Terminal {
             }
         }
         out
+    }
+}
+
+/// The drawn style of one cell, for writing a screen back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Style {
+    fg: Rgb,
+    bg: Rgb,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+}
+
+impl Style {
+    /// Underline and strike draw on a blank, so a blank carrying one is not
+    /// padding.
+    fn marks_blank(&self) -> bool {
+        self.underline || self.strikethrough
+    }
+
+    fn write_sgr(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "\x1b[0;38;2;{};{};{};48;2;{};{};{}",
+            self.fg.r, self.fg.g, self.fg.b, self.bg.r, self.bg.g, self.bg.b
+        );
+        for (on, code) in [
+            (self.bold, ";1"),
+            (self.italic, ";3"),
+            (self.underline, ";4"),
+            (self.strikethrough, ";9"),
+        ] {
+            if on {
+                out.push_str(code);
+            }
+        }
+        out.push('m');
     }
 }
 
@@ -1026,5 +1142,70 @@ mod tests {
         let mut t = terminal();
         t.advance(b"\x1b[?1049h\x1b[?1007l");
         assert_eq!(t.wheel_action(false), WheelAction::View);
+    }
+
+    fn replayed(from: &Terminal) -> Terminal {
+        let mut to = Terminal::new(from.size(), CellSize::new(8.0, 16.0));
+        to.advance(from.screen_ansi().as_bytes());
+        to
+    }
+
+    /// The point of the whole thing: what comes back is what was saved.
+    #[test]
+    fn a_saved_screen_redraws_the_same() {
+        let mut term = terminal();
+        term.advance(b"plain\r\n\x1b[1;31mbold red\x1b[0m \x1b[4mund\x1b[0m\r\n\x1b[44m blue bg \x1b[0m\r\n$ ");
+        let back = replayed(&term);
+
+        assert_eq!(back.visible_text(), term.visible_text());
+        let (before, after) = (term.snapshot(), back.snapshot());
+        assert_eq!(before.cursor, after.cursor);
+        for (a, b) in before.cells.iter().zip(after.cells.iter()) {
+            assert_eq!(
+                (a.c, a.fg, a.bg, a.bold, a.underline),
+                (b.c, b.fg, b.bg, b.bold, b.underline),
+                "{a:?}"
+            );
+        }
+    }
+
+    /// Inverse is saved as the colours it produced, since the reader has no
+    /// reason to know a swap happened.
+    #[test]
+    fn inverse_comes_back_as_its_colours() {
+        let mut term = terminal();
+        term.advance(b"\x1b[7minv\x1b[0m");
+        let back = replayed(&term);
+        let (a, b) = (&term.snapshot().cells[0], &back.snapshot().cells[0]);
+        assert_eq!((a.fg, a.bg), (b.fg, b.bg));
+    }
+
+    #[test]
+    fn wide_characters_keep_their_columns() {
+        let mut term = terminal();
+        term.advance("\u{4e2d}\u{6587}x".as_bytes());
+        let back = replayed(&term);
+        assert_eq!(back.visible_text(), term.visible_text());
+        assert_eq!(back.snapshot().cursor, term.snapshot().cursor);
+    }
+
+    /// The live screen, not wherever the view was left.
+    #[test]
+    fn a_scrolled_view_saves_the_live_screen() {
+        let mut term = terminal();
+        for n in 0..30 {
+            term.advance(format!("line {n}\r\n").as_bytes());
+        }
+        let live = term.visible_text();
+        term.scroll(Scroll::Lines(10));
+        assert_ne!(term.visible_text(), live);
+        assert_eq!(replayed(&term).visible_text(), live);
+    }
+
+    /// Padding is not worth saving. A blank screen is a clear and a cursor.
+    #[test]
+    fn a_blank_screen_saves_almost_nothing() {
+        let term = terminal();
+        assert_eq!(term.screen_ansi(), "\x1b[0m\x1b[H\x1b[2J\x1b[1;1H");
     }
 }

@@ -11,7 +11,9 @@ pub mod host;
 pub mod known_hosts;
 pub mod local;
 pub mod pty;
+pub mod restore;
 pub mod session;
+pub mod settings;
 pub mod transport;
 
 pub use error::{Error, Result};

@@ -1,0 +1,269 @@
+//! Local sessions kept across a quit or a reboot (D46).
+//!
+//! The shell itself ends with Berth (D36). Its tab, its split, its directory
+//! and its last screen are saved every minute, when a local tab closes and on
+//! quit. On launch the tabs come back with nothing running, and a tab's shells
+//! start, in their saved directories under their old screens, when that tab is
+//! first shown. A tab never looked at costs no process.
+
+use std::path::PathBuf;
+
+use berth_core::restore::{Saved, SavedPane, SavedTab};
+
+use super::*;
+
+/// How often local sessions are saved while Berth runs. The quit saves too;
+/// this is for the quit that never happens, a crash or a power cut.
+const SAVE_EVERY: Duration = Duration::from_secs(60);
+
+/// A local pane with nothing running yet: the screen of a session from a
+/// previous run, waiting for its tab to be shown.
+pub(super) struct Restored {
+    /// Where the new shell starts. `None` where the platform would not say,
+    /// and then it starts at home.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Where a pane's directory comes from when saving: already known, or to be
+/// asked of its running shell off the UI thread.
+enum Dir {
+    Known(Option<PathBuf>),
+    Ask(u32),
+}
+
+impl Workspace {
+    /// Put back the local tabs the last run saved, before anything connects.
+    pub(super) fn restore_local(&mut self, cx: &mut Context<Self>) {
+        let saved = Saved::load();
+        if saved.tabs.is_empty() {
+            return;
+        }
+        let installed = cx.text_system().all_font_names();
+        let mut tabs = saved.tabs;
+        tabs.sort_by_key(|t| t.position);
+
+        for tab in tabs {
+            let ids: Vec<u64> = tab
+                .panes
+                .into_iter()
+                .map(|saved| self.restored_pane(saved, &installed, cx))
+                .collect();
+            let (Some(root), Some(first)) = (
+                crate::restore::node_of(&tab.layout, &ids),
+                ids.first().copied(),
+            ) else {
+                // Checked on load, so this is a bug rather than a bad file.
+                // The panes exist; they just have no tab to be in.
+                tracing::warn!("a restored layout did not match its panes");
+                continue;
+            };
+            self.next_tab_id += 1;
+            let at = tab.position.min(self.tabs.len());
+            self.tabs.insert(
+                at,
+                Tab {
+                    id: self.next_tab_id,
+                    root,
+                    focus: ids.get(tab.focus).copied().unwrap_or(first),
+                },
+            );
+        }
+        self.active = 0;
+        tracing::info!(tabs = self.tabs.len(), "restored local sessions");
+        self.wake_active(cx);
+    }
+
+    /// Start the shells of restored panes in the tab on screen.
+    ///
+    /// Called wherever the shown tab can change. Cheap when there is nothing
+    /// restored, and a pane only ever starts once because resuming takes its
+    /// restored state.
+    pub(super) fn wake_active(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let waiting: Vec<u64> = tab
+            .root
+            .panes()
+            .into_iter()
+            .filter(|id| self.pane(*id).is_some_and(|p| p.restored.is_some()))
+            .collect();
+        for id in waiting {
+            self.resume(id, cx);
+        }
+    }
+
+    fn restored_pane(
+        &mut self,
+        saved: SavedPane,
+        installed: &[String],
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let palette = crate::terminal_style::TerminalStyle::default().palette;
+        let terminal = session::terminal_for(saved.cols, saved.rows, palette);
+        if let Ok(mut term) = terminal.lock() {
+            term.advance(saved.screen.as_bytes());
+        }
+        let font_size = self.settings.font_size;
+        let view = cx.new(|cx| {
+            let mut style = crate::terminal_style::TerminalStyle::default();
+            style.resolve_family(installed);
+            style.font_size = font_size;
+            TerminalView::new(terminal, None, style, cx)
+        });
+        self.next_pane_id += 1;
+        let id = self.next_pane_id;
+        self.panes.push(Pane {
+            id,
+            host: None,
+            slug: strings::LOCAL_ALIAS.to_string(),
+            view,
+            restored: Some(Restored { cwd: saved.cwd }),
+        });
+        id
+    }
+
+    /// Start a new shell in a restored pane, where the old one was.
+    fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(id) else {
+            return;
+        };
+        let Some(restored) = pane.restored.take() else {
+            return;
+        };
+        let view = pane.view.clone();
+        let size = view.read(cx).grid_size();
+        tracing::info!(cwd = ?restored.cwd, "starting a shell in a restored session");
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let opened = runtime::spawn(async move {
+                match &restored.cwd {
+                    Some(cwd) => berth_core::local::open_in(cwd, size.cols, size.rows).await,
+                    None => berth_core::local::open(size.cols, size.rows).await,
+                }
+            })
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+
+            let _ = this.update(cx, |this, cx| match opened {
+                Ok((pty, events)) => {
+                    view.update(cx, |view, cx| {
+                        view.resume(pty);
+                        session::start_pump(&cx.entity(), events, cx);
+                    });
+                    cx.notify();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not start a shell in a restored session");
+                    this.warnings.push(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Every tab that holds only local shells, as it would be saved, with the
+    /// directories still to be looked up.
+    ///
+    /// Remote tabs are not saved here: their sessions live in tmux on the
+    /// server, and the sidebar lists them whether a tab is open or not.
+    fn snapshot_local(&self, cx: &Context<Self>) -> Vec<(SavedTab, Vec<Dir>)> {
+        let mut out = Vec::new();
+        for (position, tab) in self.tabs.iter().enumerate() {
+            let order = tab.root.panes();
+            let panes: Vec<&Pane> = order.iter().filter_map(|id| self.pane(*id)).collect();
+            if panes.len() != order.len() || panes.iter().any(|p| !p.is_local()) {
+                continue;
+            }
+            let Some(layout) = crate::restore::layout_of(&tab.root, &order) else {
+                continue;
+            };
+            let mut saved = Vec::new();
+            let mut dirs = Vec::new();
+            for pane in panes {
+                let view = pane.view.read(cx);
+                let Some((screen, size)) = view.saved_screen() else {
+                    continue;
+                };
+                dirs.push(
+                    match (&pane.restored, view.pty().and_then(|p| p.local_pid())) {
+                        (Some(restored), _) => Dir::Known(restored.cwd.clone()),
+                        (None, Some(pid)) => Dir::Ask(pid),
+                        (None, None) => Dir::Known(None),
+                    },
+                );
+                saved.push(SavedPane {
+                    cwd: None,
+                    cols: size.cols,
+                    rows: size.rows,
+                    screen,
+                });
+            }
+            if saved.len() != order.len() {
+                continue;
+            }
+            out.push((
+                SavedTab {
+                    position,
+                    focus: order.iter().position(|id| *id == tab.focus).unwrap_or(0),
+                    layout,
+                    panes: saved,
+                },
+                dirs,
+            ));
+        }
+        out
+    }
+
+    /// Save now, with the directory lookups and the write off the UI thread.
+    pub(super) fn save_local(&self, cx: &mut Context<Self>) {
+        let pending = self.snapshot_local(cx);
+        cx.background_executor()
+            .spawn(async move { finish(pending).save() })
+            .detach();
+    }
+
+    /// Save every minute until the workspace goes, and once more on quit.
+    pub(super) fn watch_saves(&self, cx: &mut Context<Self>) {
+        cx.on_app_quit(|this, cx| {
+            // On the way out there is no later to put this off to. The lookups
+            // are a few milliseconds each and the quit waits for them.
+            finish(this.snapshot_local(cx)).save();
+            async {}
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SAVE_EVERY).await;
+                if this.update(cx, |this, cx| this.save_local(cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+/// Fill in the directories and make the file's contents. Blocking.
+fn finish(pending: Vec<(SavedTab, Vec<Dir>)>) -> Saved {
+    let tabs = pending
+        .into_iter()
+        .map(|(mut tab, dirs)| {
+            for (pane, dir) in tab.panes.iter_mut().zip(dirs) {
+                pane.cwd = match dir {
+                    Dir::Known(cwd) => cwd,
+                    Dir::Ask(pid) => berth_core::local::cwd_of(pid),
+                };
+            }
+            tab
+        })
+        .collect();
+    Saved {
+        version: berth_core::restore::VERSION,
+        tabs,
+    }
+}

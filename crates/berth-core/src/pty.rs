@@ -46,9 +46,17 @@ pub(crate) enum PtyInput {
 #[derive(Debug, Clone)]
 pub struct Pty {
     pub(crate) input: mpsc::Sender<PtyInput>,
+    /// The shell's process id, for a local session only. A remote shell's pid
+    /// means nothing on this machine.
+    pub(crate) pid: Option<u32>,
 }
 
 impl Pty {
+    /// The local shell's process id, or `None` for a remote session.
+    pub fn local_pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     /// Send bytes as if typed. Returns false once the channel has closed.
     pub async fn write(&self, data: impl Into<Vec<u8>>) -> bool {
         self.input.send(PtyInput::Data(data.into())).await.is_ok()
@@ -153,7 +161,13 @@ pub(crate) async fn open(
         let _ = output_tx.send(PtyEvent::Closed).await;
     });
 
-    Ok((Pty { input: input_tx }, output_rx))
+    Ok((
+        Pty {
+            input: input_tx,
+            pid: None,
+        },
+        output_rx,
+    ))
 }
 
 #[cfg(test)]
@@ -163,7 +177,10 @@ mod tests {
     #[tokio::test]
     async fn a_closed_channel_reports_write_failure() {
         let (tx, rx) = mpsc::channel::<PtyInput>(1);
-        let pty = Pty { input: tx };
+        let pty = Pty {
+            input: tx,
+            pid: None,
+        };
         drop(rx);
         assert!(!pty.write("x").await);
         assert!(!pty.resize(80, 24).await);
@@ -172,7 +189,10 @@ mod tests {
     #[tokio::test]
     async fn resize_never_sends_a_zero_dimension() {
         let (tx, mut rx) = mpsc::channel::<PtyInput>(4);
-        let pty = Pty { input: tx };
+        let pty = Pty {
+            input: tx,
+            pid: None,
+        };
         assert!(pty.resize(0, 0).await);
         assert_eq!(rx.recv().await, Some(PtyInput::Resize { cols: 1, rows: 1 }));
     }
@@ -180,7 +200,10 @@ mod tests {
     #[tokio::test]
     async fn writes_arrive_in_order() {
         let (tx, mut rx) = mpsc::channel::<PtyInput>(8);
-        let pty = Pty { input: tx };
+        let pty = Pty {
+            input: tx,
+            pid: None,
+        };
         pty.write("a").await;
         pty.write("b").await;
         assert_eq!(rx.recv().await, Some(PtyInput::Data(b"a".to_vec())));

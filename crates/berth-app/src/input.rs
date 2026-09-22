@@ -38,6 +38,14 @@ pub enum Command {
     SplitDown,
     ClosePane,
     NextPane,
+    FontBigger,
+    FontSmaller,
+    /// Back to the size Berth shipped with, for when it has been nudged to
+    /// somewhere unusable and the way back is not obvious.
+    FontReset,
+    /// Quit Berth. Remote sessions keep running in tmux and local tabs are
+    /// saved on the way out (D46).
+    Quit,
 }
 
 pub fn command(keystroke: &Keystroke) -> Option<Command> {
@@ -52,6 +60,13 @@ pub fn command(keystroke: &Keystroke) -> Option<Command> {
         // every other terminal with splits.
         ("w", false) => Some(Command::ClosePane),
         ("]", _) => Some(Command::NextPane),
+        // Both spellings of bigger. Whether shift+= arrives as "=" with shift
+        // or as "+" depends on the keyboard layout, and either is the key the
+        // user pressed.
+        ("=" | "+", _) => Some(Command::FontBigger),
+        ("-", _) => Some(Command::FontSmaller),
+        ("0", false) => Some(Command::FontReset),
+        ("q", false) => Some(Command::Quit),
         _ => None,
     }
 }
@@ -477,11 +492,27 @@ mod tests {
     }
 
     #[test]
+    fn the_font_chords_are_the_usual_ones() {
+        assert_eq!(command(&cmd("=", false)), Some(Command::FontBigger));
+        assert_eq!(command(&cmd("+", true)), Some(Command::FontBigger));
+        assert_eq!(command(&cmd("-", false)), Some(Command::FontSmaller));
+        assert_eq!(command(&cmd("0", false)), Some(Command::FontReset));
+    }
+
+    /// A bare minus is a character the shell wants, not a font chord.
+    #[test]
+    fn a_font_key_without_the_platform_modifier_is_input() {
+        assert_eq!(command(&keystroke("-", Some("-"), plain())), None);
+        assert!(translate(&keystroke("-", Some("-"), plain())).is_some());
+    }
+
+    #[test]
     fn the_split_chords_are_distinct() {
         assert_eq!(command(&cmd("d", false)), Some(Command::SplitRight));
         assert_eq!(command(&cmd("d", true)), Some(Command::SplitDown));
         assert_eq!(command(&cmd("w", false)), Some(Command::ClosePane));
         assert_eq!(command(&cmd("]", false)), Some(Command::NextPane));
+        assert_eq!(command(&cmd("q", false)), Some(Command::Quit));
     }
 
     /// Every command is a Cmd chord, so nothing here can eat a key the shell

@@ -192,7 +192,11 @@ pub async fn connect(
 
 /// The palette comes from TerminalStyle, so every visual constant stays in one
 /// struct rather than half of them living in berth-term's defaults.
-fn terminal_for(cols: u16, rows: u16, palette: berth_term::terminal::Palette) -> SharedTerminal {
+pub(crate) fn terminal_for(
+    cols: u16,
+    rows: u16,
+    palette: berth_term::terminal::Palette,
+) -> SharedTerminal {
     let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
     term.set_palette(palette);
     Arc::new(Mutex::new(term))

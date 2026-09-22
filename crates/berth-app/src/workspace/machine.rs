@@ -210,15 +210,22 @@ impl Workspace {
     /// per session, so a workspace of ten panes still asks once.
     const AGENT_POLL: Duration = Duration::from_secs(5);
 
-    /// Watch one host for agents, until its connection goes.
+    /// Watch one host's sessions and the agents in them, until its
+    /// connection goes. The same scan feeds the sidebar tree and the ghost.
     pub(super) fn watch_agents(&self, alias: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             // A host without tmux fails this every five seconds forever. Say so
             // once, then stay quiet until it works again, so the reason exists
             // somewhere without the log becoming one.
             let mut reported = false;
+            // Asked at once, then every poll, so a host's detached sessions are
+            // in the tree as soon as it connects rather than five seconds later.
+            let mut first = true;
             loop {
-                cx.background_executor().timer(Self::AGENT_POLL).await;
+                if !first {
+                    cx.background_executor().timer(Self::AGENT_POLL).await;
+                }
+                first = false;
                 let Ok(Some(connection)) = this.read_with(cx, |this, _| {
                     this.conns.get(&alias).map(|c| c.connection.clone())
                 }) else {
@@ -248,12 +255,8 @@ impl Workspace {
                 };
                 reported = false;
 
-                let found: std::collections::BTreeSet<String> =
-                    berth_core::agents::parse_scan(&output)
-                        .into_iter()
-                        .filter(|r| r.is_agent())
-                        .map(|r| r.session)
-                        .collect();
+                let found =
+                    crate::sidebar::listing(&berth_core::agents::parse_scan(&output));
 
                 let updated = this.update(cx, |this, cx| {
                     // Repaint only on a change, or this is a wakeup every five
@@ -261,10 +264,11 @@ impl Workspace {
                     // Nothing recorded and nothing found is not a change,
                     // or every host logs one at startup for a picture that was
                     // always empty.
-                    let changed = presence_changed(this.agents.get(&alias), &found);
+                    let changed = presence_changed(this.running.get(&alias), &found);
                     if changed {
-                        tracing::info!(%alias, agents = found.len(), "agent presence changed");
-                        this.agents.insert(alias.clone(), found);
+                        let agents = found.values().filter(|a| **a).count();
+                        tracing::info!(%alias, sessions = found.len(), agents, "sessions changed");
+                        this.running.insert(alias.clone(), found);
                         cx.notify();
                     }
                 });
@@ -280,9 +284,11 @@ impl Workspace {
     pub(super) fn has_agent(&self, pane: &Pane) -> bool {
         !pane.is_local()
             && self
-                .agents
+                .running
                 .get(pane.alias())
-                .is_some_and(|sessions| sessions.contains(&pane.tmux_name()))
+                .and_then(|sessions| sessions.get(&pane.slug))
+                .copied()
+                .unwrap_or(false)
     }
 
     /// A first RTT sample for the status bar.

@@ -26,101 +26,64 @@ impl Workspace {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::sidebar::{HostEntry, Input, Row};
+
         let theme = self.theme;
-        let mut list = div().flex().flex_col().gap(px(2.0));
-        let showing = self.focused().map(|p| p.alias().to_string());
+        let hosts: Vec<HostEntry> = self
+            .hosts
+            .iter()
+            .map(|h| HostEntry {
+                alias: &h.alias,
+                group: h.group.as_deref(),
+            })
+            .collect();
+        let open = self.open_sessions();
+        let shell = local_label();
+        let rows = crate::sidebar::rows(&Input {
+            hosts: &hosts,
+            open: &open,
+            running: &self.running,
+            expanded: &self.expanded,
+            local_label: &shell,
+        });
 
-        // Grouped, in file order, with the heading printed when it changes.
-        // Sorting by group would reorder the file, and the order someone put
-        // their own ssh config in is information.
-        let mut heading: Option<&str> = None;
-        for (index, host) in self.hosts.iter().enumerate() {
-            if host.group.as_deref() != heading {
-                heading = host.group.as_deref();
-                if let Some(name) = heading {
-                    list = list.child(
-                        div()
-                            .px(px(10.0))
-                            .pt(px(6.0))
-                            .text_xs()
-                            .text_color(hsla(theme.text_muted))
-                            .child(name.to_string()),
-                    );
-                }
-            }
-            let status = self
-                .statuses
-                .get(&host.alias)
-                .cloned()
-                .unwrap_or(HostStatus::Connection(ConnectionState::Disconnected));
-            let needs_verify = matches!(status, HostStatus::NeedsVerify);
-            let dot = if needs_verify {
-                theme.warning.into()
-            } else {
-                hsla(theme.state_colour(status.state()))
-            };
-
-            let alias = host.alias.clone();
-            let on_screen = showing.as_deref() == Some(alias.as_str());
-
-            let mut row = div()
-                .id(("host", index))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.open(alias.clone(), cx)))
-                .hover(|row| row.bg(hsla(theme.border)))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .py(px(4.0))
-                // Never shrink: flex was collapsing this to nothing to make
-                // room for a long label, which took the state indicator away
-                // from exactly the host that most needed one.
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded(px(3.0))
-                        .bg(dot),
-                )
-                .child(div().text_color(hsla(theme.text)).child(host.alias.clone()));
-
-            // The row on screen is marked, so a sidebar of connected hosts
-            // still says which one is being looked at.
-            if on_screen {
-                row = row.bg(hsla(theme.border));
-            }
-
-            // Only the states that need explaining carry a label. Connected is
-            // the dot's job; "waiting for you" and "this one broke" are not.
-            if needs_verify || matches!(status, HostStatus::Verifying | HostStatus::Failed(_)) {
-                row = row.child(
-                    div()
-                        .text_xs()
-                        .text_color(hsla(theme.text_muted))
-                        .child(status.label()),
-                );
-            }
-
-            // Why it failed, or why it was left alone, goes on the row: for
-            // the same reason the forward note does, this is where someone is
-            // looking when they ask.
-            let note: Option<gpui::SharedString> = match &status {
-                HostStatus::Failed(reason) => Some(reason.clone().into()),
-                HostStatus::NeedsVerify => Some(strings::VERIFY_TOOLTIP.into()),
-                HostStatus::Verifying | HostStatus::Connection(_) => None,
-            };
-            if let Some(note) = note {
-                row = row.tooltip(move |_, cx| {
-                    cx.new(|_| Note {
-                        text: note.clone(),
-                        theme,
-                    })
-                    .into()
-                });
-            }
-            list = list.child(row);
+        let mut list = div().flex().flex_col().gap(px(1.0));
+        for (index, row) in rows.into_iter().enumerate() {
+            list = list.child(match row {
+                Row::Heading(name) => div()
+                    .px(px(10.0))
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .child(name)
+                    .into_any_element(),
+                Row::Folder {
+                    folder,
+                    expanded,
+                    agent,
+                } => self.folder_row(index, folder, expanded, agent, cx),
+                Row::Session {
+                    folder,
+                    name,
+                    pane,
+                    agent,
+                } => self.session_row(index, folder, name, pane, agent, cx),
+                Row::NewTerminal(folder) => div()
+                    .id(("new-terminal", index))
+                    .cursor_pointer()
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.new_terminal(folder.clone(), cx)),
+                    )
+                    .hover(|row| row.bg(hsla(theme.border)).text_color(hsla(theme.text)))
+                    .pl(px(INDENT))
+                    .pr(px(10.0))
+                    .py(px(2.0))
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .child(strings::SIDEBAR_NEW_TERMINAL)
+                    .into_any_element(),
+            });
         }
 
         let forwards = self
@@ -151,73 +114,229 @@ impl Workspace {
         }
 
         div()
+            .id("sidebar")
             .w(px(220.0))
             .h_full()
             .flex()
             .flex_col()
             .gap(px(6.0))
+            .overflow_y_scroll()
             .bg(hsla(theme.surface))
             .border_r(px(1.0))
             .border_color(hsla(theme.border))
-            .py(px(10.0))
-            // Above the hosts, because it is the one row that works before
-            // anything is configured. An app whose first screen is "add a host
-            // first" has no first ten seconds.
-            .child(
-                div()
-                    .id("local")
-                    .cursor_pointer()
-                    .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.open_local(Place::Tab { show: true }, cx)
-                        }),
-                    )
-                    .hover(|row| row.bg(hsla(theme.border)))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .py(px(4.0))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded(px(3.0))
-                            .bg(theme.host_colour(strings::LOCAL_ALIAS, false)),
-                    )
-                    .child(
-                        div()
-                            .text_color(hsla(theme.text))
-                            .child(strings::SIDEBAR_LOCAL),
-                    ),
-            )
-            .child(
-                div()
-                    .px(px(10.0))
-                    .text_xs()
-                    .text_color(hsla(theme.text_muted))
-                    .child(strings::SIDEBAR_HOSTS),
-            )
+            .py(px(6.0))
             .child(list)
             .child(self.warnings())
     }
 
+    /// A host, or this machine. Clicking a host that is not connected opens it,
+    /// as a host row always did, so trust and retry are still one click away.
+    fn folder_row(
+        &self,
+        index: usize,
+        folder: crate::sidebar::Folder,
+        expanded: bool,
+        agent: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::sidebar::Folder;
+
+        let theme = self.theme;
+        let showing = self.focused().map(|p| p.alias().to_string());
+        let (name, dot, status) = match &folder {
+            Folder::Local => (
+                strings::SIDEBAR_LOCAL.to_string(),
+                theme.host_colour(strings::LOCAL_ALIAS, false),
+                None,
+            ),
+            Folder::Host(alias) => {
+                let status = self
+                    .statuses
+                    .get(alias)
+                    .cloned()
+                    .unwrap_or(HostStatus::Connection(ConnectionState::Disconnected));
+                let dot = if matches!(status, HostStatus::NeedsVerify) {
+                    theme.warning.into()
+                } else {
+                    hsla(theme.state_colour(status.state()))
+                };
+                (alias.clone(), dot, Some(status))
+            }
+        };
+        let alias = match &folder {
+            Folder::Local => strings::LOCAL_ALIAS.to_string(),
+            Folder::Host(alias) => alias.clone(),
+        };
+        // A closed folder holding the session on screen is marked, so the tree
+        // still says where the keys are going.
+        let on_screen = !expanded && showing.as_deref() == Some(alias.as_str());
+        let no_local = self.panes.iter().all(|p| !p.is_local());
+
+        let clicked = folder.clone();
+        let mut row = div()
+            .id(("folder", index))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // An empty "This machine" has nothing to fold. A click on it
+                // means a shell, as the row always did.
+                if clicked == Folder::Local && no_local {
+                    this.expanded.insert(Folder::Local, true);
+                    this.open_local(Place::Tab { show: true }, cx);
+                } else {
+                    this.click_folder(clicked.clone(), expanded, cx);
+                }
+            }))
+            .hover(|row| row.bg(hsla(theme.border)))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .py(px(3.0))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(10.0))
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .child(if expanded {
+                        strings::FOLDER_OPEN
+                    } else {
+                        strings::FOLDER_CLOSED
+                    }),
+            )
+            // Never shrink: flex was collapsing this to nothing to make room
+            // for a long label, which took the state indicator away from
+            // exactly the host that most needed one.
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded(px(3.0))
+                    .bg(dot),
+            )
+            .child(div().text_color(hsla(theme.text)).child(name));
+
+        if on_screen {
+            row = row.bg(hsla(theme.border));
+        }
+        if agent {
+            row = row.child(ghost(("folder-agent", index), theme));
+        }
+
+        if let Some(status) = status {
+            // Only the states that need explaining carry a label. Connected is
+            // the dot's job; "waiting for you" and "this one broke" are not.
+            let needs_verify = matches!(status, HostStatus::NeedsVerify);
+            if needs_verify || matches!(status, HostStatus::Verifying | HostStatus::Failed(_)) {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(status.label()),
+                );
+            }
+            // Why it failed, or why it was left alone, goes on the row: this is
+            // where someone is looking when they ask.
+            let note: Option<gpui::SharedString> = match &status {
+                HostStatus::Failed(reason) => Some(reason.clone().into()),
+                HostStatus::NeedsVerify => Some(strings::VERIFY_TOOLTIP.into()),
+                HostStatus::Verifying | HostStatus::Connection(_) => None,
+            };
+            if let Some(note) = note {
+                row = row.tooltip(move |_, cx| {
+                    cx.new(|_| Note {
+                        text: note.clone(),
+                        theme,
+                    })
+                    .into()
+                });
+            }
+        }
+        row.into_any_element()
+    }
+
+    /// One session under its folder. Open ones are switched to, detached ones
+    /// are reattached in a tab of their own.
+    fn session_row(
+        &self,
+        index: usize,
+        folder: crate::sidebar::Folder,
+        name: String,
+        pane: Option<u64>,
+        agent: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = self.theme;
+        let focused = pane.is_some() && self.focused().map(|p| p.id) == pane;
+        let detached = pane.is_none();
+
+        let slug = name.clone();
+        let mut row = div()
+            .id(("session", index))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| match (&folder, pane) {
+                (_, Some(pane)) => this.focus_pane(pane, cx),
+                (crate::sidebar::Folder::Host(alias), None) => {
+                    this.open_session(alias.clone(), slug.clone(), cx)
+                }
+                (crate::sidebar::Folder::Local, None) => {}
+            }))
+            .hover(|row| row.bg(hsla(theme.border)))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(INDENT))
+            .pr(px(10.0))
+            .py(px(2.0))
+            // Detached is dimmer: it is running, but nothing here shows it.
+            .child(
+                div()
+                    .text_color(hsla(if detached {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    }))
+                    .child(name),
+            );
+        if focused {
+            row = row.bg(hsla(theme.border));
+        }
+        if agent {
+            row = row.child(ghost(("session-agent", index), theme));
+        }
+        if detached {
+            row = row.tooltip(move |_, cx| {
+                cx.new(|_| Note {
+                    text: strings::SESSION_DETACHED_TOOLTIP.into(),
+                    theme,
+                })
+                .into()
+            });
+        }
+        row.into_any_element()
+    }
+
     /// One tab per open session.
     ///
-    /// Each carries the host's own colour and its connection state, so a row of
-    /// tabs answers "which host" and "is it up" without being read word by
-    /// word. The close and kill actions are on the active tab only: an inactive
+    /// Each carries the host's own colour, and a state dot only while its
+    /// connection is not up, so a row of tabs answers "which host" and "is
+    /// anything wrong" without being read word by word. The close and kill actions are on the active tab only: an inactive
     /// tab is a place to go, and putting a destructive control on it invites
     /// hitting one while aiming for the other.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        // One row that scrolls sideways rather than squeezing: a tab too narrow
+        // to read its host is worse than one you scroll to.
         let mut strip = div()
+            .id("tabs")
             .flex()
+            .flex_shrink_0()
             .items_center()
-            .gap(px(2.0))
-            .h(px(30.0))
-            .px(px(6.0))
+            .gap(px(1.0))
+            .h(px(26.0))
+            .px(px(4.0))
+            .overflow_x_scroll()
             .bg(hsla(theme.surface))
             .border_b(px(1.0))
             .border_color(hsla(theme.border));
@@ -236,6 +355,7 @@ impl Workspace {
             let split_count = tab.root.panes().len();
             let local = pane.is_local();
             let agent = self.has_agent(pane);
+            let state = self.state_of(id);
             // A named session says its name; an unnamed one is just its host,
             // because `web-1/main` on every tab is noise.
             let label = if !local && pane.slug != berth_core::session::DEFAULT_SLUG {
@@ -244,16 +364,21 @@ impl Workspace {
                 pane.alias().to_string()
             };
 
+            // The cut name is still readable, on hover.
+            let full: Option<gpui::SharedString> =
+                (label.chars().count() > TAB_LABEL_CHARS).then(|| label.clone().into());
+
             let mut row = div()
                 .id(("tab", tab_id as usize))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(tab_id, cx)))
                 .flex()
+                .flex_shrink_0()
                 .items_center()
-                .gap(px(6.0))
-                .px(px(8.0))
-                .py(px(4.0))
-                .rounded(px(4.0))
+                .gap(px(5.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
                 .text_xs()
                 .hover(|t| t.bg(hsla(theme.border)))
                 // The host's colour, as a bar rather than a dot, so it is not
@@ -277,19 +402,15 @@ impl Workspace {
                                 this.ask_rename(id, cx);
                             }
                         }))
+                        // Capped, so one long session name cannot push every
+                        // other tab off the strip.
+                        .max_w(px(TAB_LABEL_MAX))
+                        .truncate()
                         .text_color(hsla(if active { theme.text } else { theme.text_muted }))
                         .child(label),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .w(px(6.0))
-                        .h(px(6.0))
-                        .rounded(px(3.0))
-                        .bg(hsla(theme.state_colour(self.state_of(id)))),
                 );
 
-            // Between the name and the state dot, because it is about what is
+            // After the name and before the state, because it is about what is
             // inside the session rather than about the connection.
             if agent {
                 row = row.child(
@@ -299,7 +420,7 @@ impl Workspace {
                         .child(
                             svg()
                                 .path(crate::icons::GHOST)
-                                .size(px(13.0))
+                                .size(px(12.0))
                                 .text_color(hsla(theme.accent)),
                         )
                         .tooltip(move |_, cx| {
@@ -322,12 +443,33 @@ impl Workspace {
                 );
             }
 
+            if let Some(full) = full {
+                row = row.tooltip(move |_, cx| {
+                    cx.new(|_| Note {
+                        text: full.clone(),
+                        theme,
+                    })
+                    .into()
+                });
+            }
+
+            if shows_state(local, state) {
+                row = row.child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(hsla(theme.state_colour(state))),
+                );
+            }
+
             if active {
                 row = row.bg(hsla(theme.background)).child(
                     div()
                         .id(("detach", tab_id as usize))
                         .cursor_pointer()
-                        .px(px(4.0))
+                        .px(px(2.0))
                         .text_color(hsla(theme.text_muted))
                         .hover(|b| b.text_color(hsla(theme.text)))
                         .on_click(cx.listener(move |this, _, _, cx| this.close(id, cx)))
@@ -356,7 +498,7 @@ impl Workspace {
                         div()
                             .id(("kill", tab_id as usize))
                             .cursor_pointer()
-                            .px(px(4.0))
+                            .px(px(2.0))
                             .text_color(hsla(theme.text_muted))
                             .hover(|b| b.text_color(hsla(theme.warning)))
                             .on_click(cx.listener(move |this, _, _, cx| this.ask_kill(id, cx)))
@@ -802,6 +944,51 @@ impl Render for Workspace {
         }
         root
     }
+}
+
+/// The widest a tab's name gets before it is cut with an ellipsis.
+const TAB_LABEL_MAX: f32 = 160.0;
+/// Roughly where that cut falls in the UI's small text, so only a name that
+/// was actually cut gets a tooltip.
+const TAB_LABEL_CHARS: usize = 22;
+
+/// How far a session sits in from its folder: past the caret and the dot.
+const INDENT: f32 = 36.0;
+
+/// What a local shell is called in the tree: the shell's own name.
+fn local_label() -> String {
+    let shell = berth_core::local::login_shell();
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&shell)
+        .trim_end_matches(".exe")
+        .to_string();
+    if name.is_empty() {
+        strings::LOCAL_ALIAS.to_string()
+    } else {
+        name
+    }
+}
+
+/// The agent ghost, with the tooltip that says presence and nothing more.
+fn ghost(id: (&'static str, usize), theme: Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .child(
+            svg()
+                .path(crate::icons::GHOST)
+                .size(px(12.0))
+                .text_color(hsla(theme.accent)),
+        )
+        .tooltip(move |_, cx| {
+            cx.new(|_| Note {
+                text: strings::AGENT_TOOLTIP.into(),
+                theme,
+            })
+            .into()
+        })
 }
 
 fn centred(child: impl IntoElement) -> gpui::Div {

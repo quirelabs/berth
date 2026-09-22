@@ -11,6 +11,8 @@
 //! |----------------------|-------------------------------------------------|
 //! | `BERTH_SSH_CONFIG`   | read hosts from this file, not `~/.ssh/config`  |
 //! | `BERTH_KNOWN_HOSTS`  | trust and record keys here, not `~/.ssh/known_hosts` |
+//! | `BERTH_SETTINGS`     | remember settings here, not in the config directory |
+//! | `BERTH_RESTORE`      | save local sessions here, not in the data directory |
 //! | `BERTH_SHELL`        | run this as the local shell                     |
 //! | `BERTH_SESSION`      | the tmux session slug, instead of the default   |
 //! | `BERTH_HOST`         | open this alias at startup                      |
@@ -35,6 +37,8 @@ use std::path::PathBuf;
 
 pub const SSH_CONFIG: &str = "BERTH_SSH_CONFIG";
 pub const KNOWN_HOSTS: &str = "BERTH_KNOWN_HOSTS";
+pub const SETTINGS: &str = "BERTH_SETTINGS";
+pub const RESTORE: &str = "BERTH_RESTORE";
 pub const SHELL: &str = "BERTH_SHELL";
 pub const SESSION: &str = "BERTH_SESSION";
 pub const HOST: &str = "BERTH_HOST";
@@ -49,6 +53,8 @@ pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 const NAMES: &[&str] = &[
     SSH_CONFIG,
     KNOWN_HOSTS,
+    SETTINGS,
+    RESTORE,
     SHELL,
     SESSION,
     HOST,
@@ -89,6 +95,18 @@ pub fn ssh_config() -> Option<PathBuf> {
 /// Trust and record keys here. A test must never write to the user's own.
 pub fn known_hosts() -> Option<PathBuf> {
     path(KNOWN_HOSTS)
+}
+
+/// Remember settings here rather than in the platform's config directory, so a
+/// test never writes into the user's own.
+pub fn settings() -> Option<PathBuf> {
+    path(SETTINGS)
+}
+
+/// Save local sessions here rather than in the platform's data directory, so a
+/// test never writes into the user's own.
+pub fn restore() -> Option<PathBuf> {
+    path(RESTORE)
 }
 
 /// The local shell to run. First choice, ahead of the platform's own answer,

@@ -21,7 +21,7 @@ use berth_core::pty::{Pty, PtyEvent};
 use berth_term::size::{CellSize, TermSize};
 use berth_term::terminal::Selection;
 use berth_term::terminal::{Rgb, Snapshot};
-use berth_term::{KeyEvent, MouseButton as TermButton, Terminal};
+use berth_term::{KeyEvent, MouseButton as TermButton, Scroll, Terminal, WheelAction};
 
 use crate::metrics::{Histogram, KeystrokeLatency, LatencyReport};
 
@@ -96,6 +96,9 @@ pub struct TerminalView {
     /// be turned into a cell. Set during paint because only the element knows
     /// the laid-out bounds.
     geometry: Option<(Point<Pixels>, CellSize)>,
+    /// Wheel movement too small to be a line yet. A trackpad reports pixels,
+    /// so without carrying the remainder a slow drag scrolls nothing at all.
+    scroll_px: f32,
 }
 
 impl TerminalView {
@@ -122,6 +125,7 @@ impl TerminalView {
             selection: None,
             drag_anchor: None,
             geometry: None,
+            scroll_px: 0.0,
         }
     }
 
@@ -145,6 +149,27 @@ impl TerminalView {
         // The remote is a fresh tmux client that has not been told the size,
         // so forget what the last one was told and let the next paint resize.
         self.last_sent_size = None;
+    }
+
+    /// The live screen as bytes that redraw it, and the grid's size, for
+    /// saving a local session (D46).
+    pub fn saved_screen(&self) -> Option<(String, TermSize)> {
+        let term = self.terminal.lock().ok()?;
+        Some((term.screen_ansi(), term.size()))
+    }
+
+    /// Start a restored session's new shell in place of its old prompt.
+    ///
+    /// The saved cursor sits on the line the old shell was waiting on, which
+    /// is its prompt. That line is cleared and the new prompt is drawn there,
+    /// so the screen reads as if the shell never went away. Everything above it
+    /// stays as it was saved.
+    pub fn resume(&mut self, pty: Pty) {
+        if let Ok(mut term) = self.terminal.lock() {
+            term.advance(b"\x1b[0m\r\x1b[2K");
+        }
+        self.dirty = true;
+        self.swap_pty(pty);
     }
 
     /// The pty this view is currently writing to.
@@ -183,12 +208,12 @@ impl TerminalView {
         let Some(bytes) = berth_term::encode(event, mode) else {
             return;
         };
-        let Some(pty) = self.pty.clone() else { return };
+        // Typing goes to the live grid, so it is never typed into a screen the
+        // user cannot see.
+        self.scroll_to_bottom();
         // Timed from here so keystroke latency measures the whole journey.
         self.pending_keystroke = Some(Instant::now());
-        crate::runtime::handle().spawn(async move {
-            pty.write(bytes).await;
-        });
+        self.write(bytes);
     }
 
     /// Tell the remote the grid changed size. Only sent when it actually
@@ -206,6 +231,15 @@ impl TerminalView {
 
     pub fn style(&self) -> &TerminalStyle {
         &self.style
+    }
+
+    /// Change the text size.
+    ///
+    /// Nothing else is needed: the cell size is measured from the font during
+    /// prepaint, so the grid reshapes itself on the next frame and the remote
+    /// is told through the resize that paint already sends.
+    pub fn set_font_size(&mut self, size: f32) {
+        self.style.font_size = size;
     }
 
     /// Which cell a window position falls on, clamped to the grid.
@@ -263,8 +297,103 @@ impl TerminalView {
     }
 
     fn send_mouse(&self, button: TermButton, column: u16, line: u16, pressed: bool) {
+        self.write(berth_term::mouse_sgr(button, column, line, pressed));
+    }
+
+    /// Move the view through the scrollback.
+    ///
+    /// A selection is dropped when the view actually moves, because its
+    /// coordinates are rows of the viewport rather than of the history: left
+    /// alone it would stay painted over whatever scrolled into those rows, and
+    /// copy it too.
+    pub fn scroll(&mut self, scroll: Scroll) {
+        let Ok(mut term) = self.terminal.lock() else {
+            return;
+        };
+        let before = term.display_offset();
+        term.scroll(scroll);
+        if term.display_offset() != before {
+            drop(term);
+            self.selection = None;
+            self.drag_anchor = None;
+        }
+    }
+
+    /// Put the view back on the live grid.
+    ///
+    /// Called when a key is sent, because typing into a shell you cannot see
+    /// is the one thing worse than not being able to scroll at all. Every
+    /// terminal does this and nobody notices it until it is missing.
+    fn scroll_to_bottom(&mut self) {
+        self.scroll(Scroll::Bottom);
+    }
+
+    /// A wheel notch, which is not always ours: see [`WheelAction`].
+    fn on_scroll_wheel(&mut self, event: &gpui::ScrollWheelEvent) {
+        let Some((_, cell)) = self.geometry else {
+            return;
+        };
+        let lines = self.wheel_lines(event, cell.height);
+        if lines == 0 {
+            return;
+        }
+
+        let decision = self.terminal.lock().ok().map(|term| {
+            (
+                term.wheel_action(event.modifiers.shift),
+                term.application_cursor(),
+            )
+        });
+        let Some((action, application_cursor)) = decision else {
+            return;
+        };
+
+        match action {
+            WheelAction::View => self.scroll(Scroll::Lines(lines)),
+            WheelAction::Arrows => {
+                let mode = berth_term::TermMode { application_cursor };
+                self.write(berth_term::alt_scroll(lines, mode));
+            }
+            WheelAction::Report => {
+                let Some((line, column)) = self.cell_at(event.position) else {
+                    return;
+                };
+                let button = if lines > 0 {
+                    TermButton::ScrollUp
+                } else {
+                    TermButton::ScrollDown
+                };
+                // One report per line, as xterm does. A program counting
+                // notches would otherwise see a fast flick as a single one.
+                for _ in 0..lines.unsigned_abs() {
+                    self.send_mouse(button, column, line, true);
+                }
+            }
+        }
+    }
+
+    /// How many whole lines a wheel event is worth.
+    fn wheel_lines(&mut self, event: &gpui::ScrollWheelEvent, line_height: f32) -> i32 {
+        match event.touch_phase {
+            // A new gesture starts from nothing, so a flick left over from the
+            // last one cannot leak into this one.
+            gpui::TouchPhase::Started => {
+                self.scroll_px = 0.0;
+                0
+            }
+            gpui::TouchPhase::Moved => whole_lines(
+                f32::from(event.delta.pixel_delta(px(line_height)).y),
+                line_height,
+                &mut self.scroll_px,
+            ),
+            // Neither an end nor a cancel commits anything of its own.
+            _ => 0,
+        }
+    }
+
+    /// Send bytes to the remote, if there is one.
+    fn write(&self, bytes: Vec<u8>) {
         let Some(pty) = self.pty.clone() else { return };
-        let bytes = berth_term::mouse_sgr(button, column, line, pressed);
         crate::runtime::handle().spawn(async move {
             pty.write(bytes).await;
         });
@@ -284,11 +413,7 @@ impl TerminalView {
             .lock()
             .map(|t| t.bracketed_paste())
             .unwrap_or(false);
-        let Some(pty) = self.pty.clone() else { return };
-        let bytes = berth_term::paste_bytes(text, bracketed);
-        crate::runtime::handle().spawn(async move {
-            pty.write(bytes).await;
-        });
+        self.write(berth_term::paste_bytes(text, bracketed));
     }
 }
 
@@ -326,12 +451,28 @@ impl gpui::Render for TerminalView {
                                 this.paste(&text);
                             }
                         }
-                        None => {
-                            if let Some(key_event) = crate::input::translate(&event.keystroke) {
-                                this.send_key(key_event, cx);
+                        None => match crate::input::scroll_action(&event.keystroke) {
+                            Some(crate::input::ScrollKey::PageUp) => {
+                                this.scroll(Scroll::PageUp);
+                                cx.notify();
                             }
-                        }
+                            Some(crate::input::ScrollKey::PageDown) => {
+                                this.scroll(Scroll::PageDown);
+                                cx.notify();
+                            }
+                            None => {
+                                if let Some(key_event) = crate::input::translate(&event.keystroke) {
+                                    this.send_key(key_event, cx);
+                                }
+                            }
+                        },
                     }
+                }),
+            )
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    this.on_scroll_wheel(event);
+                    cx.notify();
                 }),
             )
             .on_mouse_down(
@@ -651,6 +792,24 @@ impl IntoElement for TerminalElement {
     }
 }
 
+/// How many whole lines a pixel delta is worth, carrying the remainder.
+///
+/// Pulled out of the view so it can be tested: this is the arithmetic that
+/// decides whether a trackpad feels right, and it has two ways to be wrong
+/// that a compile never catches. Truncating each event on its own means a slow
+/// drag of sub-line deltas scrolls nothing at all, forever. Carrying without
+/// subtracting what was already spent means one flick scrolls twice.
+///
+/// Positive is back into the history, matching the direction a wheel is pushed.
+fn whole_lines(delta_y: f32, line_height: f32, carried: &mut f32) -> i32 {
+    if line_height <= 0.0 || !delta_y.is_finite() {
+        return 0;
+    }
+    let before = (*carried / line_height) as i32;
+    *carried += delta_y;
+    (*carried / line_height) as i32 - before
+}
+
 /// Whether a selection covers a cell. Mirrors the rule in berth-term, which
 /// owns the text extraction; this is the painting half of the same shape.
 fn selection_covers(selection: Selection, line: u16, column: u16) -> bool {
@@ -723,6 +882,59 @@ fn batch_runs(snapshot: &Snapshot) -> Vec<CellRun> {
 
 #[cfg(test)]
 mod tests {
+    use super::whole_lines;
+
+    const LINE: f32 = 16.0;
+
+    #[test]
+    fn a_full_line_of_wheel_is_one_line() {
+        let mut carried = 0.0;
+        assert_eq!(whole_lines(LINE, LINE, &mut carried), 1);
+        assert_eq!(whole_lines(-LINE, LINE, &mut carried), -1);
+    }
+
+    /// The trackpad case. Four sub-line nudges are a line between them, and
+    /// truncating each on its own would scroll nothing at all.
+    #[test]
+    fn small_deltas_accumulate_into_a_line() {
+        let mut carried = 0.0;
+        let quarter = LINE / 4.0;
+        assert_eq!(whole_lines(quarter, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(quarter, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(quarter, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(quarter, LINE, &mut carried), 1);
+    }
+
+    /// The other way to get this wrong: carrying without subtracting what was
+    /// already spent, so one flick scrolls twice.
+    #[test]
+    fn a_line_already_spent_is_not_spent_again() {
+        let mut carried = 0.0;
+        assert_eq!(whole_lines(LINE, LINE, &mut carried), 1);
+        assert_eq!(whole_lines(0.0, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(LINE / 2.0, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(LINE / 2.0, LINE, &mut carried), 1);
+    }
+
+    #[test]
+    fn a_reversal_cancels_what_was_carried() {
+        let mut carried = 0.0;
+        assert_eq!(whole_lines(LINE * 2.0, LINE, &mut carried), 2);
+        assert_eq!(whole_lines(-LINE * 2.0, LINE, &mut carried), -2);
+        assert_eq!(carried, 0.0);
+    }
+
+    /// Geometry before the first paint, and anything a platform hands over
+    /// that is not a number. Neither is allowed to become a scroll.
+    #[test]
+    fn a_nonsense_delta_scrolls_nothing() {
+        let mut carried = 0.0;
+        assert_eq!(whole_lines(LINE, 0.0, &mut carried), 0);
+        assert_eq!(whole_lines(f32::NAN, LINE, &mut carried), 0);
+        assert_eq!(whole_lines(f32::INFINITY, LINE, &mut carried), 0);
+        assert_eq!(carried, 0.0);
+    }
+
     /// The check the benchmark header leans on: a proportional face is the one
     /// failure mode that makes every cell measurement meaningless.
     #[test]

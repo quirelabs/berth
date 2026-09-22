@@ -9,8 +9,13 @@ pub const FIRST_RUN_BODY: &str =
 pub const FIRST_RUN_PATH_LABEL: &str = "Looking for";
 pub const FIRST_RUN_PATH_MISSING: &str = "not found";
 
-pub const SIDEBAR_HOSTS: &str = "Hosts";
 pub const SIDEBAR_LOCAL: &str = "This machine";
+pub const SIDEBAR_NEW_TERMINAL: &str = "+ New terminal";
+pub const FOLDER_OPEN: &str = "\u{25be}";
+pub const FOLDER_CLOSED: &str = "\u{25b8}";
+/// Detach is not kill (D32): this is the row that proves it.
+pub const SESSION_DETACHED_TOOLTIP: &str =
+    "Detached. Still running on the server. Click to reattach in a new tab.";
 
 /// What a local session is called everywhere a host would be named. Not a host
 /// alias: a config with an entry called `local` must not collide with it.

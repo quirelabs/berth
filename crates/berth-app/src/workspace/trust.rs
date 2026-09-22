@@ -35,7 +35,7 @@ impl Workspace {
                         if let Some(host) = this.hosts.iter().find(|h| h.alias == alias).cloned() {
                             this.statuses
                                 .insert(alias, HostStatus::Connection(ConnectionState::Connecting));
-                            this.connect(host, true, cx);
+                            this.connect(host, None, true, cx);
                         }
                     }
                     // Never offered as a question. There is nothing here a user
@@ -108,7 +108,7 @@ impl Workspace {
                     prompt.alias,
                     HostStatus::Connection(ConnectionState::Connecting),
                 );
-                self.connect(host, true, cx);
+                self.connect(host, None, true, cx);
             }
             Err(error) => {
                 // Nothing was written, so the host stays a question. Connecting

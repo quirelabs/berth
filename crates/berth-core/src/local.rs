@@ -4,9 +4,10 @@
 //! recording never learn where the bytes came from, so a local session is a
 //! second constructor rather than a second architecture (D36).
 //!
-//! Local sessions are deliberately plain. No tmux, no persistence across
-//! quitting Berth, and no reconnect machine, because there is nothing to
-//! reconnect to. Every other terminal behaves this way.
+//! Local sessions are deliberately plain. No tmux, no reconnect machine, and
+//! the shell ends when Berth quits (D36). What survives a quit is the layout,
+//! the directory and the last screen, which Berth saves itself (D46); a new
+//! shell starts there when asked.
 //!
 //! `portable-pty` does the platform work. It is blocking, so the two ends are
 //! bridged to the async world by threads rather than by pretending otherwise.
@@ -47,7 +48,65 @@ pub fn login_shell() -> String {
 ///
 /// Returns the same pair as the ssh path, so everything above it is unchanged.
 pub async fn open(cols: u16, rows: u16) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
-    open_with(&login_shell(), true, cols, rows).await
+    open_with(&login_shell(), true, None, cols, rows).await
+}
+
+/// Open a shell on this machine in a given directory.
+///
+/// A directory that has gone since it was saved falls back to home rather than
+/// failing: the user asked for a shell, and a shell in the wrong place is
+/// better than none.
+pub async fn open_in(
+    cwd: &std::path::Path,
+    cols: u16,
+    rows: u16,
+) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
+    let cwd = cwd.is_dir().then_some(cwd);
+    open_with(&login_shell(), true, cwd, cols, rows).await
+}
+
+/// The working directory of a local process, where the platform will say.
+///
+/// Linux answers through `/proc`. macOS has no file for it, and the call that
+/// does answer needs `libc`, so this asks `lsof`, which ships with every macOS
+/// and reads the same kernel record. Windows keeps another process's directory
+/// in its memory, out of reach without reading it, so there it is `None` and a
+/// restored shell starts at home.
+///
+/// Blocking: `lsof` is a process. Call it off the UI thread.
+pub fn cwd_of(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        parse_lsof_cwd(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The path out of `lsof -Fn` output: the line that starts with `n`.
+///
+/// Anything else, or nothing, is `None`. The format is not ours, and a wrong
+/// directory is worse than home.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_lsof_cwd(output: &str) -> Option<std::path::PathBuf> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .filter(|path| path.starts_with('/'))
+        .map(std::path::PathBuf::from)
 }
 
 /// Open a named shell, optionally as a login shell.
@@ -59,6 +118,7 @@ pub async fn open(cols: u16, rows: u16) -> Result<(Pty, mpsc::Receiver<PtyEvent>
 async fn open_with(
     shell: &str,
     login: bool,
+    cwd: Option<&std::path::Path>,
     cols: u16,
     rows: u16,
 ) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
@@ -87,14 +147,20 @@ async fn open_with(
     // The parser is a real terminal, so say so. Without this, programs fall
     // back to line mode or refuse to run.
     command.env("TERM", TERM);
-    if let Some(home) = dirs::home_dir() {
-        command.cwd(home);
+    match cwd {
+        Some(cwd) => command.cwd(cwd),
+        None => {
+            if let Some(home) = dirs::home_dir() {
+                command.cwd(home);
+            }
+        }
     }
 
     let mut child = pair
         .slave
         .spawn_command(command)
         .map_err(|e| Error::Pty(format!("could not start {shell}: {e}")))?;
+    let pid = child.process_id();
 
     // The slave must go now. Holding it keeps the write end open, so when the
     // shell exits the master never reaches EOF, the reader blocks forever and
@@ -168,7 +234,13 @@ async fn open_with(
         drop(master);
     });
 
-    Ok((Pty { input: input_tx }, output_rx))
+    Ok((
+        Pty {
+            input: input_tx,
+            pid,
+        },
+        output_rx,
+    ))
 }
 
 #[cfg(test)]
@@ -215,7 +287,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_local_shell_echoes_what_it_is_told() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
             .await
             .expect("a local shell should open");
         assert!(pty.write("echo berth-local-ok\n").await);
@@ -229,7 +301,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_exiting_shell_reports_closed() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
             .await
             .expect("a local shell should open");
         assert!(pty.write("exit\n").await);
@@ -254,7 +326,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn resizing_reaches_the_shell() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
             .await
             .expect("a local shell should open");
 
@@ -269,5 +341,57 @@ mod tests {
         let after = read_until(&mut events, "40 120").await;
         assert!(after.contains("40 120"), "got {after:?}");
         pty.close().await;
+    }
+
+    /// A shell started in a directory is found there, which is the round trip
+    /// saving and restoring depends on. The directory is canonicalised because
+    /// macOS reports `/tmp` as `/private/tmp`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_shells_directory_can_be_read_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (pty, mut events) = open_with(TEST_SHELL, false, Some(dir.path()), 80, 24)
+            .await
+            .expect("a local shell should open");
+        // Once it answers, it is running and sitting in its directory.
+        assert!(pty.write("echo ready\n").await);
+        read_until(&mut events, "ready").await;
+
+        let pid = pty.local_pid().expect("a local shell has a pid");
+        let found = tokio::task::spawn_blocking(move || cwd_of(pid))
+            .await
+            .expect("the lookup ran")
+            .expect("the directory is readable");
+        assert_eq!(found.canonicalize().ok(), dir.path().canonicalize().ok());
+
+        // And it follows a cd, since that is the directory worth saving.
+        let sub = dir.path().join("inner");
+        std::fs::create_dir(&sub).expect("a subdirectory");
+        assert!(pty.write("cd inner && echo moved\n").await);
+        read_until(&mut events, "moved").await;
+        let found = tokio::task::spawn_blocking(move || cwd_of(pid))
+            .await
+            .expect("the lookup ran")
+            .expect("the directory is readable");
+        assert_eq!(found.canonicalize().ok(), sub.canonicalize().ok());
+        pty.close().await;
+    }
+
+    #[test]
+    fn lsof_output_gives_the_path() {
+        let output = "p123\nfcwd\nn/Users/someone/work dir\n";
+        assert_eq!(
+            parse_lsof_cwd(output),
+            Some(std::path::PathBuf::from("/Users/someone/work dir"))
+        );
+    }
+
+    /// No answer, or one that is not a path, is no directory rather than a
+    /// guess.
+    #[test]
+    fn odd_lsof_output_gives_nothing() {
+        for output in ["", "p123\nfcwd\n", "nrelative/path\n", "garbage"] {
+            assert_eq!(parse_lsof_cwd(output), None, "{output:?}");
+        }
     }
 }
