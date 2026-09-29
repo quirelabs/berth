@@ -116,12 +116,27 @@ fn parse_lsof_cwd(output: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// A shell here is a new top-level context, even when Berth itself was started
+/// from inside a Claude session (D48).
+fn scrub_session_markers(command: &mut CommandBuilder) {
+    for marker in crate::claude::SESSION_MARKERS {
+        command.env_remove(marker);
+    }
+}
+
 /// How a shell is told to put the shim back in front after its own startup.
 enum Wrapper {
     /// A `ZDOTDIR` whose files load the user's and then reorder PATH.
     Zsh(std::path::PathBuf),
     /// An `--init-file` that does a login shell's work and then reorders PATH.
     Bash(std::path::PathBuf),
+}
+
+/// Whether the login shell will resume a conversation by itself, from its
+/// startup wrapper, when started with `pane`. Where it will not, the caller
+/// types the resume line instead (D48).
+pub fn resumes_itself(pane: &crate::claude::PaneEnv) -> bool {
+    startup_wrapper(&login_shell(), pane).is_some()
 }
 
 /// The wrapper for this shell, if Berth has one and its files are in place.
@@ -207,7 +222,15 @@ pub async fn open_with(
         && let Some(shim) = &pane.shim_dir
     {
         command.env(crate::env::SHIM_DIR, shim);
+        if let Some(session) = pane
+            .resume
+            .as_deref()
+            .filter(|s| crate::claude::is_session_id(s))
+        {
+            command.env(crate::env::RESUME, session);
+        }
     }
+    scrub_session_markers(&mut command);
     // The parser is a real terminal, so say so. Without this, programs fall
     // back to line mode or refuse to run.
     command.env("TERM", TERM);
@@ -468,5 +491,19 @@ mod tests {
         for output in ["", "p123\nfcwd\n", "nrelative/path\n", "garbage"] {
             assert_eq!(parse_lsof_cwd(output), None, "{output:?}");
         }
+    }
+
+    /// Claude's session markers never reach a local shell; its settings do.
+    /// Checked on the builder, so the test sets no environment of its own.
+    #[test]
+    fn claude_session_markers_are_not_passed_on() {
+        let mut command = CommandBuilder::new("sh");
+        command.env("CLAUDE_CODE_CHILD_SESSION", "1");
+        command.env("CLAUDECODE", "1");
+        command.env("CLAUDE_CODE_USE_BEDROCK", "1");
+        scrub_session_markers(&mut command);
+        assert_eq!(command.get_env("CLAUDE_CODE_CHILD_SESSION"), None);
+        assert_eq!(command.get_env("CLAUDECODE"), None);
+        assert!(command.get_env("CLAUDE_CODE_USE_BEDROCK").is_some());
     }
 }

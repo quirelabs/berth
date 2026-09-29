@@ -17,3 +17,15 @@ if [ -n "$BERTH_SHIM_DIR" ]; then
 	PATH="$BERTH_SHIM_DIR:$PATH"
 	export PATH
 fi
+
+# A restored tab resumes its Claude conversation here, before the first prompt,
+# so nothing is typed or echoed (D48). Checked again as a strict UUID and
+# passed as one quoted argument, never read as a command.
+if [ -n "$BERTH_RESUME" ]; then
+	__berth_resume=$BERTH_RESUME
+	unset BERTH_RESUME
+	if [[ "$__berth_resume" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+		claude --resume "$__berth_resume"
+	fi
+	unset __berth_resume
+fi

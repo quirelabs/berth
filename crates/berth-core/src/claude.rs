@@ -96,6 +96,13 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
+/// The line typed into a restored pane's shell to resume a conversation, or
+/// `None` for an id that is not a strict UUID. Nothing else is ever typed: the
+/// directory is the shell's own.
+pub fn resume_line(session: &str) -> Option<String> {
+    is_session_id(session).then(|| format!("claude --resume {session}"))
+}
+
 /// What Berth puts in a pane's environment so the hook can find its way back
 /// (D48): the token, and the shim directory for the front of PATH. The pane's
 /// terminal device is added by whoever opens the pty, since only it knows.
@@ -115,6 +122,9 @@ pub struct PaneEnv {
     /// Whether the user had set `ZDOTDIR` themselves, so it is put back rather
     /// than left set to home.
     pub user_zdotdir_was_set: bool,
+    /// A conversation for the shell's startup wrapper to resume before its
+    /// first prompt. Only ever a strict UUID; see [`PaneEnv::resuming`].
+    pub resume: Option<String>,
 }
 
 impl PaneEnv {
@@ -128,7 +138,15 @@ impl PaneEnv {
             shell_dir: base.map(|b| b.join("shell")),
             user_zdotdir_was_set: user.is_some(),
             user_zdotdir: user.map(PathBuf::from).or_else(dirs::home_dir),
+            resume: None,
         }
+    }
+
+    /// Ask the shell to resume this conversation as it starts. Ignored unless
+    /// `session` is a strict UUID.
+    pub fn resuming(mut self, session: &str) -> Self {
+        self.resume = is_session_id(session).then(|| session.to_ascii_lowercase());
+        self
     }
 
     /// `PATH` with the shim directory first, from the PATH Berth itself was
@@ -144,6 +162,26 @@ impl PaneEnv {
         std::env::join_paths(dirs).ok()
     }
 }
+
+/// Variables a running Claude Code session sets for the processes it starts,
+/// which a Berth started from inside one would otherwise pass to every shell.
+/// A `claude` seeing them believes it is a sub-session: it turns transcript
+/// saving off, which makes resume impossible, and the shells could reach the
+/// parent session's messaging socket.
+///
+/// Markers only. Settings a person sets on purpose, such as
+/// `CLAUDE_CODE_USE_BEDROCK`, are never touched. Seen in Claude Code 2.1.280.
+pub const SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+];
 
 /// Which hook fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,5 +732,27 @@ mod tests {
             ..pane
         };
         assert_eq!(without.path_with_shim(Some("/usr/bin".into())), None);
+    }
+
+    #[test]
+    fn only_a_strict_uuid_becomes_a_resume_line() {
+        assert_eq!(
+            resume_line(ID).as_deref(),
+            Some("claude --resume 48efac83-05d7-447d-b460-e5bbe01e0c7e")
+        );
+        for bad in [
+            "",
+            "x; rm -rf ~",
+            "48efac83-05d7-447d-b460-e5bbe01e0c7e; ls",
+            "$(id)",
+        ] {
+            assert_eq!(resume_line(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_strict_uuid_is_handed_to_the_shell_to_resume() {
+        assert_eq!(PaneEnv::new(None).resuming(ID).resume.as_deref(), Some(ID));
+        assert_eq!(PaneEnv::new(None).resuming("x; rm -rf ~").resume, None);
     }
 }

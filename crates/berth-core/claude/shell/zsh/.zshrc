@@ -17,4 +17,12 @@ if [[ ! -o login ]]; then
 	[[ -n "$BERTH_SHIM_DIR" ]] && path=("$BERTH_SHIM_DIR" ${path:#$BERTH_SHIM_DIR})
 	if [[ -n "$BERTH_ZDOTDIR_WAS_SET" ]]; then ZDOTDIR=$BERTH_USER_ZDOTDIR; else unset ZDOTDIR; fi
 	unset BERTH_USER_ZDOTDIR BERTH_ZDOTDIR_WAS_SET
+	if [[ -n "$BERTH_RESUME" ]]; then
+		__berth_resume=$BERTH_RESUME
+		unset BERTH_RESUME
+		if [[ "$__berth_resume" =~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' ]]; then
+			claude --resume "$__berth_resume"
+		fi
+		unset __berth_resume
+	fi
 fi

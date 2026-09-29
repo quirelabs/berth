@@ -85,6 +85,29 @@ pub struct SavedPane {
     pub rows: u16,
     /// Escape sequences that redraw the last screen.
     pub screen: String,
+    /// The Claude conversation running in this pane when it was saved, so the
+    /// tab can resume it (D48). Absent in files from before D48.
+    #[serde(default)]
+    pub claude: Option<SavedClaude>,
+}
+
+/// A Claude conversation to resume: its id and the directory it is scoped to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedClaude {
+    /// A strict UUID; anything else is dropped on load.
+    pub session: String,
+    /// Absolute, and already resolved (`/private/tmp`, not `/tmp`).
+    pub dir: PathBuf,
+}
+
+impl SavedClaude {
+    /// Whether this can be handed to `claude --resume` without doubt. The id
+    /// is typed into a shell, so only the exact UUID shape is let through.
+    fn is_sound(&self) -> bool {
+        crate::claude::is_session_id(&self.session)
+            && self.dir.is_absolute()
+            && self.dir.as_os_str().len() <= 1024
+    }
 }
 
 impl SavedTab {
@@ -139,6 +162,13 @@ impl Saved {
         }
         saved.tabs.retain(SavedTab::is_sound);
         saved.tabs.truncate(MAX_TABS);
+        // A conversation that does not check out costs its pane the resume,
+        // not the pane itself.
+        for pane in saved.tabs.iter_mut().flat_map(|t| t.panes.iter_mut()) {
+            if pane.claude.as_ref().is_some_and(|c| !c.is_sound()) {
+                pane.claude = None;
+            }
+        }
         saved
     }
 
@@ -186,6 +216,7 @@ mod tests {
             cols: 80,
             rows: 24,
             screen: "\x1b[0m\x1b[H\x1b[2J\x1b[1;1H$ ls\r\n\"quoted\" \\ back".into(),
+            claude: None,
         }
     }
 
@@ -303,5 +334,63 @@ mod tests {
             .map(|e| e.expect("entry").file_name())
             .collect();
         assert_eq!(names, ["local-sessions.toml"]);
+    }
+
+    #[test]
+    fn a_claude_conversation_survives_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        let mut tab = split_tab();
+        tab.panes[1].claude = Some(SavedClaude {
+            session: "48efac83-05d7-447d-b460-e5bbe01e0c7e".into(),
+            dir: PathBuf::from("/private/tmp/work"),
+        });
+        let saved = Saved {
+            version: VERSION,
+            tabs: vec![tab],
+        };
+        saved.save_to(&path);
+        assert_eq!(Saved::load_from(&path), saved);
+    }
+
+    /// A file written before D48 has no `claude` on any pane and still loads.
+    #[test]
+    fn a_file_from_before_d48_still_loads() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[[tabs]]\nposition = 0\nfocus = 0\n[tabs.layout]\nPane = 0\n\
+             [[tabs.panes]]\ncwd = \"/a\"\ncols = 80\nrows = 24\nscreen = \"\"\n",
+        )
+        .expect("written");
+        let loaded = Saved::load_from(&path);
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].panes[0].claude, None);
+    }
+
+    /// An id that is not a strict UUID would be typed into a shell. It is
+    /// dropped, and the pane is kept.
+    #[test]
+    fn a_doubtful_conversation_is_dropped_but_its_pane_kept() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        let mut tab = split_tab();
+        tab.panes[0].claude = Some(SavedClaude {
+            session: "x; rm -rf ~".into(),
+            dir: PathBuf::from("/a"),
+        });
+        tab.panes[1].claude = Some(SavedClaude {
+            session: "48efac83-05d7-447d-b460-e5bbe01e0c7e".into(),
+            dir: PathBuf::from("relative"),
+        });
+        Saved {
+            version: VERSION,
+            tabs: vec![tab],
+        }
+        .save_to(&path);
+        let loaded = Saved::load_from(&path);
+        assert_eq!(loaded.tabs.len(), 1);
+        assert!(loaded.tabs[0].panes.iter().all(|p| p.claude.is_none()));
     }
 }

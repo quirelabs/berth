@@ -34,7 +34,9 @@
 //! directories a `claude` call has already passed through, so shims never loop
 //! or add the plugin twice. `BERTH_SHIM_DIR`, `BERTH_USER_ZDOTDIR` and
 //! `BERTH_ZDOTDIR_WAS_SET` are read by Berth's shell startup wrappers, to load
-//! the user's own files and then put the shim back in front.
+//! the user's own files and then put the shim back in front, and
+//! `BERTH_RESUME` tells a wrapper which Claude conversation to resume before
+//! the first prompt.
 //!
 //! Berth also reads variables it does not own: `SHELL` and `ComSpec` for the
 //! local shell, `USER` and `USERNAME` when ssh config names no user. Those stay
@@ -57,6 +59,7 @@ pub const CLAUDE_SHIM: &str = "BERTH_CLAUDE_SHIM";
 pub const SHIM_DIR: &str = "BERTH_SHIM_DIR";
 pub const USER_ZDOTDIR: &str = "BERTH_USER_ZDOTDIR";
 pub const ZDOTDIR_WAS_SET: &str = "BERTH_ZDOTDIR_WAS_SET";
+pub const RESUME: &str = "BERTH_RESUME";
 pub const SHELL: &str = "BERTH_SHELL";
 pub const SESSION: &str = "BERTH_SESSION";
 pub const HOST: &str = "BERTH_HOST";
@@ -81,6 +84,7 @@ const NAMES: &[&str] = &[
     SHIM_DIR,
     USER_ZDOTDIR,
     ZDOTDIR_WAS_SET,
+    RESUME,
     SHELL,
     SESSION,
     HOST,

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use berth_core::restore::{Saved, SavedPane, SavedTab};
+use berth_core::restore::{Saved, SavedClaude, SavedPane, SavedTab};
 
 use super::*;
 
@@ -22,6 +22,8 @@ pub(super) struct Restored {
     /// Where the new shell starts. `None` where the platform would not say,
     /// and then it starts at home.
     pub cwd: Option<PathBuf>,
+    /// The Claude conversation to resume in it, if one was running (D48).
+    pub claude: Option<SavedClaude>,
 }
 
 /// Where a pane's directory comes from when saving: already known, or to be
@@ -120,7 +122,10 @@ impl Workspace {
             slug: strings::LOCAL_ALIAS.to_string(),
             view,
             claude: None,
-            restored: Some(Restored { cwd: saved.cwd }),
+            restored: Some(Restored {
+                cwd: saved.cwd,
+                claude: saved.claude,
+            }),
         });
         id
     }
@@ -135,7 +140,25 @@ impl Workspace {
         };
         let view = pane.view.clone();
         let size = view.read(cx).grid_size();
-        let pane_env = self.pane_env();
+        // Claude's own directory first, since that is where its conversation
+        // is found; the shell's saved one otherwise.
+        let dir = restored
+            .claude
+            .as_ref()
+            .map(|c| c.dir.clone())
+            .filter(|d| d.is_dir())
+            .or(restored.cwd.clone());
+        let mut pane_env = self.pane_env();
+        // zsh and bash resume it themselves from Berth's startup wrapper,
+        // before their first prompt; anything else gets it typed.
+        let mut type_it = None;
+        if let Some(claude) = &restored.claude {
+            if berth_core::local::resumes_itself(&pane_env) {
+                pane_env = pane_env.resuming(&claude.session);
+            } else {
+                type_it = Some(claude.session.clone());
+            }
+        }
         if let Some(pane) = self.pane_mut(id) {
             pane.claude = Some(super::ClaudePane::new(pane_env.token.clone()));
         }
@@ -144,7 +167,7 @@ impl Workspace {
 
         cx.spawn(async move |this, cx| {
             let opened = runtime::spawn(async move {
-                match &restored.cwd {
+                match &dir {
                     Some(cwd) => {
                         berth_core::local::open_in(cwd, size.cols, size.rows, Some(&pane_env)).await
                     }
@@ -157,6 +180,9 @@ impl Workspace {
 
             let _ = this.update(cx, |this, cx| match opened {
                 Ok((pty, events)) => {
+                    if let Some(session) = &type_it {
+                        resume_claude(&pty, session);
+                    }
                     view.update(cx, |view, cx| {
                         view.resume(pty);
                         session::start_pump(&cx.entity(), events, cx);
@@ -208,6 +234,11 @@ impl Workspace {
                     cols: size.cols,
                     rows: size.rows,
                     screen,
+                    claude: match &pane.restored {
+                        // Not woken yet: still the conversation it was saved with.
+                        Some(restored) => restored.claude.clone(),
+                        None => pane.claude.as_ref().and_then(|c| conversation(&c.tracker)),
+                    },
                 });
             }
             if saved.len() != order.len() {
@@ -256,6 +287,41 @@ impl Workspace {
     }
 }
 
+/// Type `claude --resume <id>` into a freshly started shell (D48), for a shell
+/// Berth has no startup wrapper for; zsh and bash resume it themselves.
+///
+/// Through the shell rather than as its own process, because only the user's
+/// shell has their PATH and environment: a Berth opened from the Dock does not
+/// know where `claude` lives, and Claude's own tools would run without the
+/// user's setup. The id is the only thing typed, and nothing but a strict UUID
+/// ever is; the directory is the shell's own, never typed.
+fn resume_claude(pty: &berth_core::pty::Pty, session: &str) {
+    let Some(line) = berth_core::claude::resume_line(session) else {
+        tracing::warn!("a saved Claude session id was not a UUID, not resuming");
+        return;
+    };
+    tracing::info!(%session, "resuming a Claude conversation");
+    let pty = pty.clone();
+    // Fire and forget, as the terminal's own writes are: the line lands or
+    // the pane is already gone.
+    runtime::handle().spawn(async move {
+        pty.write(format!("{line}\r")).await;
+    });
+}
+
+/// The conversation worth resuming in a pane: one Claude has reported, and
+/// that did not end with the user exiting it. An interrupted one is resumed;
+/// one the user closed is not brought back.
+fn conversation(tracker: &berth_core::claude::Tracker) -> Option<SavedClaude> {
+    if tracker.state == Some(berth_core::claude::State::Finished) {
+        return None;
+    }
+    Some(SavedClaude {
+        session: tracker.session_id.clone()?,
+        dir: tracker.cwd.clone()?,
+    })
+}
+
 /// Fill in the directories and make the file's contents. Blocking.
 fn finish(pending: Vec<(SavedTab, Vec<Dir>)>) -> Saved {
     let tabs = pending
@@ -266,6 +332,13 @@ fn finish(pending: Vec<(SavedTab, Vec<Dir>)>) -> Saved {
                     Dir::Known(cwd) => cwd,
                     Dir::Ask(pid) => berth_core::local::cwd_of(pid),
                 };
+                // Resume looks in the project folder of the directory it runs
+                // from, which is the resolved path: `/private/tmp`, not `/tmp`.
+                if let Some(claude) = &mut pane.claude
+                    && let Ok(real) = claude.dir.canonicalize()
+                {
+                    claude.dir = real;
+                }
             }
             tab
         })

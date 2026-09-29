@@ -295,3 +295,249 @@ async fn without_the_wrapper_the_users_zsh_can_lose_the_shim() {
         }
     );
 }
+
+/// A shell Berth starts never sees a parent Claude session's markers. When
+/// this suite runs from inside Claude Code, the test process has them, so this
+/// checks the removal for real; elsewhere it passes trivially.
+#[tokio::test]
+async fn a_local_shell_never_sees_a_parent_claude_session() {
+    if !enabled() {
+        eprintln!("skipped: set BERTH_TEST_CLAUDE=1 to run");
+        return;
+    }
+    let inside = std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_some();
+    let (pty, mut events) = berth_core::local::open_with("/bin/sh", false, None, None, 120, 40)
+        .await
+        .expect("a shell should open");
+    assert!(
+        pty.write(
+            "printf 'marker=%s;\\n' \"${CLAUDE_CODE_CHILD_SESSION-unset}${CLAUDECODE-unset}\"\n"
+        )
+        .await
+    );
+    let mut seen = String::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(10), events.recv()).await {
+        if let PtyEvent::Output(bytes) = event {
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+            if seen.contains("marker=u") || seen.contains("marker=1") {
+                break;
+            }
+        }
+    }
+    pty.close().await;
+    eprintln!("parent has the markers: {inside}");
+    assert!(seen.contains("marker=unsetunset;"), "{seen:?}");
+}
+
+/// Resume, end to end: a conversation saved to disk, then Berth's own resume
+/// line typed into the user's real login zsh the moment it starts, the way a
+/// restored tab does it. Claude must come back with that conversation.
+///
+/// The line is typed with `-p` added so the check can read an answer without
+/// driving the interactive screen; everything that is Berth's (typeahead into
+/// a shell still running its startup files, the shim, the id, the directory)
+/// is the same. Uses a fixed work directory so repeated runs keep to one
+/// project folder in Claude's own history.
+#[tokio::test]
+async fn a_saved_conversation_resumes_in_a_fresh_login_shell() {
+    if !enabled() {
+        eprintln!("skipped: set BERTH_TEST_CLAUDE=1 to run");
+        return;
+    }
+    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    else {
+        eprintln!("skipped: no zsh");
+        return;
+    };
+    let base = tempfile::tempdir().expect("a temp dir");
+    claude::install(base.path()).expect("support files in place");
+    let work = std::env::temp_dir().join("berth-live-claude-resume");
+    std::fs::create_dir_all(&work).expect("work dir");
+
+    // A conversation that is saved, in the work directory.
+    let pane = PaneEnv::new(Some(base.path()));
+    let (pty, mut events) =
+        berth_core::local::open_with("/bin/sh", false, Some(&work), Some(&pane), 120, 40)
+            .await
+            .expect("a shell");
+    assert!(
+        pty.write(
+            "claude -p 'Remember the word marzipan. Reply with just ok.'; echo berth-claude-$((20+22))\n"
+        )
+        .await
+    );
+    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let mut seen = String::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
+        if let PtyEvent::Output(bytes) = event {
+            term.advance(&bytes);
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+            if seen.contains("berth-claude-42") {
+                break;
+            }
+        }
+    }
+    pty.close().await;
+    let session = term
+        .drain_agent_signals()
+        .iter()
+        .find_map(|p| claude::parse(p, &pane.token))
+        .map(|s| s.session_id)
+        .expect("the first run reported its session");
+
+    // A fresh login zsh in that directory, with the resume line typed before
+    // its startup files have finished, exactly as a restored tab does.
+    let pane = PaneEnv::new(Some(base.path()));
+    let (pty, mut events) =
+        berth_core::local::open_with(zsh, true, Some(&work), Some(&pane), 120, 40)
+            .await
+            .expect("a login zsh");
+    let line = claude::resume_line(&session).expect("a uuid");
+    assert!(
+        pty.write(format!(
+            "{line} -p 'What word did I ask you to remember? One word.'; echo berth-claude-$((20+22))\r"
+        ))
+        .await
+    );
+    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let mut seen = String::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
+        if let PtyEvent::Output(bytes) = event {
+            term.advance(&bytes);
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+            if seen.contains("berth-claude-42") {
+                break;
+            }
+        }
+    }
+    pty.close().await;
+    let signals: Vec<_> = term
+        .drain_agent_signals()
+        .iter()
+        .filter_map(|p| claude::parse(p, &pane.token))
+        .collect();
+    assert!(
+        signals
+            .iter()
+            .any(|s| s.event == Event::Start && s.session_id == session),
+        "the resumed session reported under its own id: {signals:?}"
+    );
+    assert!(
+        seen.to_lowercase().contains("marzipan"),
+        "the conversation came back: {seen:?}"
+    );
+}
+
+/// The way zsh and bash resume: the id goes in with the shell, and Berth's
+/// startup wrapper runs `claude --resume` before the first prompt. Nothing is
+/// typed, so the typed line must never appear on screen, and the process under
+/// the shell must be Claude resuming that exact session through the shim.
+///
+/// Checked on the process rather than on Claude's own report, because the work
+/// directory was never trusted interactively and Claude stops at its trust
+/// question before starting a session; trusting it would mean writing to the
+/// user's Claude config.
+#[tokio::test]
+async fn zsh_resumes_by_itself_before_its_first_prompt() {
+    if !enabled() {
+        eprintln!("skipped: set BERTH_TEST_CLAUDE=1 to run");
+        return;
+    }
+    let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    else {
+        eprintln!("skipped: no zsh");
+        return;
+    };
+    let base = tempfile::tempdir().expect("a temp dir");
+    claude::install(base.path()).expect("support files in place");
+    let work = std::env::temp_dir().join("berth-live-claude-resume");
+    std::fs::create_dir_all(&work).expect("work dir");
+
+    // A saved conversation to come back to.
+    let pane = PaneEnv::new(Some(base.path()));
+    let (pty, mut events) =
+        berth_core::local::open_with("/bin/sh", false, Some(&work), Some(&pane), 120, 40)
+            .await
+            .expect("a shell");
+    assert!(
+        pty.write("claude -p 'Reply with just ok.'; echo berth-claude-$((20+22))\n")
+            .await
+    );
+    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let mut seen = String::new();
+    while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
+        if let PtyEvent::Output(bytes) = event {
+            term.advance(&bytes);
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+            if seen.contains("berth-claude-42") {
+                break;
+            }
+        }
+    }
+    pty.close().await;
+    let session = term
+        .drain_agent_signals()
+        .iter()
+        .find_map(|p| claude::parse(p, &pane.token))
+        .map(|s| s.session_id)
+        .expect("the first run reported its session");
+
+    let pane = PaneEnv::new(Some(base.path())).resuming(&session);
+    assert!(berth_core::local::resumes_itself(&pane) || !login_shell_is_zsh_or_bash());
+    let (pty, mut events) =
+        berth_core::local::open_with(zsh, true, Some(&work), Some(&pane), 120, 40)
+            .await
+            .expect("a login zsh");
+    let shell_pid = pty.local_pid().expect("a local shell has a pid");
+    let mut seen = String::new();
+    let mut running = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while running.is_none() && std::time::Instant::now() < deadline {
+        if let Ok(Some(PtyEvent::Output(bytes))) =
+            timeout(Duration::from_millis(500), events.recv()).await
+        {
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        running = child_command(shell_pid).filter(|c| c.contains("--resume"));
+    }
+    pty.close().await;
+    let running = running.expect("claude started under the shell");
+    assert!(
+        running.contains(&format!("--resume {session}")),
+        "the saved session, not another: {running}"
+    );
+    assert!(
+        running.contains("--plugin-dir"),
+        "through the shim: {running}"
+    );
+    // What the screen showed is Claude's own start, never a typed line or a
+    // prompt before it.
+    assert!(
+        !seen.contains("claude --resume"),
+        "nothing was typed: {seen:?}"
+    );
+}
+
+/// The command line of a process whose parent is `pid`, if there is one.
+fn child_command(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "ppid=,command="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| {
+            let line = line.trim_start();
+            let (ppid, command) = line.split_once(' ')?;
+            (ppid.parse::<u32>().ok()? == pid).then(|| command.trim().to_string())
+        })
+}
+
+fn login_shell_is_zsh_or_bash() -> bool {
+    let shell = berth_core::local::login_shell();
+    shell.ends_with("/zsh") || shell.ends_with("/bash")
+}
