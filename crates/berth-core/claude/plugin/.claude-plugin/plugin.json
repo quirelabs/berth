@@ -1,0 +1,5 @@
+{
+  "name": "berth",
+  "version": "1.0.0",
+  "description": "Tells Berth what Claude Code is doing in a Berth pane. Does nothing in any other terminal."
+}

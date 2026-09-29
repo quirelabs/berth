@@ -13,6 +13,7 @@
 //! | `BERTH_KNOWN_HOSTS`  | trust and record keys here, not `~/.ssh/known_hosts` |
 //! | `BERTH_SETTINGS`     | remember settings here, not in the config directory |
 //! | `BERTH_RESTORE`      | save local sessions here, not in the data directory |
+//! | `BERTH_DATA`         | keep the Claude plugin and shim here, not in the data directory |
 //! | `BERTH_SHELL`        | run this as the local shell                     |
 //! | `BERTH_SESSION`      | the tmux session slug, instead of the default   |
 //! | `BERTH_HOST`         | open this alias at startup                      |
@@ -21,9 +22,19 @@
 //! | `BERTH_REFRESH_HZ`   | the display's refresh rate, for the frame budget |
 //! | `BERTH_PIXEL_CHECK`  | run the pixel test, which needs a window server |
 //! | `BERTH_TEST_HOST`    | the alias the live suites connect to            |
+//! | `BERTH_TEST_CLAUDE`  | `1` runs the live Claude Code suite, which spends a few tokens |
 //!
-//! The last two are read by test harnesses rather than by Berth, and are named
+//! The last three are read by test harnesses rather than by Berth, and are named
 //! here so the list is the whole list.
+//!
+//! Several more go the other way: Berth sets them in the panes it spawns and
+//! never reads them itself (D48). `BERTH_PANE` is the pane's token, which the
+//! Claude hook echoes back; `BERTH_TTY` is the pane's terminal device, where
+//! the hook writes outside tmux; `BERTH_CLAUDE_SHIM` lists the shim
+//! directories a `claude` call has already passed through, so shims never loop
+//! or add the plugin twice. `BERTH_SHIM_DIR`, `BERTH_USER_ZDOTDIR` and
+//! `BERTH_ZDOTDIR_WAS_SET` are read by Berth's shell startup wrappers, to load
+//! the user's own files and then put the shim back in front.
 //!
 //! Berth also reads variables it does not own: `SHELL` and `ComSpec` for the
 //! local shell, `USER` and `USERNAME` when ssh config names no user. Those stay
@@ -39,6 +50,13 @@ pub const SSH_CONFIG: &str = "BERTH_SSH_CONFIG";
 pub const KNOWN_HOSTS: &str = "BERTH_KNOWN_HOSTS";
 pub const SETTINGS: &str = "BERTH_SETTINGS";
 pub const RESTORE: &str = "BERTH_RESTORE";
+pub const DATA: &str = "BERTH_DATA";
+pub const PANE: &str = "BERTH_PANE";
+pub const TTY: &str = "BERTH_TTY";
+pub const CLAUDE_SHIM: &str = "BERTH_CLAUDE_SHIM";
+pub const SHIM_DIR: &str = "BERTH_SHIM_DIR";
+pub const USER_ZDOTDIR: &str = "BERTH_USER_ZDOTDIR";
+pub const ZDOTDIR_WAS_SET: &str = "BERTH_ZDOTDIR_WAS_SET";
 pub const SHELL: &str = "BERTH_SHELL";
 pub const SESSION: &str = "BERTH_SESSION";
 pub const HOST: &str = "BERTH_HOST";
@@ -47,6 +65,7 @@ pub const BENCH_SETTLE: &str = "BERTH_BENCH_SETTLE";
 pub const REFRESH_HZ: &str = "BERTH_REFRESH_HZ";
 pub const PIXEL_CHECK: &str = "BERTH_PIXEL_CHECK";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
+pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
 
 /// Every name above, so the test below can hold them to one shape.
 #[cfg(test)]
@@ -55,6 +74,13 @@ const NAMES: &[&str] = &[
     KNOWN_HOSTS,
     SETTINGS,
     RESTORE,
+    DATA,
+    PANE,
+    TTY,
+    CLAUDE_SHIM,
+    SHIM_DIR,
+    USER_ZDOTDIR,
+    ZDOTDIR_WAS_SET,
     SHELL,
     SESSION,
     HOST,
@@ -63,6 +89,7 @@ const NAMES: &[&str] = &[
     REFRESH_HZ,
     PIXEL_CHECK,
     TEST_HOST,
+    TEST_CLAUDE,
 ];
 
 /// Unset and empty mean the same thing.
@@ -107,6 +134,12 @@ pub fn settings() -> Option<PathBuf> {
 /// test never writes into the user's own.
 pub fn restore() -> Option<PathBuf> {
     path(RESTORE)
+}
+
+/// Keep the Claude plugin and shim here rather than in the platform's data
+/// directory, so a test never writes into the user's own.
+pub fn data() -> Option<PathBuf> {
+    path(DATA)
 }
 
 /// The local shell to run. First choice, ahead of the platform's own answer,

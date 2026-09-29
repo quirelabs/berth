@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod agents;
+pub mod claude;
 pub mod config;
 pub mod connection;
 pub mod env;

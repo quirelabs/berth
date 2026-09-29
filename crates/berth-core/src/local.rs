@@ -47,8 +47,14 @@ pub fn login_shell() -> String {
 /// Open a shell on this machine.
 ///
 /// Returns the same pair as the ssh path, so everything above it is unchanged.
-pub async fn open(cols: u16, rows: u16) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
-    open_with(&login_shell(), true, None, cols, rows).await
+///
+/// `pane` is what lets Claude's hooks find their way back to this pane (D48).
+pub async fn open(
+    cols: u16,
+    rows: u16,
+    pane: Option<&crate::claude::PaneEnv>,
+) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
+    open_with(&login_shell(), true, None, pane, cols, rows).await
 }
 
 /// Open a shell on this machine in a given directory.
@@ -60,9 +66,10 @@ pub async fn open_in(
     cwd: &std::path::Path,
     cols: u16,
     rows: u16,
+    pane: Option<&crate::claude::PaneEnv>,
 ) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
     let cwd = cwd.is_dir().then_some(cwd);
-    open_with(&login_shell(), true, cwd, cols, rows).await
+    open_with(&login_shell(), true, cwd, pane, cols, rows).await
 }
 
 /// The working directory of a local process, where the platform will say.
@@ -109,16 +116,45 @@ fn parse_lsof_cwd(output: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// How a shell is told to put the shim back in front after its own startup.
+enum Wrapper {
+    /// A `ZDOTDIR` whose files load the user's and then reorder PATH.
+    Zsh(std::path::PathBuf),
+    /// An `--init-file` that does a login shell's work and then reorders PATH.
+    Bash(std::path::PathBuf),
+}
+
+/// The wrapper for this shell, if Berth has one and its files are in place.
+/// Other shells start as before; the shim is still first in the PATH they
+/// inherit, and whether they keep it there is up to their startup files.
+fn startup_wrapper(shell: &str, pane: &crate::claude::PaneEnv) -> Option<Wrapper> {
+    pane.shim_dir.as_ref()?;
+    let dir = pane.shell_dir.as_ref()?;
+    let name = std::path::Path::new(shell).file_name()?.to_str()?;
+    match name {
+        "zsh" => dir
+            .join("zsh/.zshenv")
+            .is_file()
+            .then(|| Wrapper::Zsh(dir.join("zsh"))),
+        "bash" => {
+            let init = dir.join("bash/berth.bash");
+            init.is_file().then_some(Wrapper::Bash(init))
+        }
+        _ => None,
+    }
+}
+
 /// Open a named shell, optionally as a login shell.
 ///
 /// Split out from [`open`] so the tests can drive a plain `sh` in a known
 /// state. A login shell runs the user's profile, which is right for a session
 /// and wrong for a test: it can print, prompt, or take a second, and none of
 /// that is what the tests below are about.
-async fn open_with(
+pub async fn open_with(
     shell: &str,
     login: bool,
     cwd: Option<&std::path::Path>,
+    pane: Option<&crate::claude::PaneEnv>,
     cols: u16,
     rows: u16,
 ) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
@@ -134,19 +170,58 @@ async fn open_with(
         .map_err(|e| Error::Pty(format!("could not open a local pty: {e}")))?;
 
     let mut command = CommandBuilder::new(shell);
-    // A login shell, because that is what sets PATH. Without it Homebrew is
-    // missing on macOS and the first thing anyone types fails to be found,
-    // which is the same class of problem as the non-interactive ssh PATH note
-    // in the runbook. cmd.exe has no equivalent and needs no equivalent.
-    #[cfg(not(windows))]
-    if login {
-        command.arg("-l");
+    let wrapper = pane.and_then(|p| startup_wrapper(shell, p));
+    match &wrapper {
+        // bash is started on Berth's init file, which does what a login shell
+        // would and then puts the shim first (D48).
+        Some(Wrapper::Bash(init)) => {
+            command.arg("--init-file");
+            command.arg(init);
+        }
+        _ => {
+            // A login shell, because that is what sets PATH. Without it
+            // Homebrew is missing on macOS and the first thing anyone types
+            // fails to be found, which is the same class of problem as the
+            // non-interactive ssh PATH note in the runbook. cmd.exe has no
+            // equivalent and needs no equivalent.
+            #[cfg(not(windows))]
+            if login {
+                command.arg("-l");
+            }
+        }
     }
     #[cfg(windows)]
     let _ = login;
+    if let Some(Wrapper::Zsh(dir)) = &wrapper
+        && let Some(pane) = pane
+    {
+        command.env("ZDOTDIR", dir);
+        if let Some(user) = &pane.user_zdotdir {
+            command.env(crate::env::USER_ZDOTDIR, user);
+        }
+        if pane.user_zdotdir_was_set {
+            command.env(crate::env::ZDOTDIR_WAS_SET, "1");
+        }
+    }
+    if let (Some(pane), Some(_)) = (pane, &wrapper)
+        && let Some(shim) = &pane.shim_dir
+    {
+        command.env(crate::env::SHIM_DIR, shim);
+    }
     // The parser is a real terminal, so say so. Without this, programs fall
     // back to line mode or refuse to run.
     command.env("TERM", TERM);
+    if let Some(pane) = pane {
+        command.env(crate::env::PANE, pane.token.as_str());
+        // The hook has no terminal of its own, so it is told where this
+        // pane's is.
+        if let Some(tty) = pair.master.tty_name() {
+            command.env(crate::env::TTY, tty);
+        }
+        if let Some(path) = pane.path_with_shim(std::env::var_os("PATH")) {
+            command.env("PATH", path);
+        }
+    }
     match cwd {
         Some(cwd) => command.cwd(cwd),
         None => {
@@ -287,7 +362,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_local_shell_echoes_what_it_is_told() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, None, 80, 24)
             .await
             .expect("a local shell should open");
         assert!(pty.write("echo berth-local-ok\n").await);
@@ -301,7 +376,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_exiting_shell_reports_closed() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, None, 80, 24)
             .await
             .expect("a local shell should open");
         assert!(pty.write("exit\n").await);
@@ -326,7 +401,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn resizing_reaches_the_shell() {
-        let (pty, mut events) = open_with(TEST_SHELL, false, None, 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, None, None, 80, 24)
             .await
             .expect("a local shell should open");
 
@@ -350,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn a_shells_directory_can_be_read_back() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let (pty, mut events) = open_with(TEST_SHELL, false, Some(dir.path()), 80, 24)
+        let (pty, mut events) = open_with(TEST_SHELL, false, Some(dir.path()), None, 80, 24)
             .await
             .expect("a local shell should open");
         // Once it answers, it is running and sitting in its directory.

@@ -54,8 +54,9 @@ pub async fn open_local(
     cols: u16,
     rows: u16,
     palette: berth_term::terminal::Palette,
+    pane: berth_core::claude::PaneEnv,
 ) -> berth_core::Result<Local> {
-    let (pty, events) = berth_core::local::open(cols, rows).await?;
+    let (pty, events) = berth_core::local::open(cols, rows, Some(&pane)).await?;
     Ok(Local {
         pty,
         terminal: terminal_for(cols, rows, palette),
@@ -221,6 +222,10 @@ pub async fn pump(
         let updated = view.update(cx, |view, cx| {
             for event in batch {
                 view.ingest(event);
+            }
+            let signals = view.take_agent_signals();
+            if !signals.is_empty() {
+                cx.emit(crate::terminal_view::AgentSignals(signals));
             }
             cx.notify();
         });

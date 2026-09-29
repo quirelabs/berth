@@ -119,6 +119,9 @@ struct Pane {
     host: Option<Host>,
     slug: String,
     view: Entity<TerminalView>,
+    /// A local shell's Claude, as its hooks report it (D48). The token is the
+    /// pane's `BERTH_PANE`; signals carrying any other are not believed.
+    claude: Option<ClaudePane>,
     /// A local session from a previous run whose tab has not been shown yet,
     /// so its shell has not started (D46).
     restored: Option<saving::Restored>,
@@ -143,6 +146,21 @@ impl Pane {
 
     fn tmux_name(&self) -> String {
         berth_core::session::Session::new(self.slug.clone(), 80, 24).tmux_name()
+    }
+}
+
+/// What Berth knows about the Claude in one pane.
+struct ClaudePane {
+    token: berth_core::claude::PaneToken,
+    tracker: berth_core::claude::Tracker,
+}
+
+impl ClaudePane {
+    fn new(token: berth_core::claude::PaneToken) -> Self {
+        Self {
+            token,
+            tracker: berth_core::claude::Tracker::default(),
+        }
     }
 }
 
@@ -250,6 +268,9 @@ pub struct Workspace {
     menu: Option<(crate::menu::Target, gpui::Point<gpui::Pixels>)>,
     /// What Berth remembers between launches.
     settings: berth_core::settings::Settings,
+    /// Where the Claude plugin and shim were put, or `None` if they could not
+    /// be, in which case panes open without the shim (D48).
+    claude_base: Option<std::path::PathBuf>,
 }
 
 impl Workspace {
@@ -295,6 +316,7 @@ impl Workspace {
             running: std::collections::BTreeMap::new(),
             expanded: std::collections::BTreeMap::new(),
             menu: None,
+            claude_base: install_claude_support(),
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -425,6 +447,7 @@ impl Workspace {
         let _ = self.place_pane(
             host,
             slug,
+            None,
             connected.terminal.clone(),
             connected.pty.clone(),
             connected.events,
@@ -472,10 +495,12 @@ impl Workspace {
     /// same ones a remote session uses (D36).
     fn open_local(&mut self, place: Place, cx: &mut Context<Self>) {
         tracing::info!(shell = %berth_core::local::login_shell(), "opening a local shell");
+        let pane_env = self.pane_env();
+        let token = Some(pane_env.token.clone());
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let opened = runtime::spawn(session::open_local(80, 24, palette))
+            let opened = runtime::spawn(session::open_local(80, 24, palette, pane_env))
                 .await
                 .map_err(|_| strings::RUNTIME_DROPPED.to_string())
                 .and_then(|r| r.map_err(|e| e.to_string()));
@@ -486,6 +511,7 @@ impl Workspace {
                         this.place_pane(
                             None,
                             strings::LOCAL_ALIAS.to_string(),
+                            token,
                             local.terminal,
                             local.pty,
                             local.events,
@@ -508,6 +534,46 @@ impl Workspace {
         .detach();
     }
 
+    /// A new token, and the shim for the front of PATH, for a local pane.
+    fn pane_env(&self) -> berth_core::claude::PaneEnv {
+        berth_core::claude::PaneEnv::new(self.claude_base.as_deref())
+    }
+
+    /// Hear the agent signals a pane's terminal picks out.
+    fn watch_signals(&self, id: u64, view: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        cx.subscribe(
+            view,
+            move |this, _, signals: &crate::terminal_view::AgentSignals, cx| {
+                this.on_agent_signals(id, &signals.0, cx)
+            },
+        )
+        .detach();
+    }
+
+    /// Believe the signals that carry this pane's token, and fold them in.
+    fn on_agent_signals(&mut self, id: u64, payloads: &[String], cx: &mut Context<Self>) {
+        let Some(claude) = self.pane_mut(id).and_then(|p| p.claude.as_mut()) else {
+            return;
+        };
+        let before = claude.tracker.state;
+        for payload in payloads {
+            match berth_core::claude::parse(payload, &claude.token) {
+                Some(signal) => claude.tracker.apply(&signal),
+                // Stray output that looks like a signal, or another pane's.
+                None => tracing::debug!(pane = id, "agent signal not believed"),
+            }
+        }
+        if claude.tracker.state != before {
+            tracing::info!(pane = id, state = ?claude.tracker.state, "claude state");
+            cx.notify();
+        }
+    }
+
+    /// What a pane's Claude is doing, when its hooks have said.
+    fn claude_state(&self, id: u64) -> Option<berth_core::claude::State> {
+        self.pane(id)?.claude.as_ref()?.tracker.state
+    }
+
     /// Build the view for a session and put it where it belongs.
     ///
     /// The half of adopting a session that has nothing to do with transports,
@@ -517,6 +583,7 @@ impl Workspace {
         &mut self,
         host: Option<Host>,
         slug: String,
+        token: Option<berth_core::claude::PaneToken>,
         terminal: crate::terminal_view::SharedTerminal,
         pty: berth_core::pty::Pty,
         events: tokio::sync::mpsc::Receiver<berth_core::pty::PtyEvent>,
@@ -544,11 +611,13 @@ impl Workspace {
 
         self.next_pane_id += 1;
         let id = self.next_pane_id;
+        self.watch_signals(id, &view, cx);
         self.panes.push(Pane {
             id,
             host,
             slug,
             view,
+            claude: token.map(ClaudePane::new),
             restored: None,
         });
 
@@ -1313,6 +1382,22 @@ impl Workspace {
             (action, target) => tracing::debug!(?action, ?target, "menu action does not apply"),
         }
         cx.notify();
+    }
+}
+
+/// Put the Claude plugin and shim in Berth's data directory (D48).
+///
+/// Best effort: without them a pane still opens, it just cannot report
+/// Claude's state. Only files that changed are rewritten, so this is cheap on
+/// every launch.
+fn install_claude_support() -> Option<std::path::PathBuf> {
+    let base = berth_core::claude::base_dir()?;
+    match berth_core::claude::install(&base) {
+        Ok(()) => Some(base),
+        Err(error) => {
+            tracing::warn!(%error, "could not put the Claude plugin in place, no Claude status");
+            None
+        }
     }
 }
 

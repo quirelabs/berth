@@ -95,6 +95,15 @@ pub const SPLIT_HINT: &str =
 /// the first step towards pretending it does.
 pub const AGENT_TOOLTIP: &str = "An agent is running in this session.";
 
+/// Claude's state, from its own hooks (D48). Each says what Claude reported and
+/// nothing Berth inferred.
+pub const CLAUDE_WORKING: &str = "Claude is working.";
+pub const CLAUDE_PERMISSION: &str = "Claude needs your permission.";
+pub const CLAUDE_IDLE: &str = "Claude is waiting for your input.";
+pub const CLAUDE_YOUR_MOVE: &str = "Claude finished its turn. Your move.";
+pub const CLAUDE_FINISHED: &str = "Claude has exited.";
+pub const CLAUDE_INTERRUPTED: &str = "Claude exited in the middle of a turn.";
+
 pub const RENAME_TITLE: &str = "Name this session";
 pub const RENAME_ACCEPT: &str = "Rename";
 pub const RENAME_REJECT: &str = "Cancel";

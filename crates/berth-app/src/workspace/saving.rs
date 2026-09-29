@@ -113,11 +113,13 @@ impl Workspace {
         });
         self.next_pane_id += 1;
         let id = self.next_pane_id;
+        self.watch_signals(id, &view, cx);
         self.panes.push(Pane {
             id,
             host: None,
             slug: strings::LOCAL_ALIAS.to_string(),
             view,
+            claude: None,
             restored: Some(Restored { cwd: saved.cwd }),
         });
         id
@@ -133,14 +135,20 @@ impl Workspace {
         };
         let view = pane.view.clone();
         let size = view.read(cx).grid_size();
+        let pane_env = self.pane_env();
+        if let Some(pane) = self.pane_mut(id) {
+            pane.claude = Some(super::ClaudePane::new(pane_env.token.clone()));
+        }
         tracing::info!(cwd = ?restored.cwd, "starting a shell in a restored session");
         cx.notify();
 
         cx.spawn(async move |this, cx| {
             let opened = runtime::spawn(async move {
                 match &restored.cwd {
-                    Some(cwd) => berth_core::local::open_in(cwd, size.cols, size.rows).await,
-                    None => berth_core::local::open(size.cols, size.rows).await,
+                    Some(cwd) => {
+                        berth_core::local::open_in(cwd, size.cols, size.rows, Some(&pane_env)).await
+                    }
+                    None => berth_core::local::open(size.cols, size.rows, Some(&pane_env)).await,
                 }
             })
             .await

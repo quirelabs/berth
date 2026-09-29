@@ -196,7 +196,13 @@ pub struct Terminal {
     scanner: Scanner,
     shell_events: Vec<ShellEvent>,
     seen_shell_marker: bool,
+    /// Raw agent signal payloads since the last drain (D48). Untrusted.
+    agent_signals: Vec<String>,
 }
+
+/// Agent signals kept between drains. The app drains every frame, so this is
+/// only ever reached by something printing the sequence in a loop.
+const MAX_QUEUED_SIGNALS: usize = 64;
 
 impl Terminal {
     pub fn new(size: TermSize, cell_size: CellSize) -> Self {
@@ -217,6 +223,7 @@ impl Terminal {
             scanner: Scanner::new(),
             shell_events: Vec::new(),
             seen_shell_marker: false,
+            agent_signals: Vec::new(),
         }
     }
 
@@ -254,6 +261,14 @@ impl Terminal {
                     self.seen_shell_marker = true;
                     self.shell_events.push(ShellEvent { kind, line });
                 }
+                crate::shell::Piece::Agent(payload) => {
+                    // Bounded, so a pane nobody drains, or a program printing
+                    // the sequence in a loop, cannot grow this without limit.
+                    if self.agent_signals.len() >= MAX_QUEUED_SIGNALS {
+                        self.agent_signals.remove(0);
+                    }
+                    self.agent_signals.push(payload);
+                }
             }
         }
         self.revision = self.revision.wrapping_add(1);
@@ -265,6 +280,12 @@ impl Terminal {
     /// prompt row; M3's timeline uses `CommandEnd` for exit codes.
     pub fn drain_shell_events(&mut self) -> Vec<ShellEvent> {
         std::mem::take(&mut self.shell_events)
+    }
+
+    /// Agent signal payloads seen since the last call, oldest first. Untrusted:
+    /// the caller checks each against the pane's token before believing it.
+    pub fn drain_agent_signals(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.agent_signals)
     }
 
     /// Whether the remote has shell integration sourced. Until a marker has
@@ -1207,5 +1228,25 @@ mod tests {
     fn a_blank_screen_saves_almost_nothing() {
         let term = terminal();
         assert_eq!(term.screen_ansi(), "\x1b[0m\x1b[H\x1b[2J\x1b[1;1H");
+    }
+
+    #[test]
+    fn agent_signals_are_queued_for_the_app_and_draw_nothing() {
+        let mut term = terminal();
+        term.advance(b"a\x1b]7717;berth;1;x\x07b");
+        assert_eq!(term.drain_agent_signals(), ["1;x"]);
+        assert!(term.drain_agent_signals().is_empty());
+        assert_eq!(text_of(&term), "ab||||");
+    }
+
+    #[test]
+    fn a_flood_of_agent_signals_is_bounded() {
+        let mut term = terminal();
+        for n in 0..500 {
+            term.advance(format!("\x1b]7717;berth;{n}\x07").as_bytes());
+        }
+        let queued = term.drain_agent_signals();
+        assert_eq!(queued.len(), MAX_QUEUED_SIGNALS);
+        assert_eq!(queued.last().map(String::as_str), Some("499"));
     }
 }

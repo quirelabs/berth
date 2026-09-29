@@ -328,8 +328,10 @@ impl Workspace {
         if focused {
             row = row.bg(hsla(theme.border));
         }
-        if agent {
-            row = row.child(ghost(("session-agent", index), theme));
+        match pane.and_then(|id| self.claude_state(id)) {
+            Some(state) => row = row.child(claude_ghost(("session-agent", index), theme, state)),
+            None if agent => row = row.child(ghost(("session-agent", index), theme)),
+            None => {}
         }
         if detached {
             row = row.tooltip(move |_, cx| {
@@ -446,25 +448,12 @@ impl Workspace {
 
             // After the name and before the state, because it is about what is
             // inside the session rather than about the connection.
-            if agent {
-                row = row.child(
-                    div()
-                        .id(("agent", tab_id as usize))
-                        .flex_shrink_0()
-                        .child(
-                            svg()
-                                .path(crate::icons::GHOST)
-                                .size(px(12.0))
-                                .text_color(hsla(theme.accent)),
-                        )
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| Note {
-                                text: strings::AGENT_TOOLTIP.into(),
-                                theme,
-                            })
-                            .into()
-                        }),
-                );
+            match self.claude_state(id) {
+                Some(state) => {
+                    row = row.child(claude_ghost(("agent", tab_id as usize), theme, state))
+                }
+                None if agent => row = row.child(ghost(("agent", tab_id as usize), theme)),
+                None => {}
             }
 
             // Split tabs say how many panes they hold, since only one of them
@@ -1106,6 +1095,31 @@ fn local_label() -> String {
 
 /// The agent ghost, with the tooltip that says presence and nothing more.
 fn ghost(id: (&'static str, usize), theme: Theme) -> gpui::Stateful<gpui::Div> {
+    ghost_as(id, theme, theme.accent, strings::AGENT_TOOLTIP)
+}
+
+/// The ghost for a Claude whose hooks report its state (D48): the colour says
+/// whether it needs you, the tooltip says which state.
+fn claude_ghost(
+    id: (&'static str, usize),
+    theme: Theme,
+    state: berth_core::claude::State,
+) -> gpui::Stateful<gpui::Div> {
+    let (tone, text) = claude_look(state);
+    let colour = match tone {
+        Tone::Working => theme.accent,
+        Tone::NeedsYou => theme.warning,
+        Tone::Done => theme.text_muted,
+    };
+    ghost_as(id, theme, colour, text)
+}
+
+fn ghost_as(
+    id: (&'static str, usize),
+    theme: Theme,
+    colour: gpui::Rgba,
+    text: &'static str,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_shrink_0()
@@ -1113,15 +1127,36 @@ fn ghost(id: (&'static str, usize), theme: Theme) -> gpui::Stateful<gpui::Div> {
             svg()
                 .path(crate::icons::GHOST)
                 .size(px(12.0))
-                .text_color(hsla(theme.accent)),
+                .text_color(hsla(colour)),
         )
         .tooltip(move |_, cx| {
             cx.new(|_| Note {
-                text: strings::AGENT_TOOLTIP.into(),
+                text: text.into(),
                 theme,
             })
             .into()
         })
+}
+
+/// How a Claude state reads at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Working,
+    /// The one worth noticing from across the screen.
+    NeedsYou,
+    Done,
+}
+
+fn claude_look(state: berth_core::claude::State) -> (Tone, &'static str) {
+    use berth_core::claude::{State, Wait};
+    match state {
+        State::Working => (Tone::Working, strings::CLAUDE_WORKING),
+        State::Waiting(Wait::Permission) => (Tone::NeedsYou, strings::CLAUDE_PERMISSION),
+        State::Waiting(Wait::Idle) => (Tone::NeedsYou, strings::CLAUDE_IDLE),
+        State::Waiting(Wait::YourMove) => (Tone::NeedsYou, strings::CLAUDE_YOUR_MOVE),
+        State::Finished => (Tone::Done, strings::CLAUDE_FINISHED),
+        State::Interrupted => (Tone::Done, strings::CLAUDE_INTERRUPTED),
+    }
 }
 
 fn centred(child: impl IntoElement) -> gpui::Div {
@@ -1131,4 +1166,25 @@ fn centred(child: impl IntoElement) -> gpui::Div {
         .items_center()
         .justify_center()
         .child(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use berth_core::claude::{State, Wait};
+
+    /// Every kind of waiting is the colour that asks for you; nothing else is.
+    #[test]
+    fn only_waiting_needs_you() {
+        for state in [
+            State::Waiting(Wait::Permission),
+            State::Waiting(Wait::Idle),
+            State::Waiting(Wait::YourMove),
+        ] {
+            assert_eq!(claude_look(state).0, Tone::NeedsYou, "{state:?}");
+        }
+        assert_eq!(claude_look(State::Working).0, Tone::Working);
+        assert_eq!(claude_look(State::Finished).0, Tone::Done);
+        assert_eq!(claude_look(State::Interrupted).0, Tone::Done);
+    }
 }

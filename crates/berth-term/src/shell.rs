@@ -10,6 +10,11 @@
 //! - `OSC 133 ; D ; <exit> ST` command end, with the exit code
 //!
 //! alacritty ignores these, so they are scanned out of the byte stream here.
+//!
+//! The same scanner also picks out Berth's own agent signal,
+//! `OSC 7717 ; berth ; ...` (D48), which a Claude Code hook writes into the
+//! pane. This crate does not interpret it: the raw payload is handed up, and
+//! checking and trusting it is `berth-core`'s job.
 //! The scanner is a state machine rather than a search because PTY output is
 //! chunked arbitrarily: a marker routinely arrives split across two reads, and
 //! anything that only searches within a chunk will miss those silently.
@@ -52,6 +57,14 @@ enum State {
 /// grow the client's memory without limit.
 const MAX_PARAM: usize = 128;
 
+/// Longest agent signal kept. The format is capped at 1 KB (D48); anything
+/// longer is not one Berth's hook wrote.
+pub const MAX_AGENT_PARAM: usize = 1100;
+
+/// What every agent signal's parameter string starts with.
+const AGENT_PREFIX: &[u8] = b"7717;berth;";
+const SHELL_PREFIX: &[u8] = b"133;";
+
 /// Splits a byte stream into runs of ordinary output and OSC 133 markers.
 #[derive(Debug, Clone)]
 pub struct Scanner {
@@ -69,6 +82,15 @@ pub enum Piece<'a> {
     /// A recognised marker. Its bytes are also passed through as `Bytes`, so
     /// the parser's state machine sees exactly the original stream.
     Marker(ShellEventKind),
+    /// An agent signal's payload, everything after `7717;berth;`. Untrusted:
+    /// any program in the pane can print one. Passed through as `Bytes` too.
+    Agent(String),
+}
+
+/// What a completed OSC turned out to be.
+enum Found {
+    Shell(ShellEventKind),
+    Agent(String),
 }
 
 impl Default for Scanner {
@@ -120,7 +142,10 @@ impl Scanner {
                         if let Some(kind) = self.finish() {
                             pieces.push(Piece::Bytes(&input[run_start..=index]));
                             run_start = index + 1;
-                            pieces.push(Piece::Marker(kind));
+                            pieces.push(match kind {
+                                Found::Shell(kind) => Piece::Marker(kind),
+                                Found::Agent(payload) => Piece::Agent(payload),
+                            });
                         }
                         self.state = State::Text;
                     }
@@ -128,7 +153,7 @@ impl Scanner {
                     b => {
                         if !self.uninteresting {
                             self.param.push(b);
-                            if self.param.len() > MAX_PARAM || !self.could_be_ours() {
+                            if self.param.len() > self.limit() || !self.could_be_ours() {
                                 self.uninteresting = true;
                                 self.param.clear();
                             }
@@ -141,7 +166,10 @@ impl Scanner {
                         if let Some(kind) = self.finish() {
                             pieces.push(Piece::Bytes(&input[run_start..=index]));
                             run_start = index + 1;
-                            pieces.push(Piece::Marker(kind));
+                            pieces.push(match kind {
+                                Found::Shell(kind) => Piece::Marker(kind),
+                                Found::Agent(payload) => Piece::Agent(payload),
+                            });
                         }
                         self.state = State::Text;
                     } else {
@@ -161,33 +189,47 @@ impl Scanner {
         pieces
     }
 
-    /// Whether the parameter so far can still be an OSC 133 marker. Lets a long
-    /// unrelated OSC, such as a title, be discarded early.
+    /// Whether the parameter so far can still be an OSC 133 marker or an agent
+    /// signal. Lets a long unrelated OSC, such as a title, be discarded early.
     fn could_be_ours(&self) -> bool {
-        const PREFIX: &[u8] = b"133;";
-        let n = self.param.len().min(PREFIX.len());
-        self.param[..n] == PREFIX[..n]
+        [SHELL_PREFIX, AGENT_PREFIX].iter().any(|prefix| {
+            let n = self.param.len().min(prefix.len());
+            self.param[..n] == prefix[..n]
+        })
+    }
+
+    /// How long this parameter may grow: an agent signal carries a directory,
+    /// a shell marker never carries more than an exit code.
+    fn limit(&self) -> usize {
+        if self.param.starts_with(AGENT_PREFIX) {
+            MAX_AGENT_PARAM
+        } else {
+            MAX_PARAM
+        }
     }
 
     /// Interpret a completed parameter string.
-    fn finish(&mut self) -> Option<ShellEventKind> {
+    fn finish(&mut self) -> Option<Found> {
         let param = std::mem::take(&mut self.param);
         let uninteresting = std::mem::replace(&mut self.uninteresting, false);
         if uninteresting {
             return None;
         }
         let text = std::str::from_utf8(&param).ok()?;
+        if let Some(payload) = text.strip_prefix("7717;berth;") {
+            return Some(Found::Agent(payload.to_string()));
+        }
         let rest = text.strip_prefix("133;")?;
         let mut parts = rest.split(';');
         match parts.next()? {
-            "A" => Some(ShellEventKind::PromptStart),
-            "B" => Some(ShellEventKind::CommandStart),
-            "C" => Some(ShellEventKind::OutputStart),
+            "A" => Some(Found::Shell(ShellEventKind::PromptStart)),
+            "B" => Some(Found::Shell(ShellEventKind::CommandStart)),
+            "C" => Some(Found::Shell(ShellEventKind::OutputStart)),
             "D" => {
                 // `D` alone means finished with no code reported. Some shells
                 // append key=value pairs after the code, which are ignored.
                 let exit_code = parts.next().and_then(|c| c.trim().parse::<i32>().ok());
-                Some(ShellEventKind::CommandEnd { exit_code })
+                Some(Found::Shell(ShellEventKind::CommandEnd { exit_code }))
             }
             _ => None,
         }
@@ -208,6 +250,7 @@ mod tests {
                 match piece {
                     Piece::Bytes(b) => passed.extend_from_slice(b),
                     Piece::Marker(kind) => found.push(kind),
+                    Piece::Agent(_) => {}
                 }
             }
         }
@@ -374,5 +417,69 @@ mod tests {
     #[test]
     fn an_unterminated_marker_does_not_fire() {
         assert!(markers(&[b"\x1b]133;A"]).is_empty());
+    }
+
+    /// Agent payloads, with the same byte-exact pass-through check.
+    fn agents(chunks: &[&[u8]]) -> Vec<String> {
+        let mut scanner = Scanner::new();
+        let mut found = Vec::new();
+        let mut passed = Vec::new();
+        for chunk in chunks {
+            for piece in scanner.scan(chunk) {
+                match piece {
+                    Piece::Bytes(b) => passed.extend_from_slice(b),
+                    Piece::Agent(payload) => found.push(payload),
+                    Piece::Marker(_) => {}
+                }
+            }
+        }
+        assert_eq!(
+            passed,
+            chunks.concat(),
+            "every byte must pass through unchanged"
+        );
+        found
+    }
+
+    #[test]
+    fn an_agent_signal_hands_up_its_payload() {
+        assert_eq!(
+            agents(&[b"out\x1b]7717;berth;1;tok;stop;id;-;L3RtcA\x07more"]),
+            ["1;tok;stop;id;-;L3RtcA"]
+        );
+    }
+
+    #[test]
+    fn an_agent_signal_split_across_reads_is_still_found() {
+        assert_eq!(agents(&[b"\x1b]77", b"17;ber", b"th;1;a;b\x07"]), ["1;a;b"]);
+    }
+
+    /// A directory makes the payload longer than any shell marker, so the
+    /// shell limit must not cut it off.
+    #[test]
+    fn a_long_agent_signal_within_its_limit_survives() {
+        let body = "x".repeat(900);
+        let signal = format!("\x1b]7717;berth;{body}\x07");
+        assert_eq!(agents(&[signal.as_bytes()]), [body]);
+    }
+
+    #[test]
+    fn an_overlong_agent_signal_is_dropped() {
+        let body = "x".repeat(MAX_AGENT_PARAM + 10);
+        let signal = format!("\x1b]7717;berth;{body}\x07");
+        assert!(agents(&[signal.as_bytes()]).is_empty());
+    }
+
+    /// Another program's 7717, without the namespace, is not ours.
+    #[test]
+    fn another_7717_is_not_an_agent_signal() {
+        assert!(agents(&[b"\x1b]7717;other;1\x07"]).is_empty());
+    }
+
+    #[test]
+    fn shell_markers_and_agent_signals_share_a_stream() {
+        let stream: &[u8] = b"\x1b]133;A\x07$ \x1b]7717;berth;p\x07";
+        assert_eq!(markers(&[stream]), [ShellEventKind::PromptStart]);
+        assert_eq!(agents(&[stream]), ["p"]);
     }
 }

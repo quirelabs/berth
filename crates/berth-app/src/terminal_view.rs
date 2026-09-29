@@ -61,6 +61,12 @@ impl FontFacts {
     }
 }
 
+/// Agent signal payloads a pane received, raw and untrusted (D48). The
+/// workspace holds the pane's token and decides what to believe.
+pub struct AgentSignals(pub Vec<String>);
+
+impl gpui::EventEmitter<AgentSignals> for TerminalView {}
+
 pub struct TerminalView {
     terminal: SharedTerminal,
     pty: Option<Pty>,
@@ -154,6 +160,14 @@ impl TerminalView {
         // The remote is a fresh tmux client that has not been told the size,
         // so forget what the last one was told and let the next paint resize.
         self.last_sent_size = None;
+    }
+
+    /// Agent signals the terminal picked out since the last call.
+    pub fn take_agent_signals(&mut self) -> Vec<String> {
+        self.terminal
+            .lock()
+            .map(|mut t| t.drain_agent_signals())
+            .unwrap_or_default()
     }
 
     /// The live screen as bytes that redraw it, and the grid's size, for
