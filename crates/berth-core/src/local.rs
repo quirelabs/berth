@@ -186,17 +186,17 @@ pub fn carried(name: &str) -> bool {
             "TZ",
             "TMPDIR",
             "SSH_AUTH_SOCK",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "XDG_RUNTIME_DIR",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
-            "XDG_STATE_HOME",
             "ZDOTDIR",
             "__CF_USER_TEXT_ENCODING",
+            // A Linux desktop session: without these, opening a GUI program
+            // or a browser from the terminal fails. The XDG_ variables below
+            // are part of it too (session type, desktop, data directories).
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
         ];
-        KEEP.contains(&name) || name.starts_with("LC_")
+        KEEP.contains(&name) || name.starts_with("LC_") || name.starts_with("XDG_")
     }
     #[cfg(windows)]
     {
@@ -597,6 +597,37 @@ mod tests {
 
     /// Claude's session markers never reach a local shell; its settings do.
     /// Checked on the builder, so the test sets no environment of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_shell_keeps_what_finds_the_user_and_their_desktop() {
+        for name in [
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "PATH",
+            "SSH_AUTH_SOCK",
+            "LC_ALL",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XAUTHORITY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR",
+            "XDG_CURRENT_DESKTOP",
+        ] {
+            assert!(carried(name), "{name}");
+        }
+        for name in [
+            "TMUX",
+            "SSH_CONNECTION",
+            "TERM_SESSION_ID",
+            "CLAUDECODE",
+            "BERTH_DATA",
+        ] {
+            assert!(!carried(name), "{name}");
+        }
+    }
+
     #[test]
     fn claude_session_markers_are_not_passed_on() {
         let mut command = CommandBuilder::new("sh");

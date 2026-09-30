@@ -145,6 +145,13 @@ pub enum ClaudeState {
 /// The visible screen: what [`ToApp::Screen`] unpacks to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Screen {
+    /// The number the worker gives the screen's first row: the number it
+    /// will have in history once it scrolls off. Line numbers have one owner,
+    /// the worker, and the app files screen rows and [`ToApp::History`]
+    /// ranges under the worker's numbers only, never counting lines itself,
+    /// so the two cannot drift apart. On the alternate screen, whose rows
+    /// never reach history, the number the primary screen's first row has.
+    pub first_line: u64,
     pub cols: u16,
     pub rows: u16,
     pub cursor: Cursor,
@@ -304,6 +311,7 @@ mod tests {
     #[test]
     fn a_screen_travels_packed() {
         let screen = Screen {
+            first_line: 0,
             cols: 80,
             rows: 24,
             cursor: Cursor {

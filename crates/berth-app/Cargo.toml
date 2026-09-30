@@ -25,3 +25,6 @@ tracing-subscriber.workspace = true
 # Decoding the screenshot the pixel check takes. Already in the tree via gpui,
 # so this adds a direct reference rather than new code.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# The server-process test: a scratch data directory and the wire types.
+tempfile.workspace = true
+berth-proto.workspace = true

@@ -13,7 +13,7 @@
 //! | `BERTH_KNOWN_HOSTS`  | trust and record keys here, not `~/.ssh/known_hosts` |
 //! | `BERTH_SETTINGS`     | remember settings here, not in the config directory |
 //! | `BERTH_RESTORE`      | save local sessions here, not in the data directory |
-//! | `BERTH_DATA`         | keep the Claude plugin and shim here, not in the data directory |
+//! | `BERTH_DATA`         | keep the Claude plugin, the shim, and the local server's runtime files and binaries here |
 //! | `BERTH_SHELL`        | run this as the local shell                     |
 //! | `BERTH_SESSION`      | the tmux session slug, instead of the default   |
 //! | `BERTH_HOST`         | open this alias at startup                      |
@@ -23,8 +23,9 @@
 //! | `BERTH_PIXEL_CHECK`  | run the pixel test, which needs a window server |
 //! | `BERTH_TEST_HOST`    | the alias the live suites connect to            |
 //! | `BERTH_TEST_CLAUDE`  | `1` runs the live Claude Code suite, which spends a few tokens |
+//! | `BERTH_TEST_OTHER_USER` | a second local account the socket tests connect as, through `sudo -n -u` |
 //!
-//! The last three are read by test harnesses rather than by Berth, and are named
+//! The last four are read by test harnesses rather than by Berth, and are named
 //! here so the list is the whole list.
 //!
 //! Several more go the other way: Berth sets them in the panes it spawns and
@@ -69,6 +70,7 @@ pub const REFRESH_HZ: &str = "BERTH_REFRESH_HZ";
 pub const PIXEL_CHECK: &str = "BERTH_PIXEL_CHECK";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
+pub const TEST_OTHER_USER: &str = "BERTH_TEST_OTHER_USER";
 
 /// Every name above, so the test below can hold them to one shape.
 #[cfg(test)]
@@ -94,6 +96,7 @@ const NAMES: &[&str] = &[
     PIXEL_CHECK,
     TEST_HOST,
     TEST_CLAUDE,
+    TEST_OTHER_USER,
 ];
 
 /// Unset and empty mean the same thing.

@@ -590,6 +590,9 @@ struct Numbering {
     /// Lines pruned since the start, which is the number of the oldest line
     /// held.
     pruned: u64,
+    /// The primary screen's history length at the last update, for numbering
+    /// its first row while the alternate screen is up.
+    held: u64,
     anchor: Option<(libghostty_vt::screen::TrackedGridRef, u32)>,
 }
 
@@ -597,10 +600,25 @@ impl Numbering {
     /// Account for what changed since the last call. Only the primary screen
     /// has history; while the alternate one is up the primary does not move.
     fn update(&mut self, term: &Ghostty) {
-        use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
         if modes_of(term).alternate_screen {
             return;
         }
+        self.update_primary(term);
+        self.held = term.scrollback_rows().unwrap_or(0) as u64;
+    }
+
+    /// The number the live screen's first row has: the line after the newest
+    /// in history.
+    fn first_line(&self, term: &Ghostty) -> u64 {
+        if modes_of(term).alternate_screen {
+            self.pruned + self.held
+        } else {
+            self.pruned + term.scrollback_rows().unwrap_or(0) as u64
+        }
+    }
+
+    fn update_primary(&mut self, term: &Ghostty) {
+        use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
         if let Some((anchor, was)) = &self.anchor {
             match anchor.point(PointSpace::Screen) {
                 Ok(Some(now)) => {
@@ -705,7 +723,8 @@ impl Engine {
                 let _ = reply.send(self.live_screen());
             }
             Command::WireScreen(reply) => {
-                let _ = reply.send(crate::wire::screen(&self.term));
+                let first_line = self.numbering.first_line(&self.term);
+                let _ = reply.send(crate::wire::screen(&self.term, first_line));
             }
             Command::HistoryHeld(reply) => {
                 let held = if modes_of(&self.term).alternate_screen {

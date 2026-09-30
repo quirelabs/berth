@@ -55,6 +55,11 @@ pub enum Error {
     #[error("authentication failed for {user} after offering {offered} agent identities")]
     AuthFailed { user: String, offered: usize },
 
+    /// Berth's own local server: a socket that would not open, a peer that
+    /// did not speak the protocol, a worker that did not start.
+    #[error("local server: {0}")]
+    Server(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

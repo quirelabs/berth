@@ -51,6 +51,8 @@ pub const HISTORY_RANGE: u32 = 500;
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub session: SessionId,
+    /// What the session list calls it.
+    pub name: String,
     /// Where the shell starts. Home if `None` or gone.
     pub cwd: Option<PathBuf>,
     pub cols: u16,
@@ -69,6 +71,9 @@ pub struct Shell {
 
 pub struct Worker {
     session: SessionId,
+    name: String,
+    cwd: Option<String>,
+    size: Mutex<(u16, u16)>,
     pty: Pty,
     terminal: Arc<Terminal>,
     /// Bytes of output so far. Locked while a chunk is fed to the terminal
@@ -114,6 +119,12 @@ impl Worker {
         Ok((
             Worker {
                 session: spec.session,
+                name: spec.name.clone(),
+                cwd: spec
+                    .cwd
+                    .as_ref()
+                    .map(|dir| dir.to_string_lossy().to_string()),
+                size: Mutex::new((spec.cols, spec.rows)),
                 pty,
                 terminal,
                 seq,
@@ -154,15 +165,31 @@ impl Worker {
             }
             // Nothing to do: output keeps flowing whether anyone reads it.
             ToServer::Detach { .. } | ToServer::Confirmed { .. } | ToServer::Visible { .. } => None,
-            ToServer::ListSessions | ToServer::Create { .. } => Some(ToApp::Refused {
+            // Asked by a supervisor finding its workers again: this session.
+            ToServer::ListSessions => Some(ToApp::Sessions(vec![self.info()])),
+            ToServer::Create { .. } => Some(ToApp::Refused {
                 what: format!("{message:?}"),
                 why: "a worker holds one session; ask the supervisor".into(),
             }),
         }
     }
 
+    /// This session as the session list shows it.
+    pub fn info(&self) -> v1::SessionInfo {
+        let (cols, rows) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
+        v1::SessionInfo {
+            id: self.session,
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            cols,
+            rows,
+            claude: None,
+        }
+    }
+
     async fn resize(&self, cols: u16, rows: u16) {
         let size = TermSize::new(cols, rows);
+        *self.size.lock().unwrap_or_else(|p| p.into_inner()) = (size.cols, size.rows);
         self.terminal.resize(size, CellSize::new(8.0, 16.0));
         self.pty.resize(size.cols, size.rows).await;
     }
@@ -261,6 +288,7 @@ mod tests {
     fn spec(dir: Option<PathBuf>) -> Spec {
         Spec {
             session: 1,
+            name: "test".into(),
             cwd: dir,
             cols: 40,
             rows: 10,
@@ -460,10 +488,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_session_list_is_not_a_workers_to_answer() {
+    async fn a_worker_describes_itself_and_refuses_to_create() {
         let (worker, _rx) = Worker::start(spec(None)).await.unwrap();
+        let Some(ToApp::Sessions(list)) = worker.handle(ToServer::ListSessions).await else {
+            panic!("no session list");
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].id, list[0].name.as_str()), (1, "test"));
         assert!(matches!(
-            worker.handle(ToServer::ListSessions).await,
+            worker
+                .handle(ToServer::Create {
+                    name: None,
+                    cwd: None,
+                    cols: 80,
+                    rows: 24
+                })
+                .await,
             Some(ToApp::Refused { .. })
         ));
     }

@@ -96,6 +96,30 @@ fn render_probe() {
     });
 }
 
+/// Run as the supervisor or a worker, on a runtime of its own.
+fn serve(args: &[String]) -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "could not start the server's runtime");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async {
+        match args.first().map(String::as_str) {
+            Some("--supervisor") => berth_core::server::supervisor::run_process().await,
+            _ => berth_core::server::worker_host::run_process(args).await,
+        }
+    });
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(%error, "the server stopped");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -103,6 +127,15 @@ fn main() -> std::process::ExitCode {
                 .unwrap_or_else(|_| "berth=info".into()),
         )
         .init();
+
+    // Berth's own server (D50): the same binary, started without a window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--supervisor" | "--worker")
+    ) {
+        return serve(&args);
+    }
 
     if std::env::args().any(|a| a == "--render-probe") {
         render_probe();

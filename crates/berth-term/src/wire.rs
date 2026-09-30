@@ -113,7 +113,7 @@ fn row(term: &Ghostty, cols: u16, point: impl Fn(u16) -> Point) -> v1::Row {
 }
 
 /// The active screen: what a fresh app copy needs to draw exactly this.
-pub(crate) fn screen(term: &Ghostty) -> Option<v1::Screen> {
+pub(crate) fn screen(term: &Ghostty, first_line: u64) -> Option<v1::Screen> {
     let cols = term.cols().ok()?;
     let rows = term.rows().ok()?;
     let lines = (0..rows)
@@ -125,6 +125,7 @@ pub(crate) fn screen(term: &Ghostty) -> Option<v1::Screen> {
         .collect();
     let modes = modes_of(term);
     Some(v1::Screen {
+        first_line,
         cols,
         rows,
         cursor: v1::Cursor {
@@ -318,6 +319,21 @@ mod tests {
         t.advance(b"\x1b[9999S");
         lines(&t, 50, 60);
         assert!(t.wire_history(None, 1).newest > before);
+    }
+
+    /// The screen's first row is the line after the newest in history, by
+    /// the worker's numbers, through pruning and on the alternate screen.
+    #[test]
+    fn a_screen_carries_the_number_of_its_first_row() {
+        let t = terminal(80, 5, 100);
+        for chunk in 0..200 {
+            lines(&t, chunk * 50, chunk * 50 + 50);
+            let newest = t.wire_history(None, 1).newest;
+            assert_eq!(t.wire_screen().unwrap().first_line, newest + 1);
+        }
+        let primary = t.wire_screen().unwrap().first_line;
+        t.advance(b"\x1b[?1049h");
+        assert_eq!(t.wire_screen().unwrap().first_line, primary);
     }
 
     #[test]

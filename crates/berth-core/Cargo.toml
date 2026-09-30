@@ -21,6 +21,11 @@ shellexpand.workspace = true
 # berth-core, so this creates no cycle.
 berth-term.workspace = true
 berth-proto.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 berth-probe.workspace = true
