@@ -1,0 +1,19 @@
+# Throwaway spike for D49 step 1: can libghostty-vt be Berth's engine on both
+# ends? Its own workspace, so it never touches Berth's build or CI.
+[package]
+name = "libghostty-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The bindings' unreleased master, pinned by commit: 0.2.2 on crates.io does
+# not yet expose Ghostty's snapshot API, which this spike needs (D49).
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "8953a740bc378cec3e07e1f6ca949f0595eab19b" }
+berth-term = { path = "../../crates/berth-term" }
+
+[features]
+# Build berth-term on libghostty too, to time its per-frame snapshot.
+ghostty-term = ["berth-term/ghostty"]

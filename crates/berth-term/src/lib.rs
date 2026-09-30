@@ -8,6 +8,8 @@ pub mod paste;
 pub mod shell;
 pub mod size;
 pub mod terminal;
+#[cfg(feature = "ghostty")]
+mod ghostty;
 
 pub use keys::{Key, KeyEvent, Modifiers, TermMode, alt_scroll, encode};
 pub use paste::{MouseButton, mouse_sgr, paste_bytes};

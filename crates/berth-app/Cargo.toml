@@ -9,6 +9,10 @@ publish.workspace = true
 name = "berth"
 path = "src/main.rs"
 
+[features]
+# D49 step 1 spike: run the app on libghostty-vt.
+ghostty = ["berth-term/ghostty"]
+
 [dependencies]
 berth-core.workspace = true
 berth-term.workspace = true

@@ -5,7 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# D49 step 1 spike: libghostty-vt as the engine, behind the same interface.
+# Needs Zig 0.16 on PATH and GHOSTTY_SOURCE_DIR from spikes/libghostty/fetch-ghostty.sh.
+ghostty = ["dep:libghostty-vt"]
+
 [dependencies]
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "8953a740bc378cec3e07e1f6ca949f0595eab19b", optional = true }
 alacritty_terminal.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

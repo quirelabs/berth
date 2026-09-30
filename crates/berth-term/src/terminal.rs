@@ -6,14 +6,25 @@
 //! firehose of output cannot stall the UI thread.
 
 use alacritty_terminal::event::{Event, EventListener};
+#[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::grid::Dimensions;
+#[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::index::Point;
+#[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::term::cell::Flags;
+#[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+#[cfg(not(feature = "ghostty"))]
+use alacritty_terminal::vte::ansi::Processor;
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(feature = "ghostty"))]
 use crate::shell::{Scanner, ShellEvent};
+
+/// The libghostty-vt engine behind the same interface, for the D49 spike.
+#[cfg(feature = "ghostty")]
+pub use crate::ghostty::Terminal;
 use crate::size::{CellSize, TermSize};
 
 /// Local scrollback. tmux keeps far more on the remote.
@@ -170,7 +181,7 @@ impl Selection {
         self.start_line == self.end_line && self.start_column == self.end_column
     }
 
-    fn contains(self, line: u16, column: u16) -> bool {
+    pub(crate) fn contains(self, line: u16, column: u16) -> bool {
         if line < self.start_line || line > self.end_line {
             return false;
         }
@@ -184,6 +195,7 @@ impl Selection {
     }
 }
 
+#[cfg(not(feature = "ghostty"))]
 pub struct Terminal {
     term: Term<Listener>,
     parser: Processor,
@@ -202,8 +214,9 @@ pub struct Terminal {
 
 /// Agent signals kept between drains. The app drains every frame, so this is
 /// only ever reached by something printing the sequence in a loop.
-const MAX_QUEUED_SIGNALS: usize = 64;
+pub(crate) const MAX_QUEUED_SIGNALS: usize = 64;
 
+#[cfg(not(feature = "ghostty"))]
 impl Terminal {
     pub fn new(size: TermSize, cell_size: CellSize) -> Self {
         let listener = Listener::default();
@@ -575,23 +588,23 @@ impl Terminal {
 
 /// The drawn style of one cell, for writing a screen back out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Style {
-    fg: Rgb,
-    bg: Rgb,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    strikethrough: bool,
+pub(crate) struct Style {
+    pub(crate) fg: Rgb,
+    pub(crate) bg: Rgb,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) underline: bool,
+    pub(crate) strikethrough: bool,
 }
 
 impl Style {
     /// Underline and strike draw on a blank, so a blank carrying one is not
     /// padding.
-    fn marks_blank(&self) -> bool {
+    pub(crate) fn marks_blank(&self) -> bool {
         self.underline || self.strikethrough
     }
 
-    fn write_sgr(&self, out: &mut String) {
+    pub(crate) fn write_sgr(&self, out: &mut String) {
         use std::fmt::Write as _;
         let _ = write!(
             out,
@@ -693,6 +706,12 @@ impl Palette {
             NamedColor::DimWhite => dim(self.ansi[7]),
             NamedColor::Cursor => self.foreground,
         }
+    }
+
+    /// All 256 colours, for an engine that resolves indexes itself.
+    #[cfg_attr(not(feature = "ghostty"), allow(dead_code))]
+    pub(crate) fn table(&self) -> [Rgb; 256] {
+        std::array::from_fn(|i| self.indexed(i as u8, false))
     }
 
     /// The xterm 256-colour layout: 0-15 ANSI, 16-231 a 6x6x6 cube, 232-255
