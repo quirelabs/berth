@@ -58,6 +58,9 @@ pub enum Bench {
     Cat,
     /// Send keystrokes and split the latency into network and render halves.
     Keys,
+    /// `cat` a 50 MB file in a local shell: no tmux, no ssh, so every byte
+    /// reaches the parser and the renderer is actually loaded (D49 verdict).
+    LocalCat,
 }
 
 impl Bench {
@@ -65,6 +68,7 @@ impl Bench {
         match berth_core::env::bench()?.as_str() {
             "cat" => Some(Bench::Cat),
             "keys" => Some(Bench::Keys),
+            "local-cat" => Some(Bench::LocalCat),
             other => {
                 eprintln!("unknown BERTH_BENCH={other}");
                 None
@@ -365,6 +369,108 @@ pub struct Outcome {
     pub passed: bool,
 }
 
+/// Where the local heavy-output benchmark keeps its file.
+pub fn local_file() -> std::path::PathBuf {
+    std::env::temp_dir().join("berth_bench_50mb_local.txt")
+}
+
+/// Write `BENCH_BYTES` of 76-column, base64-looking lines, as the remote
+/// benchmark's file is, without needing `/dev/urandom` or a shell.
+pub fn write_local_file(path: &std::path::Path) -> std::io::Result<()> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(BENCH_BYTES);
+    let mut state: u32 = 0x9e37_79b9;
+    while out.len() < BENCH_BYTES {
+        for _ in 0..76 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push(ALPHABET[(state >> 26) as usize]);
+        }
+        out.push(b'\n');
+    }
+    out.truncate(BENCH_BYTES);
+    std::fs::write(path, out)
+}
+
+/// Heavy output in a plain local shell.
+///
+/// Through tmux the fast producer is collapsed before Berth sees it (D20, D25),
+/// so that path can never load the renderer. A local pty has nothing in
+/// between: all 50 MB reach the parser, and the frames drawn while they do are
+/// the real test of the engine.
+pub async fn run_local_cat(view: WeakEntity<TerminalView>, pty: Pty, cx: &mut AsyncApp) -> Outcome {
+    let path = local_file();
+    if let Err(error) = write_local_file(&path) {
+        return Outcome {
+            text: format!("could not write {}: {error}", path.display()),
+            passed: false,
+        };
+    }
+    // Let the prompt draw, then measure from a clean histogram.
+    cx.background_executor().timer(Duration::from_secs(2)).await;
+    let _ = view.update(cx, |view, _| {
+        view.frames = crate::metrics::Histogram::new();
+        view.slow_frames.clear();
+        view.bytes_in = 0;
+    });
+    let started = std::time::Instant::now();
+    pty.write(format!("cat '{}'\n", path.display())).await;
+
+    // Until every byte is through, or a minute passes.
+    let deadline = Duration::from_secs(60);
+    loop {
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+        let bytes = view.read_with(cx, |view, _| view.bytes_in).unwrap_or(0);
+        if bytes as usize >= BENCH_BYTES || started.elapsed() > deadline {
+            break;
+        }
+    }
+    let took = started.elapsed();
+    // Let the last frames land.
+    cx.background_executor().timer(Duration::from_secs(1)).await;
+    let _ = std::fs::remove_file(&path);
+
+    view.read_with(cx, |view, _| {
+        let env = environment(view);
+        let report = view.frames.report("frame build, local cat", Some(FRAME_BUDGET));
+        let slow = view.slow_frames_report();
+        let p99 = view.frames.percentile_ms(0.99);
+        let no_freeze = view.frames.within(FRAME_BUDGET);
+        let batching_intact = p99 <= f64::from(CAT_P99_CEILING_MS);
+        let bytes = view.bytes_in as f64;
+        let arrived = bytes >= BENCH_BYTES as f64 * 0.95;
+        let painted = view.frames.count() >= 10;
+        let mut text = format!(
+            "{env}{report}{slow}bytes through the parser: {:.1} MB of {:.0} MB in {:.1} s ({:.0} MB/s)\n\
+             no frame at or above 32 ms: {}\n\
+             p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms regression ceiling: {}\n",
+            bytes / (1024.0 * 1024.0),
+            BENCH_BYTES as f64 / (1024.0 * 1024.0),
+            took.as_secs_f64(),
+            bytes / (1024.0 * 1024.0) / took.as_secs_f64(),
+            if no_freeze { "PASS" } else { "FAIL" },
+            if batching_intact { "PASS" } else { "FAIL" },
+        );
+        if !arrived || !painted {
+            text.push_str(&format!(
+                "INVALID: {:.1} MB of {:.0} MB reached the parser over {} frames.\n",
+                bytes / (1024.0 * 1024.0),
+                BENCH_BYTES as f64 / (1024.0 * 1024.0),
+                view.frames.count()
+            ));
+        }
+        Outcome {
+            text,
+            passed: no_freeze && batching_intact && arrived && painted,
+        }
+    })
+    .unwrap_or_else(|_| Outcome {
+        text: "the view went away before the report".to_string(),
+        passed: false,
+    })
+}
+
 /// Platform and font facts, printed by both benchmarks.
 ///
 /// The font lines matter most: JetBrains Mono is not installed everywhere, so
@@ -504,11 +610,11 @@ mod tests {
     fn bench_mode_parses_from_the_environment() {
         // Parsing is by string so the harness cannot silently run the wrong one.
         assert_eq!(
-            ["cat", "keys"]
+            ["cat", "keys", "local-cat"]
                 .iter()
-                .filter(|m| matches!(*m, &"cat" | &"keys"))
+                .filter(|m| matches!(*m, &"cat" | &"keys" | &"local-cat"))
                 .count(),
-            2
+            3
         );
     }
 
@@ -528,5 +634,24 @@ mod tests {
     fn cleanup_removes_the_file() {
         assert!(remove_file_command().contains(BENCH_FILE));
         assert!(remove_file_command().starts_with("rm -f"));
+    }
+
+    /// The local file is the full size the criterion is stated in, so a
+    /// short file cannot pass as a loaded renderer.
+    #[test]
+    fn the_local_file_is_fifty_megabytes_of_lines() {
+        let dir = std::env::temp_dir().join(format!("berth-bench-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("f.txt");
+        write_local_file(&path).expect("written");
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes.len(), BENCH_BYTES);
+        assert_eq!(bytes[76], b'\n');
+        assert!(
+            bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'\n'))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

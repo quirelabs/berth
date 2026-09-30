@@ -72,6 +72,18 @@ jobs:
       - name: Throughput by kind of output
         run: ./target/release/throughput
 
+      # The Linux binaries, to measure on a real server rather than a CI VM
+      # (D49 verdict, condition 1).
+      - name: Keep the Linux binaries
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-linux-x86_64
+          path: |
+            spikes/libghostty/target/release/throughput
+            spikes/libghostty/target/release/libghostty-spike
+          retention-days: 7
+
       # Where the Linux time goes, if the runner permits perf.
       - name: Profile the emoji stream on Linux
         if: runner.os == 'Linux'

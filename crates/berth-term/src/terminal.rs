@@ -14,9 +14,9 @@ use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags;
 #[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 #[cfg(not(feature = "ghostty"))]
 use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(feature = "ghostty"))]

@@ -521,6 +521,9 @@ impl Workspace {
                         );
                         this.report_cold_start(strings::LOCAL_ALIAS);
                     });
+                    if crate::bench::Bench::from_env() == Some(crate::bench::Bench::LocalCat) {
+                        Self::run_local_benchmark(&this, cx).await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not open a local shell");

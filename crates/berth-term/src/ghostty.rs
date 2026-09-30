@@ -15,18 +15,18 @@
 use std::sync::mpsc;
 
 use alacritty_terminal::event::Event;
+use libghostty_vt::RenderState;
 use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{Palette as GhosttyPalette, RgbColor};
 use libghostty_vt::terminal::{Mode, ScrollViewport};
-use libghostty_vt::RenderState;
 
 use crate::shell::{Piece, Scanner, ShellEvent};
 use crate::size::{CellSize, TermSize};
 use crate::terminal::{
-    Cell, Cursor, MAX_QUEUED_SIGNALS, Palette, Rgb, SCROLLBACK_LINES, Scroll, Selection, Snapshot, Style, WheelAction,
+    Cell, Cursor, MAX_QUEUED_SIGNALS, Palette, Rgb, SCROLLBACK_LINES, Scroll, Selection, Snapshot,
+    Style, WheelAction,
 };
-
 
 /// The terminal modes a caller asks about between frames, copied out after
 /// every write so answering them never waits on the engine thread.
@@ -178,7 +178,10 @@ impl Terminal {
         }
         self.size = size;
         self.cell_size = cell_size;
-        let (w, h) = (cell_size.width.max(1.0) as u32, cell_size.height.max(1.0) as u32);
+        let (w, h) = (
+            cell_size.width.max(1.0) as u32,
+            cell_size.height.max(1.0) as u32,
+        );
         self.round_trip(|tx| Command::Resize(size.cols, size.rows, w, h, tx));
         self.revision = self.revision.wrapping_add(1);
     }
@@ -238,7 +241,8 @@ impl Terminal {
     pub fn snapshot(&self) -> Snapshot {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(Command::Snapshot(self.size, self.cell_size, tx));
-        rx.recv().unwrap_or_else(|_| blank(self.size, self.cell_size))
+        rx.recv()
+            .unwrap_or_else(|_| blank(self.size, self.cell_size))
     }
 
     pub fn selection_text(&self, selection: Selection) -> String {
@@ -418,15 +422,29 @@ fn engine(commands: mpsc::Receiver<Command>, cols: u16, rows: u16) {
                 let _ = term.set_default_color_palette(Some(GhosttyPalette(table)));
                 let fg = new.foreground;
                 let bg = new.background;
-                let _ = term.set_default_fg_color(Some(RgbColor { r: fg.r, g: fg.g, b: fg.b }));
-                let _ = term.set_default_bg_color(Some(RgbColor { r: bg.r, g: bg.g, b: bg.b }));
+                let _ = term.set_default_fg_color(Some(RgbColor {
+                    r: fg.r,
+                    g: fg.g,
+                    b: fg.b,
+                }));
+                let _ = term.set_default_bg_color(Some(RgbColor {
+                    r: bg.r,
+                    g: bg.g,
+                    b: bg.b,
+                }));
                 palette = new;
             }
             Command::LiveSnapshot(size, cell_size, reply) => {
                 let offset = modes(&term).display_offset;
                 term.scroll_viewport(ScrollViewport::Bottom);
                 let snapshot = build(
-                    &term, &mut state, &mut row_iter, &mut cell_iter, &palette, size, cell_size,
+                    &term,
+                    &mut state,
+                    &mut row_iter,
+                    &mut cell_iter,
+                    &palette,
+                    size,
+                    cell_size,
                 )
                 .unwrap_or_else(|| blank(size, cell_size));
                 if offset > 0 {
@@ -436,7 +454,13 @@ fn engine(commands: mpsc::Receiver<Command>, cols: u16, rows: u16) {
             }
             Command::Snapshot(size, cell_size, reply) => {
                 let snapshot = build(
-                    &term, &mut state, &mut row_iter, &mut cell_iter, &palette, size, cell_size,
+                    &term,
+                    &mut state,
+                    &mut row_iter,
+                    &mut cell_iter,
+                    &palette,
+                    size,
+                    cell_size,
                 )
                 .unwrap_or_else(|| blank(size, cell_size));
                 let _ = reply.send(snapshot);
@@ -468,8 +492,18 @@ fn build(
             let wide = cell.raw_cell().ok().and_then(|c| c.wide().ok());
             if !matches!(wide, Some(CellWide::SpacerTail | CellWide::SpacerHead)) {
                 let style = cell.style().ok();
-                let mut fg = cell.fg_color().ok().flatten().map(rgb).unwrap_or(palette.foreground);
-                let mut bg = cell.bg_color().ok().flatten().map(rgb).unwrap_or(palette.background);
+                let mut fg = cell
+                    .fg_color()
+                    .ok()
+                    .flatten()
+                    .map(rgb)
+                    .unwrap_or(palette.foreground);
+                let mut bg = cell
+                    .bg_color()
+                    .ok()
+                    .flatten()
+                    .map(rgb)
+                    .unwrap_or(palette.background);
                 if style.is_some_and(|s| s.inverse) {
                     std::mem::swap(&mut fg, &mut bg);
                 }
@@ -486,7 +520,9 @@ fn build(
                     bg,
                     bold: style.is_some_and(|s| s.bold),
                     italic: style.is_some_and(|s| s.italic),
-                    underline: style.is_some_and(|s| !matches!(s.underline, libghostty_vt::style::Underline::None)),
+                    underline: style.is_some_and(|s| {
+                        !matches!(s.underline, libghostty_vt::style::Underline::None)
+                    }),
                     strikethrough: style.is_some_and(|s| s.strikethrough),
                     wide_spacer: false,
                 });
@@ -495,7 +531,10 @@ fn build(
         }
         line += 1;
     }
-    let modes_alt = matches!(term.active_screen(), Ok(libghostty_vt::screen::Screen::Alternate));
+    let modes_alt = matches!(
+        term.active_screen(),
+        Ok(libghostty_vt::screen::Screen::Alternate)
+    );
     let scrollbar = term.scrollbar().ok();
     Some(Snapshot {
         cells,

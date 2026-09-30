@@ -74,6 +74,10 @@ pub struct TerminalView {
     style: TerminalStyle,
     /// Frame build times, the basis of the heavy-output acceptance test.
     pub frames: Histogram,
+    /// The slowest frames since the histogram was last reset, each with the
+    /// part spent resizing and copying the screen out, so a long frame can be
+    /// put down to the engine or to drawing.
+    pub slow_frames: Vec<(Duration, Duration)>,
     /// Set when the pump has seen output that is not yet painted.
     pub dirty: bool,
     /// Last size announced to the remote, so window_change is sent once.
@@ -124,6 +128,7 @@ impl TerminalView {
             focus: cx.focus_handle(),
             style,
             frames: Histogram::new(),
+            slow_frames: Vec::new(),
             dirty: false,
             last_sent_size: None,
             pending_keystroke: None,
@@ -138,6 +143,30 @@ impl TerminalView {
             geometry: None,
             scroll_px: 0.0,
         }
+    }
+
+    /// Keep the five slowest frames.
+    fn note_slow_frame(&mut self, total: Duration, copy: Duration) {
+        self.slow_frames.push((total, copy));
+        self.slow_frames.sort_by_key(|f| std::cmp::Reverse(f.0));
+        self.slow_frames.truncate(5);
+    }
+
+    /// The five slowest frames, for a benchmark report.
+    pub fn slow_frames_report(&self) -> String {
+        let frames: Vec<String> = self
+            .slow_frames
+            .iter()
+            .map(|(total, copy)| {
+                format!(
+                    "{:.1} ms (copy {:.1}, draw {:.1})",
+                    total.as_secs_f64() * 1000.0,
+                    copy.as_secs_f64() * 1000.0,
+                    total.saturating_sub(*copy).as_secs_f64() * 1000.0
+                )
+            })
+            .collect();
+        format!("slowest frames: {}\n", frames.join(", "))
     }
 
     /// The grid's current size, so a reconnect can attach at the same shape.
@@ -545,6 +574,8 @@ pub struct PrepaintState {
     cell: CellSize,
     font_facts: FontFacts,
     started: Instant,
+    /// How long resizing and copying the screen out took, of the frame.
+    copy: Duration,
 }
 
 /// A horizontal stretch of cells sharing one style, shaped as a single line.
@@ -646,6 +677,7 @@ impl Element for TerminalElement {
         );
 
         // One lock, held only long enough to resize and copy the grid out.
+        let copy_started = Instant::now();
         let snapshot = {
             let view = self.view.read(cx);
             // Poisoned means the pump panicked mid-`advance`, so the grid may
@@ -658,6 +690,7 @@ impl Element for TerminalElement {
             term.resize(size, cell);
             term.snapshot()
         };
+        let copy = copy_started.elapsed();
 
         let selection = self.view.read(cx).selection;
         let runs = batch_runs(&snapshot);
@@ -671,6 +704,7 @@ impl Element for TerminalElement {
             cell,
             font_facts,
             started,
+            copy,
         }
     }
 
@@ -786,6 +820,7 @@ impl Element for TerminalElement {
         }
 
         let elapsed = state.started.elapsed();
+        let copy = state.copy;
         let frame_started = state.started;
         let painted_size = state.snapshot.size;
         let geometry = (origin, state.cell);
@@ -793,6 +828,7 @@ impl Element for TerminalElement {
         let painted_font = state.font_facts.clone();
         self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
+            view.note_slow_frame(elapsed, copy);
             view.dirty = false;
             view.sync_remote_size(painted_size);
             view.geometry = Some(geometry);
