@@ -23,8 +23,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/ghostty
       - run: cargo fmt --all --check
-      - run: cargo clippy -p berth-core -p berth-probe -p berth-term -p berth-timeline --all-targets
-      - run: cargo test -p berth-core -p berth-probe -p berth-term -p berth-timeline
+      - run: cargo clippy -p berth-core -p berth-probe -p berth-proto -p berth-term -p berth-timeline --all-targets
+      - run: cargo test -p berth-core -p berth-probe -p berth-proto -p berth-term -p berth-timeline
 
   # gpui only compiles as part of berth-app, and only on the platforms Berth
   # ships to. Everything that can be judged without a person at the window is
