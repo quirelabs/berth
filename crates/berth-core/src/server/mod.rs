@@ -16,6 +16,7 @@
 
 pub mod client;
 pub mod link;
+pub mod local;
 pub mod paths;
 pub mod supervisor;
 mod transport;

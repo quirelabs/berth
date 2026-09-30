@@ -68,6 +68,8 @@ enum Event {
     },
     WorkerSaid(SessionId, ToApp),
     WorkerGone(SessionId),
+    /// A client that fell behind has emptied its queue.
+    CaughtUp(ClientId),
 }
 
 struct Session {
@@ -77,11 +79,28 @@ struct Session {
     build: String,
 }
 
+/// One client's own bounded queue. The table never waits on a client: a full
+/// queue marks that client alone as behind, and nothing is queued for it
+/// while it is (D50). A slow client can so never hold up any other session or
+/// client.
+///
+/// Once its queue has drained, each session it is attached to is asked for a
+/// fresh screen, and that session's output is dropped for the client until
+/// the screen has gone out, so it never draws output on top of a gap. The
+/// sync piece refines what a client that falls behind is sent; this is what
+/// keeps it from staying behind for good.
+struct ClientQueue {
+    tx: mpsc::Sender<ToApp>,
+    behind: bool,
+    /// Sessions whose next screen this client must get before their output.
+    awaiting: HashSet<SessionId>,
+}
+
 struct State {
     config: Config,
     events: mpsc::Sender<Event>,
     sessions: HashMap<SessionId, Session>,
-    clients: HashMap<ClientId, mpsc::Sender<ToApp>>,
+    clients: HashMap<ClientId, ClientQueue>,
     /// Sessions being started, so an idle check does not exit under them.
     starting: usize,
     next_session: SessionId,
@@ -168,7 +187,7 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
         return;
     }
     let mut write = opened.write;
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             let Ok(payload) = message.encode() else {
                 continue;
@@ -179,16 +198,24 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
         }
     });
     let mut read = opened.read;
-    while let Ok(Some(payload)) = read.recv().await {
-        match ToServer::decode(&payload) {
-            Ok(message) => {
-                if events.send(Event::ClientSaid(id, message)).await.is_err() {
-                    break;
+    loop {
+        tokio::select! {
+            // The table dropped this client's queue: the supervisor is going,
+            // and the connection goes with it rather than lingering open.
+            _ = &mut writer => break,
+            received = read.recv() => {
+                let Ok(Some(payload)) = received else { break };
+                match ToServer::decode(&payload) {
+                    Ok(message) => {
+                        if events.send(Event::ClientSaid(id, message)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "a client sent something unreadable");
+                        break;
+                    }
                 }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "a client sent something unreadable");
-                break;
             }
         }
     }
@@ -204,20 +231,80 @@ fn copy_name(build: &str) -> Option<String> {
 }
 
 impl State {
-    async fn to_client(&self, client: ClientId, message: ToApp) {
-        if let Some(tx) = self.clients.get(&client) {
-            let _ = tx.send(message).await;
+    fn send_client(&mut self, client: ClientId, message: ToApp) {
+        let session = match &message {
+            ToApp::Output { session, .. }
+            | ToApp::Screen { session, .. }
+            | ToApp::History { session, .. }
+            | ToApp::Event { session, .. } => Some(*session),
+            _ => None,
+        };
+        let screen = matches!(message, ToApp::Screen { .. });
+        let events = self.events.clone();
+        let Some(queue) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if queue.behind {
+            return;
+        }
+        if let Some(session) = session
+            && queue.awaiting.contains(&session)
+        {
+            if !screen {
+                return;
+            }
+            queue.awaiting.remove(&session);
+        }
+        if let Err(mpsc::error::TrySendError::Full(_)) = queue.tx.try_send(message) {
+            tracing::warn!(client, "a client fell behind");
+            queue.behind = true;
+            let tx = queue.tx.clone();
+            tokio::spawn(async move {
+                // Drained, or gone: either way this watch is over.
+                while !tx.is_closed() && tx.capacity() < tx.max_capacity() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                drop(tx);
+                let _ = events.send(Event::CaughtUp(client)).await;
+            });
         }
     }
 
-    async fn to_attached(&self, session: SessionId, message: ToApp) {
-        let Some(entry) = self.sessions.get(&session) else {
+    fn send_attached(&mut self, session: SessionId, message: ToApp) {
+        let attached: Vec<ClientId> = match self.sessions.get(&session) {
+            Some(entry) => entry.attached.iter().copied().collect(),
+            None => return,
+        };
+        for client in attached {
+            self.send_client(client, message.clone());
+        }
+    }
+
+    /// A client caught up: every session it shows sends a fresh screen, which
+    /// it gets before any more of their output.
+    async fn caught_up(&mut self, client: ClientId) {
+        let attached: Vec<(SessionId, u16, u16)> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.attached.contains(&client))
+            .map(|(id, s)| (*id, s.info.cols, s.info.rows))
+            .collect();
+        let Some(queue) = self.clients.get_mut(&client) else {
             return;
         };
-        for client in &entry.attached {
-            if let Some(tx) = self.clients.get(client) {
-                let _ = tx.send(message.clone()).await;
-            }
+        queue.behind = false;
+        queue.awaiting = attached.iter().map(|(id, _, _)| *id).collect();
+        tracing::info!(client, sessions = attached.len(), "a client caught up");
+        for (session, cols, rows) in attached {
+            self.to_worker(
+                session,
+                ToServer::Attach {
+                    session,
+                    cols,
+                    rows,
+                },
+            )
+            .await;
         }
     }
 
@@ -231,7 +318,14 @@ impl State {
     async fn handle(&mut self, event: Event) {
         match event {
             Event::ClientUp(id, tx) => {
-                self.clients.insert(id, tx);
+                self.clients.insert(
+                    id,
+                    ClientQueue {
+                        tx,
+                        behind: false,
+                        awaiting: HashSet::new(),
+                    },
+                );
             }
             Event::ClientGone(id) => {
                 self.clients.remove(&id);
@@ -240,6 +334,7 @@ impl State {
                 }
             }
             Event::ClientSaid(id, message) => self.client_said(id, message).await,
+            Event::CaughtUp(id) => self.caught_up(id).await,
             Event::WorkerUp {
                 info,
                 to_worker,
@@ -258,7 +353,7 @@ impl State {
                     },
                 );
                 if let Some(client) = reply_to {
-                    self.to_client(client, ToApp::Created { session }).await;
+                    self.send_client(client, ToApp::Created { session });
                 }
             }
             Event::WorkerFailed {
@@ -269,14 +364,13 @@ impl State {
                 self.starting = self.starting.saturating_sub(1);
                 tracing::warn!(session, %why, "a worker did not start");
                 if let Some(client) = reply_to {
-                    self.to_client(
+                    self.send_client(
                         client,
                         ToApp::Refused {
                             what: format!("create session {session}"),
                             why,
                         },
-                    )
-                    .await;
+                    );
                 }
             }
             Event::WorkerSaid(session, message) => {
@@ -290,7 +384,7 @@ impl State {
                 if let ToApp::Sessions(_) = message {
                     return;
                 }
-                self.to_attached(session, message).await;
+                self.send_attached(session, message);
                 if ended {
                     self.sessions.remove(&session);
                 }
@@ -299,14 +393,13 @@ impl State {
                 // Gone without saying it exited: a crash. The tab says the
                 // session ended.
                 if self.sessions.contains_key(&session) {
-                    self.to_attached(
+                    self.send_attached(
                         session,
                         ToApp::Event {
                             session,
                             event: v1::Event::Exited { code: None },
                         },
-                    )
-                    .await;
+                    );
                     self.sessions.remove(&session);
                 }
             }
@@ -319,13 +412,15 @@ impl State {
                 let mut list: Vec<SessionInfo> =
                     self.sessions.values().map(|s| s.info.clone()).collect();
                 list.sort_by_key(|s| s.id);
-                self.to_client(client, ToApp::Sessions(list)).await;
+                self.send_client(client, ToApp::Sessions(list));
             }
             ToServer::Create {
                 name,
                 cwd,
                 cols,
                 rows,
+                pane,
+                resume,
             } => {
                 let session = self.next_session;
                 self.next_session += 1;
@@ -337,6 +432,8 @@ impl State {
                     cols,
                     rows,
                     shell: None,
+                    pane,
+                    resume,
                 };
                 self.start_worker(launch, client);
             }
@@ -346,8 +443,7 @@ impl State {
                 rows,
             } => {
                 let Some(entry) = self.sessions.get_mut(&session) else {
-                    self.refuse(client, format!("attach {session}"), "no such session")
-                        .await;
+                    self.refuse(client, format!("attach {session}"), "no such session");
                     return;
                 };
                 entry.attached.insert(client);
@@ -390,29 +486,31 @@ impl State {
         }
     }
 
-    async fn forward(&self, client: ClientId, session: SessionId, message: ToServer) {
+    async fn forward(&mut self, client: ClientId, session: SessionId, message: ToServer) {
         if !self.to_worker(session, message).await {
-            self.refuse(client, format!("session {session}"), "no such session")
-                .await;
+            self.refuse(client, format!("session {session}"), "no such session");
         }
     }
 
-    async fn refuse(&self, client: ClientId, what: String, why: &str) {
-        self.to_client(
+    fn refuse(&mut self, client: ClientId, what: String, why: &str) {
+        self.send_client(
             client,
             ToApp::Refused {
                 what,
                 why: why.into(),
             },
-        )
-        .await;
+        );
     }
 
     fn start_worker(&self, launch: Launch, reply_to: ClientId) {
         let session = launch.session;
         match &self.config.launcher {
             Launcher::Process { exe } => {
-                if let Err(error) = spawn_detached(exe, &launch.args()) {
+                let env = [
+                    (crate::env::WORKER_PANE, launch.pane.clone()),
+                    (crate::env::WORKER_RESUME, launch.resume.clone()),
+                ];
+                if let Err(error) = spawn_detached(exe, &launch.args(), &env) {
                     let events = self.events.clone();
                     tokio::spawn(async move {
                         let _ = events
@@ -567,8 +665,21 @@ where
 
 /// Start a process that outlives this one: its own process group on Unix,
 /// detached and out of the job object on Windows (D49).
-pub fn spawn_detached(exe: &std::path::Path, args: &[String]) -> std::io::Result<()> {
+///
+/// `env` sets or, where `None`, removes variables, so a value the supervisor
+/// happened to inherit never reaches a worker by accident.
+pub fn spawn_detached(
+    exe: &std::path::Path,
+    args: &[String],
+    env: &[(&str, Option<String>)],
+) -> std::io::Result<()> {
     let mut command = std::process::Command::new(exe);
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
     command
         .args(args)
         .stdin(std::process::Stdio::null())

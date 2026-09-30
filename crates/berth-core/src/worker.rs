@@ -184,6 +184,7 @@ impl Worker {
             cols,
             rows,
             claude: None,
+            pid: self.pty.local_pid(),
         }
     }
 
@@ -501,7 +502,9 @@ mod tests {
                     name: None,
                     cwd: None,
                     cols: 80,
-                    rows: 24
+                    rows: 24,
+                    pane: None,
+                    resume: None,
                 })
                 .await,
             Some(ToApp::Refused { .. })

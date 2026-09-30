@@ -28,6 +28,10 @@ pub struct Launch {
     pub rows: u16,
     /// Tests name a plain shell; a real session runs the login shell.
     pub shell: Option<Shell>,
+    /// The pane's Claude token and a conversation to resume (D48). Passed to
+    /// a worker process in its environment, never its arguments.
+    pub pane: Option<String>,
+    pub resume: Option<String>,
 }
 
 impl Launch {
@@ -58,6 +62,8 @@ impl Launch {
             cols: 80,
             rows: 24,
             shell: None,
+            pane: crate::env::worker_pane(),
+            resume: crate::env::worker_resume(),
         };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -98,7 +104,17 @@ impl Drop for PidFile {
 
 /// Run one session until its shell exits.
 pub async fn serve(places: Places, launch: Launch) -> Result<()> {
-    let pane = crate::claude::PaneEnv::new(crate::claude::base_dir().as_deref());
+    let mut pane = crate::claude::PaneEnv::new(crate::claude::base_dir().as_deref());
+    if let Some(token) = launch
+        .pane
+        .as_deref()
+        .and_then(crate::claude::PaneToken::parse)
+    {
+        pane.token = token;
+    }
+    if let Some(session) = &launch.resume {
+        pane = pane.resuming(session);
+    }
     let (worker, mut output) = Worker::start(Spec {
         session: launch.session,
         name: launch.name.clone(),
@@ -219,6 +235,8 @@ mod tests {
             cols: 120,
             rows: 40,
             shell: None,
+            pane: None,
+            resume: None,
         };
         let back = Launch::parse(&launch.args()).unwrap();
         assert_eq!(back.session, 12);

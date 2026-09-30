@@ -39,6 +39,12 @@
 //! `BERTH_RESUME` tells a wrapper which Claude conversation to resume before
 //! the first prompt.
 //!
+//! Two carry a session's Claude settings from the supervisor to the worker
+//! process it starts (D50), in the environment rather than the command line
+//! so other users cannot read them in the process list: `BERTH_WORKER_PANE`,
+//! the pane token for the worker's shell, and `BERTH_WORKER_RESUME`, a
+//! conversation for it to resume.
+//!
 //! Berth also reads variables it does not own: `SHELL` and `ComSpec` for the
 //! local shell, `USER` and `USERNAME` when ssh config names no user. Those stay
 //! where they are used, because they are the platform's answer to a question
@@ -71,6 +77,8 @@ pub const PIXEL_CHECK: &str = "BERTH_PIXEL_CHECK";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
 pub const TEST_OTHER_USER: &str = "BERTH_TEST_OTHER_USER";
+pub const WORKER_PANE: &str = "BERTH_WORKER_PANE";
+pub const WORKER_RESUME: &str = "BERTH_WORKER_RESUME";
 
 /// Every name above, so the test below can hold them to one shape.
 #[cfg(test)]
@@ -97,6 +105,8 @@ const NAMES: &[&str] = &[
     TEST_HOST,
     TEST_CLAUDE,
     TEST_OTHER_USER,
+    WORKER_PANE,
+    WORKER_RESUME,
 ];
 
 /// Unset and empty mean the same thing.
@@ -153,6 +163,16 @@ pub fn data() -> Option<PathBuf> {
 /// so a settings page has something to set.
 pub fn shell() -> Option<String> {
     text(SHELL)
+}
+
+/// The pane token a worker process's shell presents to Claude's hook.
+pub fn worker_pane() -> Option<String> {
+    text(WORKER_PANE)
+}
+
+/// The Claude conversation a worker process's shell resumes.
+pub fn worker_resume() -> Option<String> {
+    text(WORKER_RESUME)
 }
 
 /// The tmux session slug to use instead of the default.

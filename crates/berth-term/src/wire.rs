@@ -154,6 +154,117 @@ pub(crate) fn history(term: &Ghostty, first: u32, count: u32) -> Vec<v1::Row> {
         .collect()
 }
 
+/// A screen as the escape sequences that redraw it in a fresh terminal of
+/// the same size: how the app's copy takes a screen the worker sent. Colours
+/// stay as the program set them, so the app's palette applies; soft wraps are
+/// kept by letting a wrapped row run on into the next rather than placing it.
+pub fn replay(screen: &v1::Screen) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let mut out = String::from("\x1b[0m");
+    let flag = |on: bool| if on { 'h' } else { 'l' };
+    let m = &screen.modes;
+    let _ = write!(out, "\x1b[?1049{}", flag(m.alternate_screen));
+    out.push_str("\x1b[H\x1b[2J");
+    let _ = write!(
+        out,
+        "\x1b[?1{}\x1b[?2004{}\x1b[?1007{}",
+        flag(m.application_cursor),
+        flag(m.bracketed_paste),
+        flag(m.alternate_scroll)
+    );
+    // v1 says only whether the program reports the mouse, not which way;
+    // clicks with the SGR encoding are what Berth sends.
+    let _ = write!(
+        out,
+        "\x1b[?1000{}\x1b[?1006{}",
+        flag(m.mouse_reporting),
+        flag(m.mouse_reporting)
+    );
+
+    let mut placed_after_wrap = false;
+    for (y, row) in screen.lines.iter().enumerate() {
+        if !placed_after_wrap {
+            let _ = write!(out, "\x1b[{};1H", y + 1);
+        }
+        let last = row
+            .cells
+            .iter()
+            .rposition(|c| !is_blank(c))
+            .map_or(0, |i| i + 1);
+        // A wrapped row is written to the edge, so the next character wraps
+        // onto the next row exactly as it did in the program.
+        let end = if row.wrapped && y + 1 < screen.lines.len() {
+            row.cells.len()
+        } else {
+            last
+        };
+        let mut style: Option<(u16, v1::Color, v1::Color)> = None;
+        for cell in &row.cells[..end] {
+            if cell.width == 0 {
+                continue;
+            }
+            let now = (cell.style, cell.fg, cell.bg);
+            if style != Some(now) {
+                sgr(&mut out, cell);
+                style = Some(now);
+            }
+            if cell.text.is_empty() || cell.text.chars().any(char::is_control) {
+                out.push(' ');
+            } else {
+                out.push_str(&cell.text);
+            }
+        }
+        out.push_str("\x1b[0m");
+        placed_after_wrap = row.wrapped && end == row.cells.len() && y + 1 < screen.lines.len();
+    }
+    let _ = write!(
+        out,
+        "\x1b[{};{}H\x1b[?25{}",
+        screen.cursor.line + 1,
+        screen.cursor.column + 1,
+        flag(screen.cursor.visible)
+    );
+    out.into_bytes()
+}
+
+fn is_blank(cell: &v1::Cell) -> bool {
+    (cell.text.is_empty() || cell.text == " ")
+        && cell.bg == v1::Color::Default
+        && cell.style & (v1::style::UNDERLINE | v1::style::STRIKETHROUGH | v1::style::INVERSE) == 0
+}
+
+fn sgr(out: &mut String, cell: &v1::Cell) {
+    use std::fmt::Write as _;
+    use v1::style::*;
+    out.push_str("\x1b[0");
+    for (bit, code) in [
+        (BOLD, 1),
+        (FAINT, 2),
+        (ITALIC, 3),
+        (UNDERLINE, 4),
+        (BLINK, 5),
+        (INVERSE, 7),
+        (INVISIBLE, 8),
+        (STRIKETHROUGH, 9),
+    ] {
+        if cell.style & bit != 0 {
+            let _ = write!(out, ";{code}");
+        }
+    }
+    for (color, base) in [(cell.fg, 30u8), (cell.bg, 40u8)] {
+        match color {
+            v1::Color::Default => {}
+            v1::Color::Palette(n) => {
+                let _ = write!(out, ";{};5;{n}", base + 8);
+            }
+            v1::Color::Rgb(r, g, b) => {
+                let _ = write!(out, ";{};2;{r};{g};{b}", base + 8);
+            }
+        }
+    }
+    out.push('m');
+}
+
 #[cfg(test)]
 mod tests {
     use berth_proto::v1::{self, Color};
@@ -178,6 +289,36 @@ mod tests {
             .iter()
             .map(|c| c.text.as_str())
             .collect::<String>()
+    }
+
+    /// What the worker sends and the app replays is the same screen: cells,
+    /// colours as set, styles, wide glyphs, soft wraps, cursor and modes.
+    #[test]
+    fn a_replayed_screen_is_the_same_screen() {
+        let from = terminal(12, 6, 100);
+        from.advance(
+            "plain \x1b[1;31mred\x1b[0m\r\n\x1b[38;2;9;8;7;44mrgb on blue\x1b[0m\r\n\u{65e5}\u{672c}e\u{301} \x1b[4;7mu\x1b[0m\r\nwrapping onto the next row\x1b[?1h\x1b[?2004h\x1b[5;3H"
+                .as_bytes(),
+        );
+        let sent = from.wire_screen().unwrap();
+        let to = terminal(12, 6, 100);
+        to.advance(&super::replay(&sent));
+        let got = to.wire_screen().unwrap();
+        assert_eq!(got.lines, sent.lines);
+        assert_eq!(got.cursor, sent.cursor);
+        assert_eq!(got.modes, sent.modes);
+    }
+
+    #[test]
+    fn the_alternate_screen_is_replayed_as_one() {
+        let from = terminal(10, 3, 100);
+        from.advance(b"under\x1b[?1049h\x1b[Hover\x1b[?1000h");
+        let sent = from.wire_screen().unwrap();
+        let to = terminal(10, 3, 100);
+        to.advance(&super::replay(&sent));
+        let got = to.wire_screen().unwrap();
+        assert!(got.modes.alternate_screen && got.modes.mouse_reporting);
+        assert_eq!(got.lines, sent.lines);
     }
 
     /// Colours go out as the program set them, so the app's palette applies.

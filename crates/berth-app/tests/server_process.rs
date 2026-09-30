@@ -101,6 +101,8 @@ async fn sessions_run_in_worker_processes_that_outlive_the_supervisor() {
             cwd: Some(data.to_string_lossy().to_string()),
             cols: 80,
             rows: 24,
+            pane: None,
+            resume: None,
         })
         .await
         .unwrap();

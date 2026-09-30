@@ -23,21 +23,26 @@ pub struct Places {
 impl Places {
     /// The platform's places: under the local data directory
     /// (`~/Library/Application Support/berth` on macOS, `%LOCALAPPDATA%\berth`
-    /// on Windows), with the runtime directory under `$XDG_RUNTIME_DIR` on
-    /// Linux where there is one. `BERTH_DATA` moves all of it, for tests.
+    /// on Windows). `BERTH_DATA` moves all of it, for tests.
     pub fn standard() -> Option<Self> {
-        let base = match crate::env::data() {
-            Some(dir) => dir,
-            None => dirs::data_local_dir()?.join("berth"),
-        };
-        let run = match (crate::env::data(), dirs::runtime_dir()) {
-            (None, Some(runtime)) => runtime.join("berth"),
-            _ => base.join("run"),
-        };
-        Some(Self {
-            run,
+        if let Some(base) = crate::env::data() {
+            return Some(Self::under(&base));
+        }
+        let mut places = Self::under(&dirs::data_local_dir()?.join("berth"));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            places.run = linux_run(dirs::runtime_dir(), dirs::home_dir())?;
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        let _ = &mut places;
+        Some(places)
+    }
+
+    fn under(base: &Path) -> Self {
+        Self {
+            run: base.join("run"),
             bin: base.join("bin"),
-        })
+        }
     }
 
     /// Both directories, created, and the runtime one made private.
@@ -61,6 +66,18 @@ impl Places {
 
     pub fn worker_pid(&self, session: SessionId) -> PathBuf {
         self.run.join(format!("w{session}.pid"))
+    }
+}
+
+/// The runtime directory on Linux and other Unix: `$XDG_RUNTIME_DIR/berth`
+/// where a desktop login set one, and otherwise `~/.berth/run`, which is
+/// common on a server reached over SSH without one (step 3). Never `/tmp`,
+/// which every user shares and which is cleaned on its own schedule.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+fn linux_run(runtime: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    match runtime {
+        Some(runtime) => Some(runtime.join("berth")),
+        None => Some(home?.join(".berth").join("run")),
     }
 }
 
@@ -250,6 +267,19 @@ mod tests {
         ));
         let path = places.worker(u64::MAX);
         assert!(path.as_os_str().len() < 104, "{}", path.display());
+    }
+
+    #[test]
+    fn without_a_runtime_directory_linux_uses_one_under_home() {
+        assert_eq!(
+            linux_run(Some("/run/user/1000".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/run/user/1000/berth"))
+        );
+        assert_eq!(
+            linux_run(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.berth/run"))
+        );
+        assert_eq!(linux_run(None, None), None, "never a shared fallback");
     }
 
     #[test]

@@ -26,6 +26,12 @@ pub enum ToServer {
         cwd: Option<String>,
         cols: u16,
         rows: u16,
+        /// The pane's token, which Claude's hook presents with every signal
+        /// (D48): set as the shell's `BERTH_PANE`.
+        pane: Option<String>,
+        /// A Claude conversation for the shell's startup wrapper to resume
+        /// before its first prompt (D48). Only a strict UUID is used.
+        resume: Option<String>,
     },
     /// Show a session: a [`ToApp::Screen`] first, then its output from there.
     Attach {
@@ -105,6 +111,9 @@ pub struct SessionInfo {
     pub cols: u16,
     pub rows: u16,
     pub claude: Option<Claude>,
+    /// The shell's process, on the machine it runs on: how the app reads its
+    /// working directory to save a session (D46).
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

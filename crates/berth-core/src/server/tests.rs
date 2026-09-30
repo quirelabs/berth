@@ -87,6 +87,8 @@ async fn create(client: &mut Client) -> SessionId {
             cwd: None,
             cols: 40,
             rows: 10,
+            pane: None,
+            resume: None,
         })
         .await
         .unwrap();
@@ -94,6 +96,15 @@ async fn create(client: &mut Client) -> SessionId {
         if let ToApp::Created { session } = next(client).await {
             return session;
         }
+    }
+}
+
+/// Keep only the tail of a stream being searched, so a flood does not make
+/// every check slower than the last.
+fn keep_tail(text: &mut Vec<u8>) {
+    const TAIL: usize = 4096;
+    if text.len() > 2 * TAIL {
+        text.drain(..text.len() - TAIL);
     }
 }
 
@@ -106,6 +117,7 @@ async fn until_output(client: &mut Client, needle: &str) {
             if String::from_utf8_lossy(&text).contains(needle) {
                 return;
             }
+            keep_tail(&mut text);
         }
     }
 }
@@ -320,4 +332,194 @@ async fn a_session_that_does_not_exist_is_refused_by_name() {
         panic!("not refused");
     };
     assert_eq!(what, "attach 99");
+}
+
+/// A client that stops reading must not hold up anyone else: here it is
+/// attached to a session that floods, and another client in another session
+/// is still answered at once (D50).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_stops_reading_holds_up_no_one() {
+    let server = server().await;
+    let mut stuck = client::connect(&server.places).await.unwrap();
+    let flooding = create(&mut stuck).await;
+    attach(&mut stuck, flooding).await;
+
+    let mut app = client::connect(&server.places).await.unwrap();
+    let quiet = create(&mut app).await;
+    attach(&mut app, quiet).await;
+
+    // `stuck` never reads again from here, while its session prints far more
+    // than every queue and socket buffer between them holds.
+    type_line(&stuck, flooding, "yes berth_flood_line | head -n 6000000").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let started = std::time::Instant::now();
+    type_line(&app, quiet, "echo still_$((8*8))").await;
+    until_output(&mut app, "still_64").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the other session waited {:?}",
+        started.elapsed()
+    );
+    app.to_server.send(ToServer::ListSessions).await.unwrap();
+    loop {
+        if let ToApp::Sessions(list) = next(&mut app).await {
+            assert_eq!(list.len(), 2);
+            break;
+        }
+    }
+    drop(stuck);
+}
+
+/// A client that fell behind is not behind for good: once it reads again it
+/// gets a fresh screen before any more output, and its session carries on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_fell_behind_catches_up() {
+    let server = server().await;
+    let mut slow = client::connect(&server.places).await.unwrap();
+    let session = create(&mut slow).await;
+    attach(&mut slow, session).await;
+    type_line(&slow, session, "yes berth_flood_line | head -n 4000000").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Reading again: a screen arrives before long, then the session answers.
+    let screen = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(ToApp::Screen { .. }) = slow.from_server.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(screen.is_ok(), "no screen after catching up");
+    type_line(&slow, session, "echo back_$((2*3))").await;
+    until_output(&mut slow, "back_6").await;
+}
+
+mod through_the_app {
+    //! The app's side: sessions seen as ptys through `LocalServer`.
+    use super::*;
+    use crate::pty::PtyEvent;
+    use crate::server::local::{LocalServer, Start};
+    use tokio::sync::mpsc::Receiver;
+
+    /// Pty output until `needle` appears, as the app's pump would see it.
+    async fn until(events: &mut Receiver<PtyEvent>, needle: &str) -> String {
+        let mut text = Vec::new();
+        timeout(Duration::from_secs(15), async {
+            while let Some(event) = events.recv().await {
+                if let PtyEvent::Output(bytes) = event {
+                    text.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&text).contains(needle) {
+                        return;
+                    }
+                    keep_tail(&mut text);
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{needle:?} never came: {:?}",
+                String::from_utf8_lossy(&text)
+            )
+        });
+        String::from_utf8_lossy(&text).to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_is_a_pty_and_outlives_the_app() {
+        let server = server().await;
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let session = app.create(None, 40, 10, None, None).await.unwrap();
+        let (pty, mut events) = app.attach(session, 40, 10, None).await.unwrap();
+        pty.write(b"echo seen_$((9*9))\n".to_vec()).await;
+        until(&mut events, "seen_81").await;
+
+        // Closing the pane detaches: the session stays.
+        pty.close().await;
+        drop(pty);
+        drop(app);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A new app finds it, and its first output is the screen as it was.
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let list = app.list().await.unwrap();
+        assert_eq!(list.iter().map(|s| s.id).collect::<Vec<_>>(), vec![session]);
+        assert!(list[0].pid.is_some(), "the shell's pid is listed");
+        let (_pty, mut events) = app.attach(session, 40, 10, None).await.unwrap();
+        until(&mut events, "seen_81").await;
+    }
+
+    /// The supervisor goes away and comes back: the tab reattaches by itself
+    /// and keeps working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_supervisor_costs_the_tab_nothing() {
+        let server = server().await;
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let session = app.create(None, 40, 10, None, None).await.unwrap();
+        let (pty, mut events) = app.attach(session, 40, 10, None).await.unwrap();
+        pty.write(b"echo one_$((1+0))\n".to_vec()).await;
+        until(&mut events, "one_1").await;
+
+        server.supervisor.abort();
+        let _ = server.supervisor.await;
+        let _again = supervise(
+            server.places.clone(),
+            &server.tasks,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        // The screen comes back first, then the session answers again.
+        until(&mut events, "one_1").await;
+        let mut answered = false;
+        for _ in 0..40 {
+            pty.write(b"echo two_$((1+1))\n".to_vec()).await;
+            let got = timeout(Duration::from_millis(500), until(&mut events, "two_2")).await;
+            if got.is_ok() {
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "the session never answered after the restart");
+    }
+
+    /// A pane that stops taking output while its session floods falls
+    /// behind, is caught up with a screen, and holds up no other tab.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_that_falls_behind_catches_up_with_a_screen() {
+        let server = server().await;
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let flooding = app.create(None, 40, 10, None, None).await.unwrap();
+        let (flood_pty, mut flood_events) = app.attach(flooding, 40, 10, None).await.unwrap();
+        let quiet = app.create(None, 40, 10, None, None).await.unwrap();
+        let (quiet_pty, mut quiet_events) = app.attach(quiet, 40, 10, None).await.unwrap();
+
+        flood_pty
+            .write(b"yes berth_flood | head -n 3000000; echo flood_do\"\"ne\n".to_vec())
+            .await;
+        // Nobody reads the flooding pane for a while.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let started = std::time::Instant::now();
+        quiet_pty.write(b"echo quiet_$((6+6))\n".to_vec()).await;
+        until(&mut quiet_events, "quiet_12").await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Reading again, the flooding pane reaches the end.
+        until(&mut flood_events, "flood_done").await;
+    }
 }
