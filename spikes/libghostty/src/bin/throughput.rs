@@ -65,7 +65,26 @@ fn rate(bytes: &[u8], mut write: impl FnMut(&[u8])) -> f64 {
 }
 
 fn main() {
-    println!("{:<10} {:>16} {:>18} {:>14}", "stream", "ghostty, no hist", "ghostty, 10k lines", "alacritty 10k");
+    // `throughput <stream>`: one stream, libghostty only, for a profiler.
+    if let Some(only) = std::env::args().nth(1) {
+        let bytes = match only.as_str() {
+            "plain" => plain(),
+            "coloured" => coloured(),
+            "emoji" => emoji(),
+            "cjk" => unicode(),
+            _ => mixed(),
+        };
+        let mut term = libghostty_vt::Terminal::new(100, 30).expect("terminal");
+        let _ = term.set_scrollback_max_bytes(None);
+        let _ = term.set_scrollback_max_lines(Some(10_000));
+        let total: f64 = (0..3).map(|_| rate(&bytes, |c| term.vt_write(c))).sum();
+        println!("{only}: {:.0} MB/s", total / 3.0);
+        return;
+    }
+    println!(
+        "{:<10} {:>16} {:>18} {:>20} {:>14}",
+        "stream", "ghostty, no hist", "ghostty, 10k lines", "ghostty, 10k, malloc", "alacritty 10k"
+    );
     for (name, bytes) in [
         ("plain", plain()),
         ("coloured", coloured()),
@@ -83,11 +102,20 @@ fn main() {
         let _ = hist.set_scrollback_max_lines(Some(10_000));
         let b = rate(&bytes, |c| hist.vt_write(c));
 
+        // Every allocation through Rust's global allocator (malloc) rather
+        // than libghostty's own default, to see whether the allocator is the
+        // Linux difference.
+        let alloc = libghostty_vt::alloc::Allocator::GLOBAL;
+        let mut sys = libghostty_vt::Terminal::new_with_alloc(&alloc, 100, 30).expect("terminal");
+        let _ = sys.set_scrollback_max_bytes(None);
+        let _ = sys.set_scrollback_max_lines(Some(10_000));
+        let m = rate(&bytes, |c| sys.vt_write(c));
+
         let mut ala = berth_term::Terminal::new(
             berth_term::size::TermSize::new(100, 30),
             berth_term::size::CellSize::new(8.0, 16.0),
         );
         let c = rate(&bytes, |x| ala.advance(x));
-        println!("{name:<10} {a:>13.0} MB/s {b:>15.0} MB/s {c:>11.0} MB/s");
+        println!("{name:<10} {a:>13.0} MB/s {b:>15.0} MB/s {m:>17.0} MB/s {c:>11.0} MB/s");
     }
 }

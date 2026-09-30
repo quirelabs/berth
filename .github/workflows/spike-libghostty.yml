@@ -72,6 +72,16 @@ jobs:
       - name: Throughput by kind of output
         run: ./target/release/throughput
 
+      # Where the Linux time goes, if the runner permits perf.
+      - name: Profile the emoji stream on Linux
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" >/dev/null
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          perf record -q -g -o perf.data ./target/release/throughput emoji
+          perf report -i perf.data --stdio --no-children --percent-limit 2 2>/dev/null | grep -v "^$" | head -60
+
       # Linux parsed three times slower than the current engine on the first
       # run. The bindings build for a baseline x86 CPU by default, which leaves
       # out the vector paths; this measures the same report built for x86-64-v3.
