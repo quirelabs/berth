@@ -32,9 +32,30 @@ use crate::metrics::{Histogram, KeystrokeLatency, LatencyReport};
 pub type SharedTerminal = Arc<Terminal>;
 
 /// How long every vsync keeps looking for a newer screen after a keystroke
-/// while its echo is awaited. Past this, a key with no echo (a password, a
-/// program not drawing) stops costing anything.
-const ECHO_WAIT: Duration = Duration::from_secs(1);
+/// while its echo is awaited: about twice the recent echo time, within these
+/// bounds. Past it, a key with no echo (a password, a program not drawing)
+/// stops costing anything, and the echo that does come is shown the ordinary
+/// way, a frame later at worst.
+const ECHO_WAIT_FLOOR: Duration = Duration::from_millis(50);
+const ECHO_WAIT_CEILING: Duration = Duration::from_secs(1);
+
+/// How long to look for an echo, given the recent echo time. Until one has
+/// been measured, the ceiling.
+fn echo_wait(recent: Option<Duration>) -> Duration {
+    recent.map_or(ECHO_WAIT_CEILING, |recent| {
+        (recent * 2).clamp(ECHO_WAIT_FLOOR, ECHO_WAIT_CEILING)
+    })
+}
+
+/// Fold one echo time into the recent one, a quarter at a time, so one slow
+/// echo moves it but does not decide it. Output later than the ceiling is not
+/// taken for an echo: it is a command that took a while to print.
+fn fold_echo(recent: Option<Duration>, sample: Duration) -> Option<Duration> {
+    if sample >= ECHO_WAIT_CEILING {
+        return recent;
+    }
+    Some(recent.map_or(sample, |recent| (recent * 3 + sample) / 4))
+}
 
 /// What the output pump, on its own thread, shares with the view.
 #[derive(Default)]
@@ -45,6 +66,8 @@ pub struct Intake {
     keystroke: Mutex<Option<Instant>>,
     /// The echo, until a frame shows it.
     echo: Mutex<Option<Echo>>,
+    /// The recent keystroke-to-echo time, which sets how long to look.
+    recent_echo: Mutex<Option<Duration>>,
 }
 
 /// The first output after a keystroke.
@@ -82,9 +105,12 @@ impl Intake {
     pub fn arrived(&self, len: usize, seq: u64) {
         self.bytes.fetch_add(len as u64, Ordering::Relaxed);
         if let Some(sent) = lock(&self.keystroke).take() {
+            let round_trip = sent.elapsed();
+            let mut recent = lock(&self.recent_echo);
+            *recent = fold_echo(*recent, round_trip);
             *lock(&self.echo) = Some(Echo {
                 arrived: Instant::now(),
-                round_trip: sent.elapsed(),
+                round_trip,
                 seq,
             });
         }
@@ -103,7 +129,8 @@ impl Intake {
     /// Whether a keystroke's echo is still to reach the screen.
     fn awaiting_echo(&self) -> bool {
         lock(&self.echo).is_some()
-            || lock(&self.keystroke).is_some_and(|sent| sent.elapsed() < ECHO_WAIT)
+            || lock(&self.keystroke)
+                .is_some_and(|sent| sent.elapsed() < echo_wait(*lock(&self.recent_echo)))
     }
 }
 
@@ -1051,7 +1078,35 @@ fn batch_runs(snapshot: &Snapshot) -> Vec<CellRun> {
 
 #[cfg(test)]
 mod tests {
-    use super::{click_is_local, whole_lines};
+    use super::{click_is_local, echo_wait, fold_echo, whole_lines};
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn the_echo_is_looked_for_twice_as_long_as_it_takes() {
+        assert_eq!(echo_wait(Some(MS * 40)), MS * 80);
+    }
+
+    /// Before any echo, and on a link too slow to bound, the full second.
+    #[test]
+    fn the_wait_is_bounded_both_ways() {
+        assert_eq!(echo_wait(None), Duration::from_secs(1));
+        assert_eq!(echo_wait(Some(MS * 5)), MS * 50);
+        assert_eq!(echo_wait(Some(MS * 900)), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn one_slow_echo_moves_the_recent_time_without_deciding_it() {
+        let recent = fold_echo(Some(MS * 40), MS * 200);
+        assert_eq!(recent, Some(MS * 80));
+    }
+
+    /// A command that prints after two seconds is not an echo.
+    #[test]
+    fn late_output_is_not_taken_for_an_echo() {
+        assert_eq!(fold_echo(Some(MS * 40), MS * 2000), Some(MS * 40));
+        assert_eq!(fold_echo(None, MS * 30), Some(MS * 30));
+    }
 
     const LINE: f32 = 16.0;
 
