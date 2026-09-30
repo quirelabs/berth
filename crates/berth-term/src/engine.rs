@@ -27,6 +27,8 @@ use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{Palette as GhosttyPalette, RgbColor, Underline};
 use libghostty_vt::terminal::{Mode, ScrollViewport};
 
+use berth_proto::v1;
+
 use crate::shell::{Piece, Scanner, ShellEvent};
 use crate::size::{CellSize, TermSize};
 use crate::terminal::{
@@ -51,6 +53,43 @@ enum Command {
     Palette(Palette),
     /// The live screen as escape sequences, wherever the view is scrolled to.
     LiveScreen(mpsc::SyncSender<String>),
+    /// The active screen in Berth's wire format.
+    WireScreen(mpsc::SyncSender<Option<v1::Screen>>),
+    /// How many history lines the primary screen holds.
+    HistoryHeld(mpsc::SyncSender<usize>),
+    /// History lines older than `before`, or the newest if `None`.
+    WireHistory {
+        before: Option<u64>,
+        max: u32,
+        reply: mpsc::SyncSender<WireHistory>,
+    },
+}
+
+/// How much history a terminal keeps. Both limits apply and the first reached
+/// wins (D49), so both are always stated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scrollback {
+    pub lines: Option<usize>,
+    pub bytes: Option<usize>,
+}
+
+impl Scrollback {
+    /// The app's own copy of a screen: the line count Berth means, and no byte
+    /// limit, which left in silently caps the history far below the line count
+    /// (found in the D49 spike).
+    pub const VIEW: Scrollback = Scrollback {
+        lines: Some(SCROLLBACK_LINES),
+        bytes: None,
+    };
+}
+
+/// History lines as the wire has them: newest first, numbered.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WireHistory {
+    /// The number of the first line in `lines`, counted from the first line
+    /// the session ever produced. Meaningless when `lines` is empty.
+    pub newest: u64,
+    pub lines: Vec<v1::Row>,
 }
 
 /// A command, numbered in the order it was sent.
@@ -108,10 +147,10 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(size: TermSize, cell_size: CellSize) -> Self {
-        Self::with_scrollback(size, cell_size, SCROLLBACK_LINES)
+        Self::with_scrollback(size, cell_size, Scrollback::VIEW)
     }
 
-    pub(crate) fn with_scrollback(size: TermSize, cell_size: CellSize, lines: usize) -> Self {
+    pub fn with_scrollback(size: TermSize, cell_size: CellSize, scrollback: Scrollback) -> Self {
         let palette = Palette::default();
         let shared = Arc::new(Shared {
             published: Mutex::new(Published {
@@ -132,7 +171,7 @@ impl Terminal {
         let spawned = std::thread::Builder::new()
             .name("berth-terminal".into())
             .spawn(move || {
-                match Engine::new(size, cell_size, lines, for_engine.clone()) {
+                match Engine::new(size, cell_size, scrollback, for_engine.clone()) {
                     Some(engine) => engine.run(rx),
                     None => tracing::warn!("libghostty could not create a terminal"),
                 }
@@ -362,6 +401,36 @@ impl Terminal {
     /// and the cursor position. It is how a local session's last screen is
     /// kept across a quit. Always the live grid, never wherever the view was
     /// scrolled to, and never the scrollback.
+    /// The active screen in Berth's wire format, with everything sent so far
+    /// on it: colours as the program set them, for another copy to draw with
+    /// its own palette.
+    pub fn wire_screen(&self) -> Option<v1::Screen> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Command::WireScreen(tx));
+        rx.recv_timeout(CATCH_UP_LIMIT).ok().flatten()
+    }
+
+    /// Up to `max` history lines older than line `before`, or the newest
+    /// ones, newest first. Lines are numbered from the first the terminal
+    /// ever produced, so ranges fetched at different times fit together. The
+    /// alternate screen has no history, and gives none.
+    pub fn wire_history(&self, before: Option<u64>, max: u32) -> WireHistory {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Command::WireHistory {
+            before,
+            max,
+            reply: tx,
+        });
+        rx.recv_timeout(CATCH_UP_LIMIT).unwrap_or_default()
+    }
+
+    /// How many history lines the primary screen holds now.
+    pub fn history_held(&self) -> usize {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Command::HistoryHeld(tx));
+        rx.recv_timeout(CATCH_UP_LIMIT).unwrap_or(0)
+    }
+
     pub fn screen_ansi(&self) -> String {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(Command::LiveScreen(tx));
@@ -456,9 +525,9 @@ fn ghostty_rgb(c: Rgb) -> RgbColor {
     }
 }
 
-type Ghostty = libghostty_vt::Terminal<'static, 'static>;
+pub(crate) type Ghostty = libghostty_vt::Terminal<'static, 'static>;
 
-fn modes_of(term: &Ghostty) -> Modes {
+pub(crate) fn modes_of(term: &Ghostty) -> Modes {
     Modes {
         alternate_screen: matches!(
             term.active_screen(),
@@ -495,16 +564,76 @@ struct Engine {
     shell_events: Vec<ShellEvent>,
     agent_signals: Vec<String>,
     seen_shell_marker: bool,
+    numbering: Numbering,
+    /// The most bytes parsed between two numbering updates.
+    slice: usize,
+}
+
+/// Numbers history lines so that a line keeps its number for as long as it
+/// is held, and no number is ever used twice. libghostty's own history
+/// coordinates start at whatever is oldest now, and shift every time old
+/// lines are pruned.
+///
+/// A tracked reference sits on the bottom row of the live screen, and is put
+/// back there after every slice of a write. How far it moved up in the full
+/// screen is how many lines were pruned in between. libghostty prunes a whole
+/// page at a time, and a page can reach past every row that existed before the
+/// slice, the reference's included (found 2026-09-30). Then nothing that was
+/// ever numbered is left, and the rows that remain are numbered on from past
+/// the reference. The numbers can so fall behind the count of lines the
+/// session produced, but never collide.
+///
+/// Physical lines: a resize that reflows renumbers what it moves, so history
+/// fetched before a resize is fetched again after it.
+#[derive(Default)]
+struct Numbering {
+    /// Lines pruned since the start, which is the number of the oldest line
+    /// held.
+    pruned: u64,
+    anchor: Option<(libghostty_vt::screen::TrackedGridRef, u32)>,
+}
+
+impl Numbering {
+    /// Account for what changed since the last call. Only the primary screen
+    /// has history; while the alternate one is up the primary does not move.
+    fn update(&mut self, term: &Ghostty) {
+        use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
+        if modes_of(term).alternate_screen {
+            return;
+        }
+        if let Some((anchor, was)) = &self.anchor {
+            match anchor.point(PointSpace::Screen) {
+                Ok(Some(now)) => {
+                    self.pruned += u64::from(was.saturating_sub(now.y));
+                }
+                // Pruned with its page. Every row older went too, so every
+                // line ever numbered is gone: the survivors are rows this
+                // slice made, never numbered, and numbering them from here
+                // cannot collide with anything already sent.
+                _ => self.pruned += u64::from(*was) + 1,
+            }
+        }
+        let bottom = u32::from(term.rows().unwrap_or(1).saturating_sub(1));
+        self.anchor = term
+            .track_grid_ref(Point::Active(PointCoordinate { x: 0, y: bottom }))
+            .ok()
+            .and_then(|anchor| {
+                let at = anchor.point(PointSpace::Screen).ok()??.y;
+                Some((anchor, at))
+            });
+    }
 }
 
 impl Engine {
-    fn new(size: TermSize, cell_size: CellSize, lines: usize, shared: Arc<Shared>) -> Option<Self> {
+    fn new(
+        size: TermSize,
+        cell_size: CellSize,
+        scrollback: Scrollback,
+        shared: Arc<Shared>,
+    ) -> Option<Self> {
         let mut term = libghostty_vt::Terminal::new(size.cols.max(1), size.rows.max(1)).ok()?;
-        // Both limits apply and the first reached wins. Lines is the one Berth
-        // means, so the byte limit goes: left in, it silently caps the history
-        // far below the line count (found in the D49 spike).
-        term.set_scrollback_max_bytes(None).ok()?;
-        term.set_scrollback_max_lines(Some(lines)).ok()?;
+        term.set_scrollback_max_bytes(scrollback.bytes).ok()?;
+        term.set_scrollback_max_lines(scrollback.lines).ok()?;
         let mut engine = Self {
             term,
             screen: Screen::new()?,
@@ -518,7 +647,10 @@ impl Engine {
             shell_events: Vec::new(),
             agent_signals: Vec::new(),
             seen_shell_marker: false,
+            numbering: Numbering::default(),
+            slice: scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096),
         };
+        engine.numbering.update(&engine.term);
         engine.apply_palette(Palette::default());
         Some(engine)
     }
@@ -563,6 +695,7 @@ impl Engine {
                     cell_size.height.max(1.0) as u32,
                 );
                 let _ = self.term.resize(size.cols.max(1), size.rows.max(1), w, h);
+                self.numbering.update(&self.term);
                 self.cell_size = cell_size;
                 self.rebuild = true;
             }
@@ -570,6 +703,20 @@ impl Engine {
             Command::Palette(palette) => self.apply_palette(palette),
             Command::LiveScreen(reply) => {
                 let _ = reply.send(self.live_screen());
+            }
+            Command::WireScreen(reply) => {
+                let _ = reply.send(crate::wire::screen(&self.term));
+            }
+            Command::HistoryHeld(reply) => {
+                let held = if modes_of(&self.term).alternate_screen {
+                    0
+                } else {
+                    self.term.scrollback_rows().unwrap_or(0)
+                };
+                let _ = reply.send(held);
+            }
+            Command::WireHistory { before, max, reply } => {
+                let _ = reply.send(self.wire_history(before, max));
             }
         }
     }
@@ -584,7 +731,12 @@ impl Engine {
         let mut scanner = std::mem::take(&mut self.scanner);
         for piece in scanner.scan(bytes) {
             match piece {
-                Piece::Bytes(bytes) => self.term.vt_write(bytes),
+                Piece::Bytes(bytes) => {
+                    for slice in bytes.chunks(self.slice) {
+                        self.term.vt_write(slice);
+                        self.numbering.update(&self.term);
+                    }
+                }
                 Piece::Marker(kind) => {
                     self.seen_shell_marker = true;
                     self.shell_events.push(ShellEvent {
@@ -596,6 +748,28 @@ impl Engine {
             }
         }
         self.scanner = scanner;
+    }
+
+    fn wire_history(&self, before: Option<u64>, max: u32) -> WireHistory {
+        if modes_of(&self.term).alternate_screen {
+            return WireHistory::default();
+        }
+        let held = self.term.scrollback_rows().unwrap_or(0) as u64;
+        let oldest = self.numbering.pruned;
+        // One past the newest line wanted, in libghostty's coordinates.
+        let end = match before {
+            Some(before) => before.saturating_sub(oldest).min(held),
+            None => held,
+        };
+        let count = end.min(u64::from(max));
+        if count == 0 {
+            return WireHistory::default();
+        }
+        let first = end - count;
+        WireHistory {
+            newest: oldest + end - 1,
+            lines: crate::wire::history(&self.term, first as u32, count as u32),
+        }
     }
 
     fn scroll(&mut self, scroll: Scroll) {

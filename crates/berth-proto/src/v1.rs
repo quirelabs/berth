@@ -75,8 +75,11 @@ pub enum ToApp {
         screen: Packed,
     },
     /// History lines, a packed `Vec<Row>`, newest first: line `newest`, then
-    /// `newest - 1`, and so on. Lines are numbered from the first the session
-    /// ever produced. Sent on its own, lower-priority stream (D49).
+    /// `newest - 1`, and so on. Numbers grow with the output, a line keeps its
+    /// number while the server holds it, and none is used twice in a session,
+    /// so ranges sent at different times fit together. They can run behind
+    /// the count of lines produced. Sent on its own, lower-priority stream
+    /// (D49).
     History {
         session: SessionId,
         newest: u64,

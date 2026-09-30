@@ -6,7 +6,16 @@
 /// Namespace for every session Berth creates, so `remove` can find them all.
 pub const SESSION_PREFIX: &str = "berth/";
 pub const DEFAULT_SLUG: &str = "main";
+/// What Berth's terminal says it is (D51). xterm-256color because every host
+/// has its terminfo; Ghostty's own `xterm-ghostty` would follow the user into
+/// nested ssh sessions on hosts without it, where programs then fail with
+/// "unknown terminal".
 pub const TERM: &str = "xterm-256color";
+/// The engine draws 24-bit colour, and terminfo has no reliable way to say so.
+pub const COLORTERM: &str = "truecolor";
+/// How a program can tell it is in Berth, as `TERM` no longer can.
+pub const TERM_PROGRAM: &str = "Berth";
+pub const TERM_PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {

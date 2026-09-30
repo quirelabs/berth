@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::error::{Error, Result};
 use crate::pty::{INPUT_QUEUE_SIZE, OUTPUT_QUEUE_SIZE, Pty, PtyEvent, PtyInput};
-use crate::session::TERM;
+use crate::session::{COLORTERM, TERM, TERM_PROGRAM, TERM_PROGRAM_VERSION};
 
 /// Read at most this much per wakeup. Matches the ssh side's appetite: output
 /// arrives far faster than a UI can paint, and the pump coalesces anyway.
@@ -159,6 +159,84 @@ fn startup_wrapper(shell: &str, pane: &crate::claude::PaneEnv) -> Option<Wrapper
     }
 }
 
+/// What a shell inherits from the process that starts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Environment {
+    /// Everything, as the app's local shells have always had.
+    Inherit,
+    /// Only the variables a login shell needs to find the user, their locale,
+    /// their agent and their temporary directory ([`carried`]); Berth adds its
+    /// own. For a session in a worker, which must not depend on whatever
+    /// happened to start the supervisor (D51).
+    Clean,
+}
+
+/// Whether a variable is carried into a [`Environment::Clean`] shell.
+pub fn carried(name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        const KEEP: &[&str] = &[
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "PATH",
+            "LANG",
+            "LANGUAGE",
+            "TZ",
+            "TMPDIR",
+            "SSH_AUTH_SOCK",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_STATE_HOME",
+            "ZDOTDIR",
+            "__CF_USER_TEXT_ENCODING",
+        ];
+        KEEP.contains(&name) || name.starts_with("LC_")
+    }
+    #[cfg(windows)]
+    {
+        const KEEP: &[&str] = &[
+            "ALLUSERSPROFILE",
+            "APPDATA",
+            "COMMONPROGRAMFILES",
+            "COMMONPROGRAMFILES(X86)",
+            "COMMONPROGRAMW6432",
+            "COMPUTERNAME",
+            "COMSPEC",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LANG",
+            "LOCALAPPDATA",
+            "NUMBER_OF_PROCESSORS",
+            "OS",
+            "PATH",
+            "PATHEXT",
+            "PROCESSOR_ARCHITECTURE",
+            "PROGRAMDATA",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "PROGRAMW6432",
+            "PSMODULEPATH",
+            "PUBLIC",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERDOMAIN",
+            "USERNAME",
+            "USERPROFILE",
+            "WINDIR",
+        ];
+        // Names are case-insensitive on Windows.
+        KEEP.contains(&name.to_ascii_uppercase().as_str())
+    }
+}
+
 /// Open a named shell, optionally as a login shell.
 ///
 /// Split out from [`open`] so the tests can drive a plain `sh` in a known
@@ -173,6 +251,19 @@ pub async fn open_with(
     cols: u16,
     rows: u16,
 ) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
+    open_shell(shell, login, cwd, pane, cols, rows, Environment::Inherit).await
+}
+
+/// As [`open_with`], choosing what the shell inherits.
+pub async fn open_shell(
+    shell: &str,
+    login: bool,
+    cwd: Option<&std::path::Path>,
+    pane: Option<&crate::claude::PaneEnv>,
+    cols: u16,
+    rows: u16,
+    environment: Environment,
+) -> Result<(Pty, mpsc::Receiver<PtyEvent>)> {
     let size = PtySize {
         rows: rows.max(1),
         cols: cols.max(1),
@@ -185,6 +276,14 @@ pub async fn open_with(
         .map_err(|e| Error::Pty(format!("could not open a local pty: {e}")))?;
 
     let mut command = CommandBuilder::new(shell);
+    if environment == Environment::Clean {
+        command.env_clear();
+        for (name, value) in std::env::vars_os() {
+            if name.to_str().is_some_and(carried) {
+                command.env(name, value);
+            }
+        }
+    }
     let wrapper = pane.and_then(|p| startup_wrapper(shell, p));
     match &wrapper {
         // bash is started on Berth's init file, which does what a login shell
@@ -234,6 +333,9 @@ pub async fn open_with(
     // The parser is a real terminal, so say so. Without this, programs fall
     // back to line mode or refuse to run.
     command.env("TERM", TERM);
+    command.env("COLORTERM", COLORTERM);
+    command.env("TERM_PROGRAM", TERM_PROGRAM);
+    command.env("TERM_PROGRAM_VERSION", TERM_PROGRAM_VERSION);
     if let Some(pane) = pane {
         command.env(crate::env::PANE, pane.token.as_str());
         // The hook has no terminal of its own, so it is told where this

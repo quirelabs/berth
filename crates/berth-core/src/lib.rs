@@ -16,6 +16,7 @@ pub mod restore;
 pub mod session;
 pub mod settings;
 pub mod transport;
+pub mod worker;
 
 pub use error::{Error, Result};
 pub use host::Host;

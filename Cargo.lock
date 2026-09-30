@@ -595,6 +595,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "berth-probe",
+ "berth-proto",
  "berth-term",
  "dirs",
  "notify",
@@ -638,6 +639,7 @@ dependencies = [
 name = "berth-term"
 version = "0.1.0"
 dependencies = [
+ "berth-proto",
  "libghostty-vt",
  "proptest",
  "thiserror 2.0.20",
