@@ -103,9 +103,7 @@ impl Workspace {
     ) -> u64 {
         let palette = crate::terminal_style::TerminalStyle::default().palette;
         let terminal = session::terminal_for(saved.cols, saved.rows, palette);
-        if let Ok(mut term) = terminal.lock() {
-            term.advance(saved.screen.as_bytes());
-        }
+        terminal.advance(saved.screen.as_bytes());
         let font_size = self.settings.font_size;
         let view = cx.new(|cx| {
             let mut style = crate::terminal_style::TerminalStyle::default();
@@ -183,9 +181,9 @@ impl Workspace {
                     if let Some(session) = &type_it {
                         resume_claude(&pty, session);
                     }
-                    view.update(cx, |view, cx| {
+                    view.update(cx, |view, _| {
                         view.resume(pty);
-                        session::start_pump(&cx.entity(), events, cx);
+                        session::start_pump(view, events);
                     });
                     cx.notify();
                 }

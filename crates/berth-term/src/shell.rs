@@ -9,7 +9,8 @@
 //! - `OSC 133 ; C ST` output start, the command is now running
 //! - `OSC 133 ; D ; <exit> ST` command end, with the exit code
 //!
-//! alacritty ignores these, so they are scanned out of the byte stream here.
+//! The engine has no use for these, so they are scanned out of the byte stream
+//! here.
 //!
 //! The same scanner also picks out Berth's own agent signal,
 //! `OSC 7717 ; berth ; ...` (D48), which a Claude Code hook writes into the

@@ -183,10 +183,10 @@ impl Workspace {
                 let Some(view) = this.pane(id).map(|p| p.view.clone()) else {
                     continue;
                 };
-                view.update(cx, |view, cx| {
+                view.update(cx, |view, _| {
                     // The grid is untouched. tmux repaints over it in place.
                     view.swap_pty(attached.pty.clone());
-                    session::start_pump(&cx.entity(), attached.events, cx);
+                    session::start_pump(view, attached.events);
                 });
             }
             let Some(conn) = this.conns.get_mut(alias) else {
@@ -309,6 +309,29 @@ impl Workspace {
         .detach();
     }
 
+    /// The local heavy-output benchmark, in the local shell that just opened.
+    pub(super) async fn run_local_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        if crate::bench::Bench::from_env() != Some(crate::bench::Bench::LocalCat) {
+            return;
+        }
+        let Ok(Some((view, pty))) = this.read_with(cx, |this, _| {
+            let pane = this.focused()?;
+            Some((
+                pane.view.downgrade(),
+                pane.view.read_with(cx, |v, _| v.pty())?,
+            ))
+        }) else {
+            return;
+        };
+        let report = crate::bench::run_local_cat(view, pty, cx).await;
+        println!("\n{}", report.text);
+        if !report.passed {
+            eprintln!("benchmark did not meet its criteria");
+            crate::bench::mark_failed();
+        }
+        cx.update(|cx| cx.quit());
+    }
+
     /// Drive the real render loop for a benchmark, then quit.
     pub(super) async fn run_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
         let Some(mode) = crate::bench::Bench::from_env() else {
@@ -351,6 +374,8 @@ impl Workspace {
             crate::bench::Bench::Keys => {
                 crate::bench::run_keys(view, pty, 40, refresh_hz(), cx).await
             }
+            // Local only; started from `run_local_benchmark`.
+            crate::bench::Bench::LocalCat => return,
         };
         println!("\n{}", report.text);
         let _ = runtime::spawn(async move {

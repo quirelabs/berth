@@ -86,7 +86,9 @@ impl Screen {
                 );
             }
             match timeout(left, rx.recv()).await {
-                Ok(Some(PtyEvent::Output(bytes))) => self.terminal.advance(&bytes),
+                Ok(Some(PtyEvent::Output(bytes))) => {
+                    self.terminal.advance(&bytes);
+                }
                 Ok(Some(PtyEvent::Closed)) | Ok(None) => {
                     if predicate(&self.terminal) {
                         return;

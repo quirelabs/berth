@@ -1,0 +1,37 @@
+name: libghostty-vt build inputs
+description: >
+  Zig 0.16.0 from ziglang.org and Ghostty's source at the pinned commit, both
+  checked against their SHA-256, so berth-term's engine can build (D49). No
+  third-party action, and the build itself never fetches anything.
+
+runs:
+  using: composite
+  steps:
+    - name: Zig 0.16.0
+      shell: bash
+      run: |
+        set -eux
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Windows-X64) zig=zig-x86_64-windows-0.16.0; archive=zip; sha256=68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e ;;
+          macOS-ARM64) zig=zig-aarch64-macos-0.16.0; archive=tar.xz; sha256=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+          Linux-X64) zig=zig-x86_64-linux-0.16.0; archive=tar.xz; sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+          *) echo "no pinned Zig for ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+        esac
+        # Git Bash on Windows gets Windows paths from the runner; convert them
+        # for the shell and back for GITHUB_PATH.
+        tmp="$RUNNER_TEMP"
+        if command -v cygpath >/dev/null; then tmp=$(cygpath -u "$RUNNER_TEMP"); fi
+        file="$zig.$archive"
+        curl -sSfL -o "$tmp/$file" "https://ziglang.org/download/0.16.0/$file"
+        if command -v sha256sum >/dev/null; then sum=$(sha256sum "$tmp/$file" | cut -d' ' -f1); else sum=$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1); fi
+        test "$sum" = "$sha256"
+        cd "$tmp"
+        if [ "$archive" = zip ]; then unzip -q "$file"; else tar -xJf "$file"; fi
+        dir="$tmp/$zig"
+        if command -v cygpath >/dev/null; then dir=$(cygpath -w "$dir"); fi
+        echo "$dir" >> "$GITHUB_PATH"
+
+    # Where .cargo/config.toml points the build.
+    - name: Ghostty source
+      shell: bash
+      run: sh scripts/fetch-ghostty.sh

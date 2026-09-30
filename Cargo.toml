@@ -41,7 +41,10 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "33375c34
 # russh-keys crate is stale at 0.49 and is not used. The default aws-lc-rs
 # backend needs NASM to build on Windows, so ring is used instead.
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
-alacritty_terminal = "0.26"
+# The terminal engine (D49): libghostty-vt through its Rust bindings, pinned to
+# the commit whose snapshot API Berth uses. Built from Ghostty's source with
+# Zig 0.16.0; see .cargo/config.toml and scripts/fetch-ghostty.sh.
+libghostty-vt = { git = "https://github.com/quirelabs/libghostty-rs-mirror", rev = "8953a740bc378cec3e07e1f6ca949f0595eab19b" }
 # Local PTYs on three platforms. Unix is openpty plus fork and exec, but Windows
 # ConPTY is fiddly enough that owning it would be days of work and then ours
 # forever. This is wezterm's, actively maintained, and the seam it sits behind
@@ -73,3 +76,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Without debug info the bindings build libghostty-vt with Zig's ReleaseFast
+# rather than Debug, which parses slowly enough to stall a test on a megabyte.
+[profile.dev.package.libghostty-vt-sys]
+debug = false

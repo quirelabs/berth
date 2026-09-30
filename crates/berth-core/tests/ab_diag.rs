@@ -34,7 +34,7 @@ macro_rules! host_or_skip {
 }
 
 /// Pump for a while, feeding everything into a terminal.
-async fn pump(terminal: &mut Terminal, rx: &mut mpsc::Receiver<PtyEvent>, ms: u64) {
+async fn pump(terminal: &Terminal, rx: &mut mpsc::Receiver<PtyEvent>, ms: u64) {
     let deadline = std::time::Instant::now() + Duration::from_millis(ms);
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -42,7 +42,9 @@ async fn pump(terminal: &mut Terminal, rx: &mut mpsc::Receiver<PtyEvent>, ms: u6
             return;
         }
         match timeout(left, rx.recv()).await {
-            Ok(Some(PtyEvent::Output(bytes))) => terminal.advance(&bytes),
+            Ok(Some(PtyEvent::Output(bytes))) => {
+                terminal.advance(&bytes);
+            }
             Ok(Some(_)) | Ok(None) => return,
             Err(_) => return,
         }
@@ -69,43 +71,43 @@ async fn what_survives_tmux() {
 
     // --- A: a plain shell, no tmux ---
     let (pty, mut rx) = conn.open_shell(100, 30).await.unwrap();
-    let mut plain = Terminal::new(TermSize::new(100, 30), CellSize::new(8.0, 16.0));
+    let plain = Terminal::new(TermSize::new(100, 30), CellSize::new(8.0, 16.0));
     pty.write("bash --norc --noprofile -i\n").await;
-    pump(&mut plain, &mut rx, 1200).await;
+    pump(&plain, &mut rx, 1200).await;
     pty.write("source /tmp/berth_si.sh\n").await;
-    pump(&mut plain, &mut rx, 1200).await;
+    pump(&plain, &mut rx, 1200).await;
     plain.drain_shell_events();
     let alt_before_plain = plain.alternate_screen();
     pty.write("(exit 7)\n").await;
-    pump(&mut plain, &mut rx, 1500).await;
+    pump(&plain, &mut rx, 1500).await;
     let plain_events = plain.drain_shell_events();
     pty.write("vim -u NONE\n").await;
-    pump(&mut plain, &mut rx, 2500).await;
+    pump(&plain, &mut rx, 2500).await;
     let alt_in_vim_plain = plain.alternate_screen();
     pty.write(":q!\n").await;
-    pump(&mut plain, &mut rx, 1500).await;
+    pump(&plain, &mut rx, 1500).await;
     let alt_after_vim_plain = plain.alternate_screen();
     pty.close().await;
 
     // --- B: the same through tmux, which is how Berth actually runs ---
     let session = Session::new("abdiag", 100, 30);
     let (pty2, mut rx2) = conn.open_session(&session).await.unwrap();
-    let mut through = Terminal::new(TermSize::new(100, 30), CellSize::new(8.0, 16.0));
-    pump(&mut through, &mut rx2, 1500).await;
+    let through = Terminal::new(TermSize::new(100, 30), CellSize::new(8.0, 16.0));
+    pump(&through, &mut rx2, 1500).await;
     let alt_after_attach = through.alternate_screen();
     pty2.write("bash --norc --noprofile -i\n").await;
-    pump(&mut through, &mut rx2, 1200).await;
+    pump(&through, &mut rx2, 1200).await;
     pty2.write("source /tmp/berth_si.sh\n").await;
-    pump(&mut through, &mut rx2, 1200).await;
+    pump(&through, &mut rx2, 1200).await;
     through.drain_shell_events();
     pty2.write("(exit 7)\n").await;
-    pump(&mut through, &mut rx2, 1500).await;
+    pump(&through, &mut rx2, 1500).await;
     let tmux_events = through.drain_shell_events();
     pty2.write("vim -u NONE\n").await;
-    pump(&mut through, &mut rx2, 2500).await;
+    pump(&through, &mut rx2, 2500).await;
     let alt_in_vim_tmux = through.alternate_screen();
     pty2.write(":q!\n").await;
-    pump(&mut through, &mut rx2, 1500).await;
+    pump(&through, &mut rx2, 1500).await;
     let alt_after_vim_tmux = through.alternate_screen();
     pty2.write("exit\n").await;
     pty2.close().await;

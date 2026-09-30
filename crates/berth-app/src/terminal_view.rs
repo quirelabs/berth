@@ -6,18 +6,19 @@
 //! batch contiguous same-style cells into one shaped line, and never hold the
 //! grid lock while painting.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use gpui::{
     Bounds, Context, Element, ElementId, Entity, FocusHandle, Focusable, FontStyle, FontWeight,
     GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
-    ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Style, Styled, TextAlign,
+    ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Style, Styled, Task, TextAlign,
     TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 
 use crate::terminal_style::{CursorShape, TerminalStyle};
-use berth_core::pty::{Pty, PtyEvent};
+use berth_core::pty::Pty;
 use berth_term::size::{CellSize, TermSize};
 use berth_term::terminal::Selection;
 use berth_term::terminal::{Rgb, Snapshot};
@@ -25,9 +26,86 @@ use berth_term::{KeyEvent, MouseButton as TermButton, Scroll, Terminal, WheelAct
 
 use crate::metrics::{Histogram, KeystrokeLatency, LatencyReport};
 
-/// Shared between the output pump and the UI. The pump holds the lock only for
-/// as long as it takes to feed bytes to the parser.
-pub type SharedTerminal = Arc<Mutex<Terminal>>;
+/// Shared between the output pump and the UI. No lock: the terminal hands
+/// everything to its own thread, and a frame takes the latest screen it
+/// published.
+pub type SharedTerminal = Arc<Terminal>;
+
+/// How long every vsync keeps looking for a newer screen after a keystroke
+/// while its echo is awaited. Past this, a key with no echo (a password, a
+/// program not drawing) stops costing anything.
+const ECHO_WAIT: Duration = Duration::from_secs(1);
+
+/// What the output pump, on its own thread, shares with the view.
+#[derive(Default)]
+pub struct Intake {
+    /// Bytes handed to the parser, so throughput claims can be checked.
+    bytes: AtomicU64,
+    /// When the most recent keystroke was sent, until its echo arrives.
+    keystroke: Mutex<Option<Instant>>,
+    /// The echo, until a frame shows it.
+    echo: Mutex<Option<Echo>>,
+}
+
+/// The first output after a keystroke.
+#[derive(Debug, Clone, Copy)]
+pub struct Echo {
+    pub arrived: Instant,
+    /// Keystroke sent to echo received: the network half.
+    pub round_trip: Duration,
+    /// The write it was, so a frame can tell whether it shows it.
+    pub seq: u64,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Intake {
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_bytes(&self) {
+        self.bytes.store(0, Ordering::Relaxed);
+    }
+
+    fn sent_key(&self) {
+        *lock(&self.keystroke) = Some(Instant::now());
+    }
+
+    /// Output handed to the parser as write `seq`. The first after a
+    /// keystroke is its echo: the round trip ends here, and whatever follows
+    /// is Berth's own render cost.
+    pub fn arrived(&self, len: usize, seq: u64) {
+        self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+        if let Some(sent) = lock(&self.keystroke).take() {
+            *lock(&self.echo) = Some(Echo {
+                arrived: Instant::now(),
+                round_trip: sent.elapsed(),
+                seq,
+            });
+        }
+    }
+
+    /// The echo, if a frame showing write `painted` shows it.
+    fn painted(&self, painted: u64) -> Option<Echo> {
+        let mut echo = lock(&self.echo);
+        if echo.is_some_and(|e| e.seq <= painted) {
+            echo.take()
+        } else {
+            None
+        }
+    }
+
+    /// Whether a keystroke's echo is still to reach the screen.
+    fn awaiting_echo(&self) -> bool {
+        lock(&self.echo).is_some()
+            || lock(&self.keystroke).is_some_and(|sent| sent.elapsed() < ECHO_WAIT)
+    }
+}
 
 /// What the font system resolved, as opposed to what was requested.
 ///
@@ -74,18 +152,23 @@ pub struct TerminalView {
     style: TerminalStyle,
     /// Frame build times, the basis of the heavy-output acceptance test.
     pub frames: Histogram,
-    /// Set when the pump has seen output that is not yet painted.
-    pub dirty: bool,
+    /// The slowest frames since the histogram was last reset, each with the
+    /// part spent taking the screen from the engine, so a long frame can be
+    /// put down to the engine or to drawing, and which frame it was, so a
+    /// one-off first frame can be told from a steady cost.
+    pub slow_frames: Vec<(Duration, Duration, u64)>,
+    /// When the last frame finished, and the longest time between two frames
+    /// since the histogram was reset. Build time alone cannot see a window that
+    /// draws nothing while the main thread is busy; this can.
+    pub last_frame_at: Option<Instant>,
+    pub longest_gap: Duration,
     /// Last size announced to the remote, so window_change is sent once.
     last_sent_size: Option<TermSize>,
-    /// When the most recent keystroke was sent, and when its echo arrived.
-    /// Together these split latency into the network half and the render half.
-    pending_keystroke: Option<Instant>,
-    echo_arrived: Option<(Instant, Duration)>,
+    /// Shared with the output pump: bytes in, and the keystroke and echo times
+    /// that split latency into the network half and the render half.
+    pub intake: Arc<Intake>,
     /// Keystroke latency samples, network and local reported separately.
     pub latency: LatencyReport,
-    /// Bytes fed to the parser, so throughput claims can be checked.
-    pub bytes_in: u64,
     /// Cell metrics as the platform font system resolved them. Reported by the
     /// benchmarks because font metrics are the most likely thing to differ
     /// between platforms, and a metric difference looks like a latency
@@ -109,6 +192,8 @@ pub struct TerminalView {
     /// Wheel movement too small to be a line yet. A trackpad reports pixels,
     /// so without carrying the remainder a slow drag scrolls nothing at all.
     scroll_px: f32,
+    /// Repaints, and hands on agent signals, whenever the engine publishes.
+    _published: Task<()>,
 }
 
 impl TerminalView {
@@ -118,18 +203,41 @@ impl TerminalView {
         style: TerminalStyle,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The engine publishes on its own thread; this carries the news to the
+        // UI thread. A Notify keeps one permit, so a flood of publishes between
+        // two turns of this loop is one repaint, not a queue of them.
+        let published = Arc::new(tokio::sync::Notify::new());
+        terminal.on_publish({
+            let published = published.clone();
+            move || published.notify_one()
+        });
+        let _published = cx.spawn(async move |this, cx| {
+            loop {
+                published.notified().await;
+                let updated = this.update(cx, |view, cx| {
+                    let signals = view.terminal.take_agent_signals();
+                    if !signals.is_empty() {
+                        cx.emit(AgentSignals(signals));
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             terminal,
             pty,
             focus: cx.focus_handle(),
             style,
             frames: Histogram::new(),
-            dirty: false,
+            slow_frames: Vec::new(),
+            last_frame_at: None,
+            longest_gap: Duration::ZERO,
             last_sent_size: None,
-            pending_keystroke: None,
-            echo_arrived: None,
+            intake: Arc::new(Intake::default()),
             latency: crate::metrics::LatencyReport::new(),
-            bytes_in: 0,
             resolved_cell: None,
             resolved_font: None,
             selection: None,
@@ -137,15 +245,53 @@ impl TerminalView {
             forwarding: false,
             geometry: None,
             scroll_px: 0.0,
+            _published,
         }
+    }
+
+    /// The terminal this view draws, for the output pump.
+    pub fn terminal(&self) -> SharedTerminal {
+        self.terminal.clone()
+    }
+
+    /// Bytes handed to the parser since the last reset.
+    pub fn bytes_in(&self) -> u64 {
+        self.intake.bytes()
+    }
+
+    /// Note a frame's time and the gap since the one before, keeping the five
+    /// slowest.
+    fn note_frame(&mut self, total: Duration, copy: Duration) {
+        let now = Instant::now();
+        if let Some(last) = self.last_frame_at {
+            self.longest_gap = self.longest_gap.max(now.duration_since(last));
+        }
+        self.last_frame_at = Some(now);
+        self.slow_frames.push((total, copy, self.frames.count()));
+        self.slow_frames.sort_by_key(|f| std::cmp::Reverse(f.0));
+        self.slow_frames.truncate(5);
+    }
+
+    /// The five slowest frames, for a benchmark report.
+    pub fn slow_frames_report(&self) -> String {
+        let frames: Vec<String> = self
+            .slow_frames
+            .iter()
+            .map(|(total, copy, n)| {
+                format!(
+                    "{:.2} ms at frame {n} (copy {:.2}, draw {:.2})",
+                    total.as_secs_f64() * 1000.0,
+                    copy.as_secs_f64() * 1000.0,
+                    total.saturating_sub(*copy).as_secs_f64() * 1000.0
+                )
+            })
+            .collect();
+        format!("slowest frames: {}\n", frames.join(", "))
     }
 
     /// The grid's current size, so a reconnect can attach at the same shape.
     pub fn grid_size(&self) -> TermSize {
-        self.terminal
-            .lock()
-            .map(|t| t.size())
-            .unwrap_or(TermSize::new(80, 24))
+        self.terminal.size()
     }
 
     /// Point the view at a new transport without touching the grid.
@@ -162,19 +308,10 @@ impl TerminalView {
         self.last_sent_size = None;
     }
 
-    /// Agent signals the terminal picked out since the last call.
-    pub fn take_agent_signals(&mut self) -> Vec<String> {
-        self.terminal
-            .lock()
-            .map(|mut t| t.drain_agent_signals())
-            .unwrap_or_default()
-    }
-
     /// The live screen as bytes that redraw it, and the grid's size, for
     /// saving a local session (D46).
     pub fn saved_screen(&self) -> Option<(String, TermSize)> {
-        let term = self.terminal.lock().ok()?;
-        Some((term.screen_ansi(), term.size()))
+        Some((self.terminal.screen_ansi(), self.terminal.size()))
     }
 
     /// Start a restored session's new shell in place of its old prompt.
@@ -184,10 +321,7 @@ impl TerminalView {
     /// so the screen reads as if the shell never went away. Everything above it
     /// stays as it was saved.
     pub fn resume(&mut self, pty: Pty) {
-        if let Ok(mut term) = self.terminal.lock() {
-            term.advance(b"\x1b[0m\r\x1b[2K");
-        }
-        self.dirty = true;
+        self.terminal.advance(b"\x1b[0m\r\x1b[2K");
         self.swap_pty(pty);
     }
 
@@ -199,30 +333,12 @@ impl TerminalView {
         self.pty.clone()
     }
 
-    /// Feed output into the parser. Called from the coalescing pump, never
-    /// per byte.
-    pub fn ingest(&mut self, event: PtyEvent) {
-        if let PtyEvent::Output(bytes) = event
-            && let Ok(mut term) = self.terminal.lock()
-        {
-            term.advance(&bytes);
-            self.bytes_in += bytes.len() as u64;
-            self.dirty = true;
-            // The first output after a keystroke is its echo. The round trip
-            // ends here; whatever follows is Berth's own render cost.
-            if let Some(sent) = self.pending_keystroke.take() {
-                self.echo_arrived = Some((Instant::now(), sent.elapsed()));
-            }
-        }
-    }
-
     /// Translate a key event and send it to the remote.
-    pub fn send_key(&mut self, event: KeyEvent, _cx: &mut Context<Self>) {
-        let application_cursor = self
-            .terminal
-            .lock()
-            .map(|t| t.application_cursor())
-            .unwrap_or(false);
+    ///
+    /// Modes come from the screen on display, which is what the user is
+    /// typing at, and never wait on the parser.
+    pub fn send_key(&mut self, event: KeyEvent, cx: &mut Context<Self>) {
+        let application_cursor = self.terminal.latest().modes.application_cursor;
         let mode = berth_term::TermMode { application_cursor };
         let Some(bytes) = berth_term::encode(event, mode) else {
             return;
@@ -231,8 +347,10 @@ impl TerminalView {
         // user cannot see.
         self.scroll_to_bottom();
         // Timed from here so keystroke latency measures the whole journey.
-        self.pending_keystroke = Some(Instant::now());
+        self.intake.sent_key();
         self.write(bytes);
+        // Every vsync looks for the echo until it is on screen: see the paint.
+        cx.notify();
     }
 
     /// Tell the remote the grid changed size. Only sent when it actually
@@ -275,10 +393,7 @@ impl TerminalView {
     /// True when the remote asked for mouse events, in which case a click
     /// belongs to the program rather than to local selection.
     fn forwards_mouse(&self) -> bool {
-        self.terminal
-            .lock()
-            .map(|t| t.mouse_reporting())
-            .unwrap_or(false)
+        self.terminal.latest().modes.mouse_reporting
     }
 
     fn on_mouse_down(&mut self, position: Point<Pixels>, shift: bool) {
@@ -322,21 +437,23 @@ impl TerminalView {
 
     /// Move the view through the scrollback.
     ///
-    /// A selection is dropped when the view actually moves, because its
-    /// coordinates are rows of the viewport rather than of the history: left
-    /// alone it would stay painted over whatever scrolled into those rows, and
-    /// copy it too.
+    /// A selection is dropped when the view moves, because its coordinates
+    /// are rows of the viewport rather than of the history: left alone it
+    /// would stay painted over whatever scrolled into those rows, and copy it
+    /// too. Going to the bottom when already there is not a move.
     pub fn scroll(&mut self, scroll: Scroll) {
-        let Ok(mut term) = self.terminal.lock() else {
-            return;
+        let shown = self.terminal.latest();
+        let moves = match scroll {
+            Scroll::Bottom | Scroll::PageDown => shown.display_offset > 0,
+            Scroll::Lines(lines) => lines > 0 || shown.display_offset > 0,
+            Scroll::PageUp => true,
         };
-        let before = term.display_offset();
-        term.scroll(scroll);
-        if term.display_offset() != before {
-            drop(term);
-            self.selection = None;
-            self.drag_anchor = None;
+        if !moves {
+            return;
         }
+        self.terminal.scroll(scroll);
+        self.selection = None;
+        self.drag_anchor = None;
     }
 
     /// Put the view back on the live grid.
@@ -358,17 +475,9 @@ impl TerminalView {
             return;
         }
 
-        let decision = self.terminal.lock().ok().map(|term| {
-            (
-                term.wheel_action(event.modifiers.shift),
-                term.application_cursor(),
-            )
-        });
-        let Some((action, application_cursor)) = decision else {
-            return;
-        };
-
-        match action {
+        let modes = self.terminal.latest().modes;
+        let application_cursor = modes.application_cursor;
+        match modes.wheel_action(event.modifiers.shift) {
             WheelAction::View => self.scroll(Scroll::Lines(lines)),
             WheelAction::Arrows => {
                 let mode = berth_term::TermMode { application_cursor };
@@ -422,17 +531,13 @@ impl TerminalView {
     /// The selected text, for copying.
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
-        let text = self.terminal.lock().ok()?.selection_text(selection);
+        let text = self.terminal.selection_text(selection);
         (!text.is_empty()).then_some(text)
     }
 
     /// Paste, honouring the remote's bracketed paste mode.
     pub fn paste(&self, text: &str) {
-        let bracketed = self
-            .terminal
-            .lock()
-            .map(|t| t.bracketed_paste())
-            .unwrap_or(false);
+        let bracketed = self.terminal.latest().modes.bracketed_paste;
         self.write(berth_term::paste_bytes(text, bracketed));
     }
 }
@@ -538,13 +643,15 @@ pub struct TerminalElement {
 
 /// Everything painting needs, computed during prepaint.
 pub struct PrepaintState {
-    snapshot: Snapshot,
+    snapshot: Arc<Snapshot>,
     selection: Option<Selection>,
     runs: Vec<CellRun>,
     background: Hsla,
     cell: CellSize,
     font_facts: FontFacts,
     started: Instant,
+    /// How long taking the screen from the engine took, of the frame.
+    copy: Duration,
 }
 
 /// A horizontal stretch of cells sharing one style, shaped as a single line.
@@ -645,19 +752,15 @@ impl Element for TerminalElement {
             cell,
         );
 
-        // One lock, held only long enough to resize and copy the grid out.
+        // The latest screen the engine published, which never waits on the
+        // parser. A resize reaches it for a later frame.
+        let copy_started = Instant::now();
         let snapshot = {
-            let view = self.view.read(cx);
-            // Poisoned means the pump panicked mid-`advance`, so the grid may
-            // be half-updated. Paint it anyway: this runs every frame, and
-            // panicking here would turn one bad frame into a dead window.
-            let mut term = view
-                .terminal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            term.resize(size, cell);
-            term.snapshot()
+            let terminal = &self.view.read(cx).terminal;
+            terminal.resize(size, cell);
+            terminal.latest()
         };
+        let copy = copy_started.elapsed();
 
         let selection = self.view.read(cx).selection;
         let runs = batch_runs(&snapshot);
@@ -671,6 +774,7 @@ impl Element for TerminalElement {
             cell,
             font_facts,
             started,
+            copy,
         }
     }
 
@@ -695,7 +799,7 @@ impl Element for TerminalElement {
 
         // Backgrounds first, as a separate pass, so glyphs are never clipped by
         // a neighbouring cell's fill.
-        for cell in &state.snapshot.cells {
+        for cell in state.snapshot.cells() {
             let colour = hsla(cell.bg);
             if colour == state.background {
                 continue;
@@ -713,7 +817,7 @@ impl Element for TerminalElement {
             && !selection.is_empty()
         {
             let colour = self.style.selection_colour();
-            for cell in &state.snapshot.cells {
+            for cell in state.snapshot.cells() {
                 if !selection_covers(selection, cell.line, cell.column) {
                     continue;
                 }
@@ -786,32 +890,67 @@ impl Element for TerminalElement {
         }
 
         let elapsed = state.started.elapsed();
+        let copy = state.copy;
         let frame_started = state.started;
         let painted_size = state.snapshot.size;
+        let painted_seq = state.snapshot.seq;
         let geometry = (origin, state.cell);
         let painted_cell = state.cell;
         let painted_font = state.font_facts.clone();
-        self.view.update(cx, |view, _| {
+        let awaiting_echo = self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
-            view.dirty = false;
+            view.note_frame(elapsed, copy);
             view.sync_remote_size(painted_size);
             view.geometry = Some(geometry);
             view.resolved_cell = Some(painted_cell);
             view.resolved_font = Some(painted_font);
             // This frame carried the echoed glyph, so the local half of the
             // keystroke's journey ends now.
-            if let Some((arrived, round_trip)) = view.echo_arrived.take() {
+            if let Some(echo) = view.intake.painted(painted_seq) {
                 view.latency.record(KeystrokeLatency {
-                    round_trip,
-                    local_render: arrived.elapsed(),
+                    round_trip: echo.round_trip,
+                    local_render: echo.arrived.elapsed(),
                     // Split at the moment this frame started being built, so
                     // the wait for vsync and Berth's own work are separable.
-                    wait: frame_started.saturating_duration_since(arrived),
+                    wait: frame_started.saturating_duration_since(echo.arrived),
                     paint: elapsed,
                 });
             }
+            view.intake.awaiting_echo()
         });
+        if awaiting_echo {
+            let (terminal, intake) = {
+                let view = self.view.read(cx);
+                (view.terminal.clone(), view.intake.clone())
+            };
+            watch_for_echo(window, self.view.entity_id(), terminal, intake, painted_seq);
+        }
     }
+}
+
+/// While an echo is on its way, look at every vsync for a newer screen, and
+/// draw only when there is one.
+///
+/// The engine publishes on its own thread. Waiting instead for that news to
+/// reach the UI thread and ask for a frame loses the race with a vsync often
+/// enough to miss a frame (D49's latency bug). Drawing every frame outright
+/// fixes that too, but costs a full frame per vsync for up to a second after
+/// every key, which typing into a password prompt measured at eight times the
+/// energy of before (2026-09-30). A look costs a lock and a comparison.
+fn watch_for_echo(
+    window: &mut Window,
+    view: gpui::EntityId,
+    terminal: SharedTerminal,
+    intake: Arc<Intake>,
+    painted: u64,
+) {
+    window.on_next_frame(move |window, cx| {
+        if terminal.latest().seq > painted {
+            cx.notify(view);
+        } else if intake.awaiting_echo() {
+            watch_for_echo(window, view, terminal, intake, painted);
+        }
+    });
 }
 
 impl IntoElement for TerminalElement {
@@ -863,7 +1002,7 @@ fn batch_runs(snapshot: &Snapshot) -> Vec<CellRun> {
     let mut runs: Vec<CellRun> = Vec::new();
     let mut current: Option<CellRun> = None;
 
-    for cell in &snapshot.cells {
+    for cell in snapshot.cells() {
         // Blanks paint nothing; breaking the run on them also keeps runs short.
         if cell.c == ' ' || cell.c == '\0' {
             if let Some(run) = current.take() {
@@ -986,9 +1125,9 @@ mod tests {
     use berth_term::terminal::Terminal as CoreTerminal;
 
     fn snapshot_of(input: &[u8], cols: u16, rows: u16) -> Snapshot {
-        let mut t = CoreTerminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
+        let t = CoreTerminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
         t.advance(input);
-        t.snapshot()
+        (*t.snapshot()).clone()
     }
 
     #[test]

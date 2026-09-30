@@ -521,6 +521,9 @@ impl Workspace {
                         );
                         this.report_cold_start(strings::LOCAL_ALIAS);
                     });
+                    if crate::bench::Bench::from_env() == Some(crate::bench::Bench::LocalCat) {
+                        Self::run_local_benchmark(&this, cx).await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not open a local shell");
@@ -605,9 +608,7 @@ impl Workspace {
                 cx,
             )
         });
-        view.update(cx, |_, cx| {
-            session::start_pump(&cx.entity(), events, cx);
-        });
+        view.update(cx, |view, _| session::start_pump(view, events));
 
         self.next_pane_id += 1;
         let id = self.next_pane_id;

@@ -1,9 +1,8 @@
 //! Connecting a host to a terminal view, and pumping output between them.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{AsyncApp, Context, Entity, WeakEntity};
 use tokio::sync::mpsc;
 
 use berth_core::Host;
@@ -15,11 +14,18 @@ use berth_term::Terminal;
 use berth_term::size::{CellSize, TermSize};
 
 use crate::runtime;
-use crate::terminal_view::{SharedTerminal, TerminalView};
+use crate::terminal_view::{Intake, SharedTerminal, TerminalView};
 
-/// Never gather more than this many events before painting, so a truly
-/// unbounded firehose still yields to the UI. Zed uses the same cap.
+/// Never gather more than this many events into one write, so a truly
+/// unbounded firehose still reaches the parser in steps. Zed uses the same cap.
 pub const COALESCE_MAX_EVENTS: usize = 100;
+
+/// The most output handed to the parser and not yet parsed before the pump
+/// stops reading. A producer faster than the parser is then held back by the
+/// pty or the ssh channel, as a terminal should hold it back, rather than
+/// queueing without bound. Under 10 ms of parsing on the slowest measured
+/// stream on macOS.
+pub const MAX_BACKLOG: usize = 512 * 1024;
 
 pub struct Connected {
     pub connection: Arc<Connection>,
@@ -198,38 +204,33 @@ pub(crate) fn terminal_for(
     rows: u16,
     palette: berth_term::terminal::Palette,
 ) -> SharedTerminal {
-    let mut term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(cols, rows), CellSize::new(8.0, 16.0));
     term.set_palette(palette);
-    Arc::new(Mutex::new(term))
+    Arc::new(term)
 }
 
-/// Drain PTY output into the view, coalescing bursts into one repaint.
+/// Hand PTY output to the parser as it arrives, on a thread of its own.
 ///
-/// Runs on GPUI's foreground executor. `tokio::sync::mpsc` is executor
-/// agnostic, so awaiting it here needs no tokio reactor.
-pub async fn pump(
-    view: WeakEntity<TerminalView>,
-    mut events: mpsc::Receiver<PtyEvent>,
-    cx: &mut AsyncApp,
-) {
-    loop {
-        let Some(first) = events.recv().await else {
-            break;
-        };
-
+/// Nothing here touches the UI thread: the terminal parses on its own thread
+/// and publishes screens, and the view repaints when it does. So heavy output
+/// never keeps the window from drawing (D49), and an echo reaches the screen
+/// without waiting for the UI thread to get round to it.
+fn pump(terminal: SharedTerminal, intake: Arc<Intake>, mut events: mpsc::Receiver<PtyEvent>) {
+    while let Some(first) = events.blocking_recv() {
         let (batch, closed) = take_batch(first, &mut events);
-
-        let updated = view.update(cx, |view, cx| {
-            for event in batch {
-                view.ingest(event);
+        let mut bytes = Vec::new();
+        for event in batch {
+            if let PtyEvent::Output(chunk) = event {
+                bytes.extend_from_slice(&chunk);
             }
-            let signals = view.take_agent_signals();
-            if !signals.is_empty() {
-                cx.emit(crate::terminal_view::AgentSignals(signals));
-            }
-            cx.notify();
-        });
-        if updated.is_err() || closed {
+        }
+        if !bytes.is_empty() {
+            let seq = terminal.advance(&bytes);
+            intake.arrived(bytes.len(), seq);
+            terminal.wait_for_room(MAX_BACKLOG);
+        }
+        // The last holder: the view is gone and nobody will see this.
+        if closed || Arc::strong_count(&terminal) == 1 {
             break;
         }
     }
@@ -269,16 +270,15 @@ fn take_batch(first: PtyEvent, events: &mut mpsc::Receiver<PtyEvent>) -> (Vec<Pt
 }
 
 /// Start the pump for a freshly connected session.
-pub fn start_pump(
-    view: &Entity<TerminalView>,
-    events: mpsc::Receiver<PtyEvent>,
-    cx: &mut Context<TerminalView>,
-) {
-    let weak = view.downgrade();
-    cx.spawn(async move |_, cx| {
-        pump(weak, events, cx).await;
-    })
-    .detach();
+pub fn start_pump(view: &TerminalView, events: mpsc::Receiver<PtyEvent>) {
+    let terminal = view.terminal();
+    let intake = view.intake.clone();
+    let spawned = std::thread::Builder::new()
+        .name("berth-pump".into())
+        .spawn(move || pump(terminal, intake, events));
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not start the output pump");
+    }
 }
 
 /// Measure the round trip by timing a trivial exec, for the status bar and for

@@ -4,8 +4,6 @@
 //! may not depend on gpui. `berth-app` measures the font, passes the cell size
 //! in, and converts back at the boundary.
 
-use alacritty_terminal::grid::Dimensions;
-
 /// The pixel size of one cell, measured by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CellSize {
@@ -43,8 +41,8 @@ impl TermSize {
     }
 }
 
-/// alacritty misbehaves at one column wide when asked to render an emoji, so
-/// the grid never gets narrower than two. See zed-industries/zed#2750.
+/// A grid one column wide cannot hold a wide glyph, which terminal engines
+/// handle badly (zed-industries/zed#2750), so it never gets narrower than two.
 pub const MIN_COLS: u16 = 2;
 pub const MIN_ROWS: u16 = 1;
 
@@ -59,20 +57,6 @@ fn fit(available: f32, cell: f32) -> u16 {
     }
     let raw = available / cell;
     raw.next_up().floor().clamp(1.0, u16::MAX as f32) as u16
-}
-
-impl Dimensions for TermSize {
-    fn total_lines(&self) -> usize {
-        self.screen_lines()
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.rows as usize
-    }
-
-    fn columns(&self) -> usize {
-        self.cols as usize
-    }
 }
 
 #[cfg(test)]
@@ -105,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn never_smaller_than_the_alacritty_minimum() {
+    fn never_smaller_than_the_minimum() {
         let cell = CellSize::new(10.0, 20.0);
         let size = TermSize::from_pixels(1.0, 1.0, cell);
         assert_eq!(size.cols, MIN_COLS);
@@ -120,12 +104,5 @@ mod tests {
             let size = TermSize::from_pixels(bad, bad, CellSize::new(8.0, 16.0));
             assert!(size.cols >= MIN_COLS && size.rows >= MIN_ROWS, "{bad}");
         }
-    }
-
-    #[test]
-    fn implements_alacritty_dimensions() {
-        let size = TermSize::new(80, 24);
-        assert_eq!(size.columns(), 80);
-        assert_eq!(size.screen_lines(), 24);
     }
 }

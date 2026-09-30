@@ -21,6 +21,7 @@ jobs:
           toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/ghostty
       - run: cargo fmt --all --check
       - run: cargo clippy -p berth-core -p berth-probe -p berth-term -p berth-timeline --all-targets
       - run: cargo test -p berth-core -p berth-probe -p berth-term -p berth-timeline
@@ -41,6 +42,7 @@ jobs:
           toolchain: 1.98.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/ghostty
 
       # This is the largest crate and the one that changes most, and for a
       # while it was the only one CI never linted or ran. --all-targets so the

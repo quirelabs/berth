@@ -41,7 +41,7 @@ async fn run_in_pane(pane: &PaneEnv, dir: &std::path::Path) -> Terminal {
         .await
     );
 
-    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
     let mut seen = String::new();
     let deadline = Duration::from_secs(120);
     while let Ok(Some(event)) = timeout(deadline, events.recv()).await {
@@ -72,7 +72,7 @@ async fn claude_reports_through_the_shim_and_the_hook() {
     let work = tempfile::tempdir().expect("a work dir");
     let pane = PaneEnv::new(Some(base.path()));
 
-    let mut term = run_in_pane(&pane, work.path()).await;
+    let term = run_in_pane(&pane, work.path()).await;
     let payloads = term.drain_agent_signals();
     let signals: Vec<_> = payloads
         .iter()
@@ -119,7 +119,7 @@ async fn another_panes_signals_are_not_believed() {
     let work = tempfile::tempdir().expect("a work dir");
     let pane = PaneEnv::new(Some(base.path()));
 
-    let mut term = run_in_pane(&pane, work.path()).await;
+    let term = run_in_pane(&pane, work.path()).await;
     let payloads = term.drain_agent_signals();
     assert!(!payloads.is_empty(), "the hook did write");
     let stranger = PaneToken::new();
@@ -150,7 +150,7 @@ async fn outside_a_berth_pane_the_hook_is_silent() {
         plugin.display()
     );
     assert!(pty.write(line).await);
-    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
     let mut seen = String::new();
     while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
         if let PtyEvent::Output(bytes) = event {
@@ -368,7 +368,7 @@ async fn a_saved_conversation_resumes_in_a_fresh_login_shell() {
         )
         .await
     );
-    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
     let mut seen = String::new();
     while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
         if let PtyEvent::Output(bytes) = event {
@@ -401,7 +401,7 @@ async fn a_saved_conversation_resumes_in_a_fresh_login_shell() {
         ))
         .await
     );
-    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
     let mut seen = String::new();
     while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
         if let PtyEvent::Output(bytes) = event {
@@ -467,7 +467,7 @@ async fn zsh_resumes_by_itself_before_its_first_prompt() {
         pty.write("claude -p 'Reply with just ok.'; echo berth-claude-$((20+22))\n")
             .await
     );
-    let mut term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
+    let term = Terminal::new(TermSize::new(120, 40), CellSize::new(8.0, 16.0));
     let mut seen = String::new();
     while let Ok(Some(event)) = timeout(Duration::from_secs(120), events.recv()).await {
         if let PtyEvent::Output(bytes) = event {

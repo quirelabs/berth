@@ -1,0 +1,5 @@
+# Where libghostty-vt's build finds Ghostty's source: the pinned, checksummed
+# copy scripts/fetch-ghostty.sh puts there (D49). The build never clones
+# anything itself. Zig 0.16.0 must be on PATH.
+[env]
+GHOSTTY_SOURCE_DIR = { value = ".ghostty/ghostty-22d13172cde98a0a4dda05d3d6a3fcb0dd8ed018", relative = true }
