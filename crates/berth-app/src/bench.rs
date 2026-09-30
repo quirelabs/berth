@@ -411,6 +411,8 @@ pub async fn run_local_cat(view: WeakEntity<TerminalView>, pty: Pty, cx: &mut As
         view.frames = crate::metrics::Histogram::new();
         view.slow_frames.clear();
         view.bytes_in = 0;
+        view.longest_gap = Duration::ZERO;
+        view.last_frame_at = Some(std::time::Instant::now());
     });
     let started = std::time::Instant::now();
     pty.write(format!("cat '{}'\n", path.display())).await;
@@ -440,15 +442,22 @@ pub async fn run_local_cat(view: WeakEntity<TerminalView>, pty: Pty, cx: &mut As
         let batching_intact = p99 <= f64::from(CAT_P99_CEILING_MS);
         let bytes = view.bytes_in as f64;
         let arrived = bytes >= BENCH_BYTES as f64 * 0.95;
-        let painted = view.frames.count() >= 10;
+        // The freeze criterion, measured as what the eye sees: the longest the
+        // window went without a new frame while the output was flowing.
+        let gap = view.longest_gap;
+        let no_stall = gap < FRAME_BUDGET;
+        let painted = view.frames.count() >= 2;
         let mut text = format!(
             "{env}{report}{slow}bytes through the parser: {:.1} MB of {:.0} MB in {:.1} s ({:.0} MB/s)\n\
+             longest time without a frame: {:.0} ms ({})\n\
              no frame at or above 32 ms: {}\n\
              p99 frame time {p99:.1} ms against a {CAT_P99_CEILING_MS} ms regression ceiling: {}\n",
             bytes / (1024.0 * 1024.0),
             BENCH_BYTES as f64 / (1024.0 * 1024.0),
             took.as_secs_f64(),
             bytes / (1024.0 * 1024.0) / took.as_secs_f64(),
+            gap.as_secs_f64() * 1000.0,
+            if no_stall { "PASS" } else { "FAIL: the window froze" },
             if no_freeze { "PASS" } else { "FAIL" },
             if batching_intact { "PASS" } else { "FAIL" },
         );
@@ -462,7 +471,7 @@ pub async fn run_local_cat(view: WeakEntity<TerminalView>, pty: Pty, cx: &mut As
         }
         Outcome {
             text,
-            passed: no_freeze && batching_intact && arrived && painted,
+            passed: no_freeze && no_stall && batching_intact && arrived && painted,
         }
     })
     .unwrap_or_else(|_| Outcome {

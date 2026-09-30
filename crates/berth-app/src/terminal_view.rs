@@ -78,6 +78,11 @@ pub struct TerminalView {
     /// part spent resizing and copying the screen out, so a long frame can be
     /// put down to the engine or to drawing.
     pub slow_frames: Vec<(Duration, Duration)>,
+    /// When the last frame finished, and the longest time between two frames
+    /// since the histogram was reset. Build time alone cannot see a window that
+    /// draws nothing while the main thread parses; this can.
+    pub last_frame_at: Option<Instant>,
+    pub longest_gap: Duration,
     /// Set when the pump has seen output that is not yet painted.
     pub dirty: bool,
     /// Last size announced to the remote, so window_change is sent once.
@@ -129,6 +134,8 @@ impl TerminalView {
             style,
             frames: Histogram::new(),
             slow_frames: Vec::new(),
+            last_frame_at: None,
+            longest_gap: Duration::ZERO,
             dirty: false,
             last_sent_size: None,
             pending_keystroke: None,
@@ -147,6 +154,11 @@ impl TerminalView {
 
     /// Keep the five slowest frames.
     fn note_slow_frame(&mut self, total: Duration, copy: Duration) {
+        let now = Instant::now();
+        if let Some(last) = self.last_frame_at {
+            self.longest_gap = self.longest_gap.max(now.duration_since(last));
+        }
+        self.last_frame_at = Some(now);
         self.slow_frames.push((total, copy));
         self.slow_frames.sort_by_key(|f| std::cmp::Reverse(f.0));
         self.slow_frames.truncate(5);
