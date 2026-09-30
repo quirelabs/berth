@@ -43,13 +43,21 @@ jobs:
       # no third-party action is needed for it.
       - name: Zig 0.16.0
         run: |
+          set -x
+          # Git Bash on Windows gets Windows paths from the runner; convert
+          # them for the shell and back for GITHUB_PATH.
+          tmp="$RUNNER_TEMP"
+          if command -v cygpath >/dev/null; then tmp=$(cygpath -u "$RUNNER_TEMP"); fi
           file="${{ matrix.zig }}.${{ matrix.archive }}"
-          curl -sSfL -o "$RUNNER_TEMP/$file" "https://ziglang.org/download/0.16.0/$file"
-          if command -v sha256sum >/dev/null; then sum=$(sha256sum "$RUNNER_TEMP/$file" | cut -d' ' -f1); else sum=$(shasum -a 256 "$RUNNER_TEMP/$file" | cut -d' ' -f1); fi
+          curl -sSfL -o "$tmp/$file" "https://ziglang.org/download/0.16.0/$file"
+          if command -v sha256sum >/dev/null; then sum=$(sha256sum "$tmp/$file" | cut -d' ' -f1); else sum=$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1); fi
+          echo "sha256: $sum"
           test "$sum" = "${{ matrix.sha256 }}"
-          cd "$RUNNER_TEMP"
+          cd "$tmp"
           if [ "${{ matrix.archive }}" = zip ]; then unzip -q "$file"; else tar -xJf "$file"; fi
-          echo "$RUNNER_TEMP/${{ matrix.zig }}" >> "$GITHUB_PATH"
+          dir="$tmp/${{ matrix.zig }}"
+          if command -v cygpath >/dev/null; then dir=$(cygpath -w "$dir"); fi
+          echo "$dir" >> "$GITHUB_PATH"
       - run: zig version
 
       - name: Build from the pinned, checksummed Ghostty source
@@ -59,3 +67,14 @@ jobs:
 
       - name: Run the spike report
         run: ./target/release/libghostty-spike
+
+      # Linux parsed three times slower than the current engine on the first
+      # run. The bindings build for a baseline x86 CPU by default, which leaves
+      # out the vector paths; this measures the same report built for x86-64-v3.
+      - name: Linux, built for x86-64-v3
+        if: runner.os == 'Linux'
+        run: |
+          export GHOSTTY_SOURCE_DIR=$(./fetch-ghostty.sh)
+          LIBGHOSTTY_VT_SYS_CPU=x86_64_v3 cargo build --release
+          ./target/release/libghostty-spike | sed -n '/5. Throughput/,$p'
+
