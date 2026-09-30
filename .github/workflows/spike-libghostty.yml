@@ -68,6 +68,10 @@ jobs:
       - name: Run the spike report
         run: ./target/release/libghostty-spike
 
+      # Where the parsing time goes, by kind of output, on each platform.
+      - name: Throughput by kind of output
+        run: ./target/release/throughput
+
       # Linux parsed three times slower than the current engine on the first
       # run. The bindings build for a baseline x86 CPU by default, which leaves
       # out the vector paths; this measures the same report built for x86-64-v3.
