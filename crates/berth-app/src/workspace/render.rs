@@ -42,8 +42,8 @@ impl Workspace {
         let shell = local_label();
         let detached: Vec<String> = self
             .detached_local()
-            .iter()
-            .map(|s| strings::local_detached_name(&shell, s.id))
+            .into_iter()
+            .map(|(_, name)| name)
             .collect();
         let rows = crate::sidebar::rows(&Input {
             hosts: &hosts,
@@ -291,12 +291,11 @@ impl Workspace {
         let slug = name.clone();
         // A local server session no tab shows, found again by the name the
         // tree gave it.
-        let shell = local_label();
         let local_session = self
             .detached_local()
-            .iter()
-            .find(|s| strings::local_detached_name(&shell, s.id) == name)
-            .map(|s| s.id);
+            .into_iter()
+            .find(|(_, n)| *n == name)
+            .map(|(id, _)| id);
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
             (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {

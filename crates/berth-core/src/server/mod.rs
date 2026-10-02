@@ -19,6 +19,7 @@ pub mod link;
 pub mod local;
 pub mod paths;
 pub mod supervisor;
+pub mod sync;
 mod transport;
 pub mod worker_host;
 

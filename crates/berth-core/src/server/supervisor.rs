@@ -381,7 +381,14 @@ impl State {
                         ..
                     }
                 );
-                if let ToApp::Sessions(_) = message {
+                // A worker telling what has its terminal now.
+                if let ToApp::Sessions(list) = message {
+                    if let (Some(entry), Some(info)) =
+                        (self.sessions.get_mut(&session), list.into_iter().next())
+                    {
+                        entry.info.program = info.program;
+                        entry.info.cwd = info.cwd;
+                    }
                     return;
                 }
                 self.send_attached(session, message);

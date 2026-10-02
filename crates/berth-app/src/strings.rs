@@ -26,11 +26,6 @@ pub const LOCAL_ALIAS: &str = "local";
 pub fn local_direct_notice(reason: &str) -> String {
     format!("This session won't survive quitting: {reason}")
 }
-/// A local server session no tab shows, in the sidebar: the shell's name
-/// and the session's number.
-pub fn local_detached_name(label: &str, session: u64) -> String {
-    format!("{label} #{session}")
-}
 pub const LOCAL_DIRECT_BY_ENV: &str = "BERTH_LOCAL_DIRECT is set";
 pub const LOCAL_DIRECT_BY_SETTING: &str = "local_direct is on in settings";
 pub fn local_server_failed(error: &str) -> String {

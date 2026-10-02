@@ -90,6 +90,8 @@ pub struct WireHistory {
     /// the session ever produced. Meaningless when `lines` is empty.
     pub newest: u64,
     pub lines: Vec<v1::Row>,
+    /// The range runs down to the oldest line held: there is nothing older.
+    pub reaches_oldest: bool,
 }
 
 /// A command, numbered in the order it was sent.
@@ -771,7 +773,10 @@ impl Engine {
 
     fn wire_history(&self, before: Option<u64>, max: u32) -> WireHistory {
         if modes_of(&self.term).alternate_screen {
-            return WireHistory::default();
+            return WireHistory {
+                reaches_oldest: true,
+                ..WireHistory::default()
+            };
         }
         let held = self.term.scrollback_rows().unwrap_or(0) as u64;
         let oldest = self.numbering.pruned;
@@ -782,12 +787,16 @@ impl Engine {
         };
         let count = end.min(u64::from(max));
         if count == 0 {
-            return WireHistory::default();
+            return WireHistory {
+                reaches_oldest: true,
+                ..WireHistory::default()
+            };
         }
         let first = end - count;
         WireHistory {
             newest: oldest + end - 1,
             lines: crate::wire::history(&self.term, first as u32, count as u32),
+            reaches_oldest: first == 0,
         }
     }
 

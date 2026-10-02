@@ -161,7 +161,19 @@ fn main() -> std::process::ExitCode {
                 inactive_frame_interval: None,
                 ..Default::default()
             },
-            |_, cx| cx.new(Workspace::new),
+            |window, cx| {
+                cx.new(|cx| {
+                    // A window that becomes active is drawn: the local server's
+                    // sessions send again (D50).
+                    cx.observe_window_activation(window, |this: &mut Workspace, window, cx| {
+                        if window.is_window_active() {
+                            this.window_activated(cx);
+                        }
+                    })
+                    .detach();
+                    Workspace::new(cx)
+                })
+            },
         );
 
         if let Err(error) = window {

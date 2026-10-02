@@ -79,6 +79,12 @@ pub enum ToApp {
         session: SessionId,
         seq: u64,
         screen: Packed,
+        /// History follows: every line the server holds above this screen,
+        /// as [`ToApp::History`] ranges ending with one marked `complete`. The
+        /// app rebuilds its scrollback from them, so it equals the server's
+        /// line for line. False for the screens sent while an app is behind,
+        /// which would otherwise resend the history thirty times a second.
+        history_follows: bool,
     },
     /// History lines, a packed `Vec<Row>`, newest first: line `newest`, then
     /// `newest - 1`, and so on. Numbers grow with the output, a line keeps its
@@ -90,6 +96,8 @@ pub enum ToApp {
         session: SessionId,
         newest: u64,
         lines: Packed,
+        /// The last range after a screen: nothing older is held.
+        complete: bool,
     },
     Event {
         session: SessionId,
@@ -107,7 +115,12 @@ pub enum ToApp {
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: String,
+    /// The directory of whatever has the terminal now, where the machine
+    /// will say; the shell's starting directory until then.
     pub cwd: Option<String>,
+    /// What has the terminal now: the shell at its prompt, or the program it
+    /// runs. What the app names a session by.
+    pub program: Option<String>,
     pub cols: u16,
     pub rows: u16,
     pub claude: Option<Claude>,
@@ -350,6 +363,7 @@ mod tests {
             session: 1,
             seq: 42,
             screen: Packed::pack(&screen).unwrap(),
+            history_follows: false,
         };
         let bytes = message.encode().unwrap();
         assert!(bytes.len() < 200, "a blank screen is {} bytes", bytes.len());

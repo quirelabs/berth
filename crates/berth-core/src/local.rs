@@ -103,6 +103,33 @@ pub fn cwd_of(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The name of a local process, as `ps` gives it, without its path or the
+/// dash a login shell carries. Unix only; blocking, as [`cwd_of`] is.
+pub fn program_of(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        program_name(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// `/bin/zsh` or `-zsh` to `zsh`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn program_name(comm: &str) -> Option<String> {
+    let name = comm.trim().rsplit('/').next()?.trim_start_matches('-');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// The path out of `lsof -Fn` output: the line that starts with `n`.
 ///
 /// Anything else, or nothing, is `None`. The format is not ours, and a wrong
@@ -409,8 +436,13 @@ pub async fn open_shell(
     });
 
     // Writes and resizes share a thread because both need the master, and
-    // because a write that blocks must not stall the reader.
-    let master = pair.master;
+    // because a write that blocks must not stall the reader. The master is
+    // shared so the terminal's foreground process can be asked for, and taken
+    // out when the pty closes, so holding a handle never keeps the shell up.
+    let foreground = crate::pty::Foreground(std::sync::Arc::new(std::sync::Mutex::new(Some(
+        pair.master,
+    ))));
+    let master = foreground.0.clone();
     std::thread::spawn(move || {
         while let Some(request) = input_rx.blocking_recv() {
             match request {
@@ -420,24 +452,30 @@ pub async fn open_shell(
                     }
                 }
                 PtyInput::Resize { cols, rows } => {
-                    let _ = master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                    if let Ok(guard) = master.lock()
+                        && let Some(master) = guard.as_ref()
+                    {
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
                 }
                 PtyInput::Close => break,
             }
         }
         // Dropping the master hangs up the shell, which ends the reader.
-        drop(master);
+        let taken = master.lock().ok().and_then(|mut m| m.take());
+        drop(taken);
     });
 
     Ok((
         Pty {
             input: input_tx,
             pid,
+            foreground: Some(foreground),
         },
         output_rx,
     ))
@@ -575,6 +613,20 @@ mod tests {
             .expect("the directory is readable");
         assert_eq!(found.canonicalize().ok(), sub.canonicalize().ok());
         pty.close().await;
+    }
+
+    #[test]
+    fn a_program_is_named_without_its_path_or_login_dash() {
+        assert_eq!(program_name("/bin/zsh\n").as_deref(), Some("zsh"));
+        assert_eq!(program_name("-zsh").as_deref(), Some("zsh"));
+        assert_eq!(program_name("claude").as_deref(), Some("claude"));
+        assert_eq!(program_name("  \n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_has_a_name() {
+        assert!(program_of(std::process::id()).is_some());
     }
 
     #[test]

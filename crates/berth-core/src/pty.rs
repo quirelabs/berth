@@ -49,12 +49,43 @@ pub struct Pty {
     /// The shell's process id, for a local session only. A remote shell's pid
     /// means nothing on this machine.
     pub(crate) pid: Option<u32>,
+    /// Asks a local pty which process has the terminal now.
+    pub(crate) foreground: Option<Foreground>,
+}
+
+/// A local pty's master, shared so the terminal's foreground process can be
+/// asked for. `None` once the pty has closed: whoever closes it takes it, so
+/// holding this never keeps a shell from being hung up.
+#[derive(Clone)]
+pub(crate) struct Foreground(
+    pub(crate) std::sync::Arc<std::sync::Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>>,
+);
+
+impl std::fmt::Debug for Foreground {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Foreground")
+    }
 }
 
 impl Pty {
     /// The local shell's process id, or `None` for a remote session.
     pub fn local_pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// The process that has the terminal now, a local one only: the shell
+    /// at its prompt, or whatever it is running. Unix only.
+    pub fn foreground_pid(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            let master = self.foreground.as_ref()?.0.lock().ok()?;
+            let leader = master.as_ref()?.process_group_leader()?;
+            u32::try_from(leader).ok()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     /// Send bytes as if typed. Returns false once the channel has closed.
@@ -165,6 +196,7 @@ pub(crate) async fn open(
         Pty {
             input: input_tx,
             pid: None,
+            foreground: None,
         },
         output_rx,
     ))
@@ -180,6 +212,7 @@ mod tests {
         let pty = Pty {
             input: tx,
             pid: None,
+            foreground: None,
         };
         drop(rx);
         assert!(!pty.write("x").await);
@@ -192,6 +225,7 @@ mod tests {
         let pty = Pty {
             input: tx,
             pid: None,
+            foreground: None,
         };
         assert!(pty.resize(0, 0).await);
         assert_eq!(rx.recv().await, Some(PtyInput::Resize { cols: 1, rows: 1 }));
@@ -203,6 +237,7 @@ mod tests {
         let pty = Pty {
             input: tx,
             pid: None,
+            foreground: None,
         };
         pty.write("a").await;
         pty.write("b").await;

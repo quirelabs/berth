@@ -181,10 +181,76 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
         flag(m.mouse_reporting)
     );
 
-    let mut placed_after_wrap = false;
-    for (y, row) in screen.lines.iter().enumerate() {
-        if !placed_after_wrap {
-            let _ = write!(out, "\x1b[{};1H", y + 1);
+    let rows: Vec<&v1::Row> = screen.lines.iter().collect();
+    write_rows(&mut out, &rows, true);
+    let _ = write!(
+        out,
+        "\x1b[{};{}H\x1b[?25{}",
+        screen.cursor.line + 1,
+        screen.cursor.column + 1,
+        flag(screen.cursor.visible)
+    );
+    out.into_bytes()
+}
+
+/// A screen with every history line above it, as the escape sequences that
+/// rebuild a terminal's scrollback and screen from scratch: the scrollback
+/// cleared, then history oldest first and the screen's rows as one stream of
+/// lines, so exactly the history scrolls off into the scrollback, then the
+/// cursor and modes. `history` is oldest first. How the app's scrollback comes
+/// to equal the worker's line for line (D51).
+pub fn rebuild(history: &[v1::Row], screen: &v1::Screen) -> Vec<u8> {
+    use std::fmt::Write as _;
+    // A full reset, not an erase: erasing leaves each row's soft-wrap flag
+    // behind, and a row that wrapped before would read as wrapped after
+    // (found 2026-10-02).
+    let mut out = String::from("\x1bc\x1b[3J");
+    if screen.modes.alternate_screen {
+        // The primary screen under a full-screen program is not known; its
+        // history is, and the program's screen goes on the alternate one.
+        let rows: Vec<&v1::Row> = history.iter().collect();
+        write_rows(&mut out, &rows, false);
+        for _ in 0..screen.rows {
+            out.push_str("\r\n");
+        }
+        let mut tail = replay(screen);
+        let mut bytes = out.into_bytes();
+        bytes.append(&mut tail);
+        return bytes;
+    }
+    let rows: Vec<&v1::Row> = history.iter().chain(screen.lines.iter()).collect();
+    write_rows(&mut out, &rows, false);
+    let flag = |on: bool| if on { 'h' } else { 'l' };
+    let m = &screen.modes;
+    let _ = write!(
+        out,
+        "\x1b[?1{}\x1b[?2004{}\x1b[?1007{}\x1b[?1000{}\x1b[?1006{}\x1b[{};{}H\x1b[?25{}",
+        flag(m.application_cursor),
+        flag(m.bracketed_paste),
+        flag(m.alternate_scroll),
+        flag(m.mouse_reporting),
+        flag(m.mouse_reporting),
+        screen.cursor.line + 1,
+        screen.cursor.column + 1,
+        flag(screen.cursor.visible)
+    );
+    out.into_bytes()
+}
+
+/// Write rows with their styles. `placed`: each row is put at its line on a
+/// cleared screen; otherwise rows follow each other as lines from where the
+/// cursor is. Either way a soft-wrapped row runs on into the next rather than
+/// being placed, so the wrap is kept.
+fn write_rows(out: &mut String, rows: &[&v1::Row], placed: bool) {
+    use std::fmt::Write as _;
+    let mut runs_on_before = false;
+    for (y, row) in rows.iter().enumerate() {
+        if !runs_on_before {
+            if placed {
+                let _ = write!(out, "\x1b[{};1H", y + 1);
+            } else if y > 0 {
+                out.push_str("\r\n");
+            }
         }
         let last = row
             .cells
@@ -196,9 +262,8 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
         // is the empty cell a wide glyph leaves when it does not fit in the
         // last column: left unwritten, the glyph wraps by itself and the
         // terminal leaves that cell exactly as it was.
-        let runs_on = row.wrapped && y + 1 < screen.lines.len();
-        let wide_next = screen
-            .lines
+        let runs_on = row.wrapped && y + 1 < rows.len();
+        let wide_next = rows
             .get(y + 1)
             .and_then(|next| next.cells.first())
             .is_some_and(|cell| cell.width == 2);
@@ -216,7 +281,7 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
             }
             let now = (cell.style, cell.fg, cell.bg);
             if style != Some(now) {
-                sgr(&mut out, cell);
+                sgr(out, cell);
                 style = Some(now);
             }
             if cell.text.is_empty() || cell.text.chars().any(char::is_control) {
@@ -226,20 +291,14 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
             }
         }
         out.push_str("\x1b[0m");
-        placed_after_wrap = runs_on;
+        runs_on_before = runs_on;
     }
-    let _ = write!(
-        out,
-        "\x1b[{};{}H\x1b[?25{}",
-        screen.cursor.line + 1,
-        screen.cursor.column + 1,
-        flag(screen.cursor.visible)
-    );
-    out.into_bytes()
 }
 
+/// Padding: a cell nothing was ever written to. A space that was written is
+/// kept, as the terminal keeps it.
 fn is_blank(cell: &v1::Cell) -> bool {
-    (cell.text.is_empty() || cell.text == " ")
+    cell.text.is_empty()
         && cell.bg == v1::Color::Default
         && cell.style & (v1::style::UNDERLINE | v1::style::STRIKETHROUGH | v1::style::INVERSE) == 0
 }
@@ -359,6 +418,67 @@ mod tests {
         round_trip(8, 4, "12345678\r\nnext");
         // Styled cells at the edge of a wrapped row keep their style.
         round_trip(6, 3, "\x1b[41mabcdef\x1b[0mgh");
+    }
+
+    /// Rebuilt from the worker's history and screen, another terminal holds
+    /// the same history and screen, line for line, whatever it held before.
+    #[test]
+    fn a_rebuild_reproduces_history_and_screen() {
+        let from = terminal(12, 5, 1000);
+        let mut input = String::new();
+        for n in 0..60 {
+            input.push_str(&format!("\x1b[3{}mline {n}\x1b[0m", n % 8));
+            if n % 7 == 0 {
+                input.push_str(" long enough to wrap");
+            }
+            input.push_str("\r\n");
+        }
+        input.push_str("\u{65e5}\u{672c} e\u{301} $ ");
+        from.advance(input.as_bytes());
+        let screen = from.wire_screen().unwrap();
+        let mut history = from.wire_history(Some(screen.first_line), u32::MAX).lines;
+        history.reverse();
+
+        let to = terminal(12, 5, 1000);
+        to.advance(b"stale scrollback\r\n".repeat(30).as_slice());
+        to.advance(&super::rebuild(&history, &screen));
+
+        let got = to.wire_screen().unwrap();
+        assert_eq!(got.lines, screen.lines);
+        assert_eq!(got.cursor, screen.cursor);
+        let mut got_history = to.wire_history(Some(got.first_line), u32::MAX).lines;
+        got_history.reverse();
+        let line = |r: &v1::Row| -> String {
+            format!(
+                "{}{}",
+                r.cells.iter().map(|c| c.text.as_str()).collect::<String>(),
+                if r.wrapped { " \\" } else { "" }
+            )
+        };
+        if let Some(at) = (0..history.len().max(got_history.len()))
+            .find(|&i| history.get(i) != got_history.get(i))
+        {
+            panic!(
+                "history differs at line {at} of {} (got {}): sent {:?}, got {:?}",
+                history.len(),
+                got_history.len(),
+                history.get(at).map(line),
+                got_history.get(at).map(line)
+            );
+        }
+    }
+
+    /// Replayed over a screen whose rows had wrapped, rows that do not wrap
+    /// must not read as wrapped.
+    #[test]
+    fn replay_over_wrapped_rows_leaves_no_stale_wraps() {
+        let from = terminal(8, 4, 100);
+        from.advance(b"a\r\nb\r\nc");
+        let sent = from.wire_screen().unwrap();
+        let to = terminal(8, 4, 100);
+        to.advance(b"0123456789abcdefghijklmnopqrstuv");
+        to.advance(&super::replay(&sent));
+        assert_eq!(to.wire_screen().unwrap().lines, sent.lines);
     }
 
     #[test]

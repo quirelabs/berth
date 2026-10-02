@@ -69,10 +69,18 @@ pub struct Shell {
     pub login: bool,
 }
 
+/// What has a session's terminal now, and where.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Live {
+    program: Option<String>,
+    cwd: Option<String>,
+}
+
 pub struct Worker {
     session: SessionId,
     name: String,
-    cwd: Option<String>,
+    /// As last looked at; the starting directory until then.
+    live: Mutex<Live>,
     size: Mutex<(u16, u16)>,
     pty: Pty,
     terminal: Arc<Terminal>,
@@ -120,10 +128,13 @@ impl Worker {
             Worker {
                 session: spec.session,
                 name: spec.name.clone(),
-                cwd: spec
-                    .cwd
-                    .as_ref()
-                    .map(|dir| dir.to_string_lossy().to_string()),
+                live: Mutex::new(Live {
+                    program: None,
+                    cwd: spec
+                        .cwd
+                        .as_ref()
+                        .map(|dir| dir.to_string_lossy().to_string()),
+                }),
                 size: Mutex::new((spec.cols, spec.rows)),
                 pty,
                 terminal,
@@ -155,9 +166,11 @@ impl Worker {
                 self.resize(cols, rows).await;
                 None
             }
+            // The size only: the host sends the screen and its history,
+            // off the async threads (see `worker_host`).
             ToServer::Attach { cols, rows, .. } => {
                 self.resize(cols, rows).await;
-                Some(self.screen())
+                None
             }
             ToServer::Kill { .. } => {
                 self.pty.close().await;
@@ -174,18 +187,49 @@ impl Worker {
         }
     }
 
+    /// Whether a full-screen program has the terminal, as of the screen last
+    /// published. Never waits.
+    pub fn alternate_screen(&self) -> bool {
+        self.terminal.latest().modes.alternate_screen
+    }
+
     /// This session as the session list shows it.
     pub fn info(&self) -> v1::SessionInfo {
         let (cols, rows) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
+        let live = self.live.lock().unwrap_or_else(|p| p.into_inner()).clone();
         v1::SessionInfo {
             id: self.session,
             name: self.name.clone(),
-            cwd: self.cwd.clone(),
+            cwd: live.cwd,
+            program: live.program,
             cols,
             rows,
             claude: None,
             pid: self.pty.local_pid(),
         }
+    }
+
+    /// Look again at what has the terminal and where. Returns the session's
+    /// description if either changed, for the session list. Blocking: it
+    /// asks `ps` and `lsof`.
+    pub fn refresh(&self) -> Option<v1::SessionInfo> {
+        let pid = self.pty.foreground_pid()?;
+        let now = Live {
+            program: crate::local::program_of(pid),
+            cwd: crate::local::cwd_of(pid).map(|d| d.to_string_lossy().to_string()),
+        };
+        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        // Something the machine would not say is not a change.
+        let merged = Live {
+            program: now.program.or_else(|| live.program.clone()),
+            cwd: now.cwd.or_else(|| live.cwd.clone()),
+        };
+        if merged == *live {
+            return None;
+        }
+        *live = merged;
+        drop(live);
+        Some(self.info())
     }
 
     async fn resize(&self, cols: u16, rows: u16) {
@@ -195,41 +239,61 @@ impl Worker {
         self.pty.resize(size.cols, size.rows).await;
     }
 
-    /// The screen as of the output so far, packed.
+    /// The screen as of the output so far, packed, and the number of its
+    /// first row, below which [`Worker::history_below`] reaches.
     ///
     /// Output chunks at or below its `seq` may still be on their way to the
     /// app behind it; the app skips them, as they are already on this screen.
-    pub fn screen(&self) -> ToApp {
+    pub fn screen(&self, history_follows: bool) -> (ToApp, Option<u64>) {
         let seq = lock(&self.seq);
         let screen = self.terminal.wire_screen();
         let at = *seq;
         drop(seq);
-        match screen.map(|s| Packed::pack(&s)) {
+        let first_line = screen.as_ref().map(|s| s.first_line);
+        let message = match screen.map(|s| Packed::pack(&s)) {
             Some(Ok(screen)) => ToApp::Screen {
                 session: self.session,
                 seq: at,
                 screen,
+                history_follows,
             },
             Some(Err(error)) => self.refused("screen", error.to_string()),
             None => self.refused("screen", "the terminal did not answer".into()),
-        }
+        };
+        (message, first_line)
     }
 
-    /// Up to [`HISTORY_RANGE`] history lines older than `before`, or the
-    /// newest. `None` when there are none.
-    pub fn history(&self, before: Option<u64>) -> Option<ToApp> {
-        let history = self.terminal.wire_history(before, HISTORY_RANGE);
-        if history.lines.is_empty() {
-            return None;
+    /// Every history line above a screen whose first row is `first_line`,
+    /// newest first, in ranges of [`HISTORY_RANGE`], the last marked
+    /// complete. Lines below a screen never change, only the oldest are
+    /// pruned, so this needs no lock against the output: a line pruned
+    /// meanwhile is simply not sent.
+    pub fn history_below(&self, first_line: u64) -> Vec<ToApp> {
+        let mut out = Vec::new();
+        let mut before = first_line;
+        loop {
+            let history = self.terminal.wire_history(Some(before), HISTORY_RANGE);
+            let complete = history.reaches_oldest || history.lines.is_empty();
+            let newest = history.newest;
+            let count = history.lines.len() as u64;
+            match Packed::pack(&history.lines) {
+                Ok(lines) => out.push(ToApp::History {
+                    session: self.session,
+                    newest,
+                    lines,
+                    complete,
+                }),
+                Err(error) => {
+                    out.push(self.refused("history", error.to_string()));
+                    break;
+                }
+            }
+            if complete {
+                break;
+            }
+            before = newest + 1 - count;
         }
-        Some(match Packed::pack(&history.lines) {
-            Ok(lines) => ToApp::History {
-                session: self.session,
-                newest: history.newest,
-                lines,
-            },
-            Err(error) => self.refused("history", error.to_string()),
-        })
+        out
     }
 
     fn refused(&self, what: &str, why: String) -> ToApp {
@@ -363,7 +427,7 @@ mod tests {
                 assert_eq!(*seq, total, "seq counts bytes");
             }
         }
-        let (seq, text) = screen_text(&worker.screen());
+        let (seq, text) = screen_text(&worker.screen(false).0);
         assert!(seq >= total);
         assert!(text.contains("berth_42"), "{text}");
     }
@@ -407,7 +471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attaching_resizes_and_answers_with_the_screen() {
+    async fn attaching_resizes_the_session() {
         let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
         worker
             .handle(ToServer::Input {
@@ -422,9 +486,12 @@ mod tests {
                 cols: 60,
                 rows: 12,
             })
-            .await
-            .unwrap();
-        let ToApp::Screen { screen, .. } = &reply else {
+            .await;
+        assert!(
+            reply.is_none(),
+            "the host sends the screen, off the async threads"
+        );
+        let ToApp::Screen { screen, .. } = &worker.screen(true).0 else {
             panic!("not a screen");
         };
         let screen: v1::Screen = screen.unpack().unwrap();
@@ -451,15 +518,79 @@ mod tests {
             .await;
         // Quoted apart so the shell's echo of the command does not match.
         until(&mut rx, "done_").await;
-        let Some(ToApp::History { newest, lines, .. }) = worker.history(None) else {
+        let (_, first_line) = worker.screen(true);
+        let ranges = worker.history_below(first_line.unwrap());
+        let Some(ToApp::History {
+            newest,
+            lines,
+            complete,
+            ..
+        }) = ranges.last()
+        else {
             panic!("no history");
         };
+        assert!(*complete, "the last range is marked complete");
         let rows: Vec<v1::Row> = lines.unpack().unwrap();
         assert!(!rows.is_empty());
-        let Some(ToApp::History { newest: older, .. }) = worker.history(Some(newest)) else {
-            panic!("no older history");
+        assert!(
+            *newest < first_line.unwrap(),
+            "history lies above the screen"
+        );
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.cells.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(text.contains("row0"), "{text}");
+    }
+
+    /// The session list names a session by what has its terminal and where,
+    /// so the description follows the shell into a program and back.
+    #[tokio::test]
+    async fn the_description_follows_what_has_the_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, mut rx) = Worker::start(spec(Some(dir.path().to_path_buf())))
+            .await
+            .unwrap();
+        let worker = std::sync::Arc::new(worker);
+        let program = |worker: &std::sync::Arc<Worker>| {
+            let worker = worker.clone();
+            async move {
+                for _ in 0..50 {
+                    let w = worker.clone();
+                    let _ = tokio::task::spawn_blocking(move || w.refresh()).await;
+                    let info = worker.info();
+                    if info.program.is_some() {
+                        return info;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                worker.info()
+            }
         };
-        assert!(older < newest);
+        let at_prompt = program(&worker).await;
+        assert_eq!(at_prompt.program.as_deref(), Some("sh"));
+        let real = dir.path().canonicalize().unwrap();
+        assert_eq!(at_prompt.cwd.as_deref(), real.to_str());
+
+        worker
+            .handle(ToServer::Input {
+                session: 1,
+                bytes: b"sleep 5\n".to_vec(),
+            })
+            .await;
+        until(&mut rx, "sleep 5").await;
+        let mut running = None;
+        for _ in 0..50 {
+            let w = worker.clone();
+            if let Ok(Some(info)) = tokio::task::spawn_blocking(move || w.refresh()).await
+                && info.program.as_deref() == Some("sleep")
+            {
+                running = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(running.is_some(), "never saw sleep take the terminal");
     }
 
     #[tokio::test]

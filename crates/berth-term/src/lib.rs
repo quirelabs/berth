@@ -20,4 +20,4 @@ pub use size::{CellSize, TermSize};
 pub use terminal::{
     Cell, Cursor, Modes, Palette, Rgb, Scroll, Selection, Snapshot, Terminal, WheelAction,
 };
-pub use wire::replay;
+pub use wire::{rebuild, replay};

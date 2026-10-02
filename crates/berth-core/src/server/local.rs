@@ -201,11 +201,24 @@ impl LocalServer {
         .await?;
 
         let (events_tx, events) = mpsc::channel(OUTPUT_QUEUE_SIZE);
-        tokio::spawn(translate(from_server, events_tx));
+        tokio::spawn(translate(self.clone(), session, from_server, events_tx));
 
         let (input, from_pty) = mpsc::channel(INPUT_QUEUE_SIZE);
         tokio::spawn(forward(self.clone(), session, from_pty));
-        Ok((Pty { input, pid }, events))
+        Ok((
+            Pty {
+                input,
+                pid,
+                foreground: None,
+            },
+            events,
+        ))
+    }
+
+    /// The app's window was hidden or shown: while hidden, workers send
+    /// nothing, and shown again each attached session sends its screen (D50).
+    pub async fn set_visible(&self, visible: bool) -> Result<()> {
+        self.send(ToServer::Visible { visible }).await
     }
 
     /// End a session for good. The app asks the user first (D32).
@@ -225,27 +238,114 @@ impl LocalServer {
     }
 }
 
+/// Confirm output to the worker every this many bytes handed on (D49).
+const CONFIRM_EVERY: u64 = 64 * 1024;
+/// How long a pane waits for the history after a screen, and how much output
+/// it holds meanwhile, before going on without the history.
+const HISTORY_WITHIN: Duration = Duration::from_secs(2);
+const HOLD_AT_MOST: usize = 4 * 1024 * 1024;
+
+/// A screen whose history is on its way.
+struct Rebuilding {
+    screen: v1::Screen,
+    /// Ranges as they came, each newest first.
+    ranges: Vec<Vec<v1::Row>>,
+    /// Output after the screen, applied once the history is in.
+    held: Vec<Vec<u8>>,
+    held_bytes: usize,
+    since: std::time::Instant,
+}
+
 /// The server's messages for one session, as pty events.
-async fn translate(mut from_server: mpsc::Receiver<ToApp>, events: mpsc::Sender<PtyEvent>) {
+///
+/// A screen is drawn as soon as it arrives. When history follows it, later
+/// output is held until the history is in, and then the terminal is rebuilt
+/// from both, so its scrollback equals the worker's line for line under the
+/// worker's numbers; the app never numbers lines itself (D51). Output is
+/// confirmed back as it is handed on, which is how the worker knows whether
+/// the app keeps up.
+async fn translate(
+    server: LocalServer,
+    session: SessionId,
+    mut from_server: mpsc::Receiver<ToApp>,
+    events: mpsc::Sender<PtyEvent>,
+) {
     // Output at or below the last screen's number is already on it.
     let mut drawn = 0u64;
+    let mut confirmed = 0u64;
+    let mut rebuilding: Option<Rebuilding> = None;
     while let Some(message) = from_server.recv().await {
-        let event = match message {
-            ToApp::Screen { seq, screen, .. } => match screen.unpack::<v1::Screen>() {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let screen_now = matches!(message, ToApp::Screen { .. });
+        match message {
+            ToApp::Screen {
+                seq,
+                screen,
+                history_follows,
+                ..
+            } => match screen.unpack::<v1::Screen>() {
                 Ok(screen) => {
                     drawn = seq;
-                    PtyEvent::Output(berth_term::replay(&screen))
+                    out.push(berth_term::replay(&screen));
+                    // A screen without history supersedes one still waiting:
+                    // output was dropped in between, so what was held no
+                    // longer follows on from it.
+                    rebuilding = history_follows.then(|| Rebuilding {
+                        screen,
+                        ranges: Vec::new(),
+                        held: Vec::new(),
+                        held_bytes: 0,
+                        since: std::time::Instant::now(),
+                    });
                 }
                 Err(error) => {
                     tracing::warn!(%error, "a screen from the local server did not unpack");
                     continue;
                 }
             },
+            ToApp::History {
+                lines, complete, ..
+            } => {
+                let Some(pending) = rebuilding.as_mut() else {
+                    continue;
+                };
+                match lines.unpack::<Vec<v1::Row>>() {
+                    Ok(rows) => pending.ranges.push(rows),
+                    Err(error) => {
+                        tracing::warn!(%error, "history from the local server did not unpack");
+                    }
+                }
+                if complete && let Some(done) = rebuilding.take() {
+                    let mut history: Vec<v1::Row> = done.ranges.into_iter().flatten().collect();
+                    history.reverse();
+                    out.push(berth_term::rebuild(&history, &done.screen));
+                    out.extend(done.held);
+                }
+            }
             ToApp::Output { seq, bytes, .. } => {
                 if seq <= drawn {
                     continue;
                 }
-                PtyEvent::Output(bytes)
+                drawn = seq;
+                match rebuilding.as_mut() {
+                    Some(pending)
+                        if pending.since.elapsed() < HISTORY_WITHIN
+                            && pending.held_bytes + bytes.len() <= HOLD_AT_MOST =>
+                    {
+                        pending.held_bytes += bytes.len();
+                        pending.held.push(bytes);
+                    }
+                    Some(_) => {
+                        // The history is not coming in time: go on without
+                        // it, rather than freeze the pane.
+                        tracing::warn!(session, "history did not arrive in time");
+                        if let Some(gave_up) = rebuilding.take() {
+                            out.extend(gave_up.held);
+                        }
+                        out.push(bytes);
+                    }
+                    None => out.push(bytes),
+                }
             }
             ToApp::Event {
                 event: v1::Event::Exited { code },
@@ -256,9 +356,22 @@ async fn translate(mut from_server: mpsc::Receiver<ToApp>, events: mpsc::Sender<
                 break;
             }
             _ => continue,
-        };
-        if events.send(event).await.is_err() {
-            return;
+        }
+        for bytes in out {
+            if events.send(PtyEvent::Output(bytes)).await.is_err() {
+                return;
+            }
+        }
+        // Every so many bytes, and as soon as a screen is drawn: a worker
+        // waiting on it sends nothing more until it is confirmed.
+        if drawn >= confirmed + CONFIRM_EVERY || (screen_now && drawn > confirmed) {
+            confirmed = drawn;
+            let _ = server
+                .send(ToServer::Confirmed {
+                    session,
+                    seq: confirmed,
+                })
+                .await;
         }
     }
     let _ = events.send(PtyEvent::Closed).await;

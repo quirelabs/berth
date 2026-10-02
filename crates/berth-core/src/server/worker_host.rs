@@ -9,14 +9,21 @@
 
 use std::path::PathBuf;
 
-use berth_proto::v1::{SessionId, ToServer};
+use berth_proto::v1::{SessionId, ToApp, ToServer};
 use tokio::sync::mpsc;
 
 use super::link::{self, protocol};
 use super::paths::{self, Places};
+use super::sync;
 use super::transport::Listener;
 use crate::error::{Error, Result};
 use crate::worker::{Shell, Spec, Worker};
+
+/// How often the flow is asked for a screen while it wants one.
+const SCREEN_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// How often a worker looks at what has its terminal.
+const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What a worker process is started with.
 #[derive(Debug, Clone)]
@@ -125,6 +132,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
         shell: launch.shell.clone(),
     })
     .await?;
+    let worker = std::sync::Arc::new(worker);
     let mut listener = Listener::bind(&places.worker(launch.session)).await?;
     let pid_file = places.worker_pid(launch.session);
     paths::write_pid(&pid_file)?;
@@ -135,21 +143,47 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     // replaced one's stragglers are ignored.
     let (inbox_tx, mut inbox) = mpsc::channel::<(u64, ToServer)>(64);
     let mut connection = 0u64;
-    let mut to_supervisor = None;
+    let mut to_supervisor: ToSupervisor = None;
     let mut _reader: Option<Owned> = None;
+    // What has the terminal is looked at now and then, and the session list
+    // told when it changes: the app names sessions by it.
+    let mut look = tokio::time::interval(LOOK_EVERY);
+    // Raw output or screens, as the app keeps up (D49).
+    let mut flow = sync::Flow::new();
+    let mut in_alternate = false;
+    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = look.tick() => {
+                let looking = worker.clone();
+                let changed = tokio::task::spawn_blocking(move || looking.refresh())
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(info) = changed {
+                    send(&mut to_supervisor, &ToApp::Sessions(vec![info])).await;
+                }
+            }
             message = output.recv() => {
                 let Some(message) = message else { break };
-                if let Some(write) = &mut to_supervisor {
-                    let sent = match message.encode() {
-                        Ok(payload) => super::link::FrameWrite::send(write, &payload).await,
-                        Err(e) => Err(protocol(e)),
-                    };
-                    if sent.is_err() {
-                        to_supervisor = None;
+                if let ToApp::Output { seq, bytes, .. } = &message {
+                    // A program leaving the alternate screen gets a screen,
+                    // so what lies underneath is right (D49).
+                    let alternate = worker.alternate_screen();
+                    if in_alternate && !alternate {
+                        flow.left_alternate_screen();
                     }
+                    in_alternate = alternate;
+                    if flow.output(*seq, bytes.len() as u64) == sync::Output::Drop {
+                        continue;
+                    }
+                }
+                send(&mut to_supervisor, &message).await;
+            }
+            _ = tokio::time::sleep(SCREEN_TICK), if flow.wants_tick() => {
+                if let Some(kind) = flow.tick(std::time::Instant::now()) {
+                    send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
                 }
             }
             accepted = listener.accept() => {
@@ -180,12 +214,22 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                 if tag != connection {
                     continue;
                 }
-                if let Some(reply) = worker.handle(message).await
-                    && let Some(write) = &mut to_supervisor
-                {
-                    let payload = reply.encode().map_err(protocol)?;
-                    if write.send(&payload).await.is_err() {
-                        to_supervisor = None;
+                match message {
+                    ToServer::Confirmed { seq, .. } => flow.confirmed(seq),
+                    ToServer::Visible { visible } => {
+                        if let Some(kind) = flow.visible(visible) {
+                            send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
+                        }
+                    }
+                    ToServer::Attach { .. } => {
+                        let _ = worker.handle(message).await;
+                        let kind = flow.attached();
+                        send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
+                    }
+                    message => {
+                        if let Some(reply) = worker.handle(message).await {
+                            send(&mut to_supervisor, &reply).await;
+                        }
                     }
                 }
             }
@@ -193,6 +237,56 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     }
     tracing::info!(session = launch.session, "worker's shell ended");
     Ok(())
+}
+
+type ToSupervisor = Option<super::link::FrameWrite<tokio::io::WriteHalf<super::transport::Stream>>>;
+
+/// Send to the supervisor, if one is connected. A failed send forgets it; the
+/// next supervisor to connect gets a screen.
+async fn send(to_supervisor: &mut ToSupervisor, message: &ToApp) {
+    let Some(write) = to_supervisor else {
+        return;
+    };
+    let sent = match message.encode() {
+        Ok(payload) => write.send(&payload).await,
+        Err(error) => Err(protocol(error)),
+    };
+    if sent.is_err() {
+        *to_supervisor = None;
+    }
+}
+
+/// Send the screen as it is now, and with it, when asked, every history line
+/// above it. Taken off the async threads: both wait on the terminal.
+async fn send_screen(
+    worker: &std::sync::Arc<Worker>,
+    flow: &mut sync::Flow,
+    kind: sync::Screen,
+    to_supervisor: &mut ToSupervisor,
+) {
+    let with_history = kind == sync::Screen::WithHistory;
+    let taking = worker.clone();
+    let Ok((screen, first_line)) =
+        tokio::task::spawn_blocking(move || taking.screen(with_history)).await
+    else {
+        return;
+    };
+    let seq = match &screen {
+        ToApp::Screen { seq, .. } => *seq,
+        _ => 0,
+    };
+    send(to_supervisor, &screen).await;
+    flow.screen_sent(seq, kind, std::time::Instant::now());
+    if let (true, Some(first_line)) = (with_history, first_line) {
+        let reading = worker.clone();
+        if let Ok(ranges) =
+            tokio::task::spawn_blocking(move || reading.history_below(first_line)).await
+        {
+            for range in &ranges {
+                send(to_supervisor, range).await;
+            }
+        }
+    }
 }
 
 /// `berth --worker ...`: a worker process, as the supervisor starts one.

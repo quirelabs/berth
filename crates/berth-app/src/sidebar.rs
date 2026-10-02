@@ -180,6 +180,58 @@ fn push_folder(
     out.push(Row::NewTerminal(folder));
 }
 
+/// A local server session no tab shows, as the tree names it.
+pub struct LocalSession<'a> {
+    pub id: u64,
+    /// What has its terminal now.
+    pub program: Option<&'a str>,
+    pub cwd: Option<&'a str>,
+}
+
+/// Names for local server sessions no tab shows (D50): what runs and where,
+/// `claude · ~/berth`, so several can be told apart. The shell's label and
+/// the session's number only when neither is known, and the number added
+/// wherever two would otherwise read the same.
+pub fn local_session_names(
+    sessions: &[LocalSession],
+    label: &str,
+    home: Option<&str>,
+) -> Vec<(u64, String)> {
+    let short = |dir: &str| -> String {
+        match home {
+            Some(home) if dir == home => "~".to_string(),
+            Some(home) => match dir.strip_prefix(home).and_then(|r| r.strip_prefix('/')) {
+                Some(rest) => format!("~/{rest}"),
+                None => dir.to_string(),
+            },
+            None => dir.to_string(),
+        }
+    };
+    let named: Vec<(u64, String)> = sessions
+        .iter()
+        .map(|s| {
+            let name = match (s.program, s.cwd) {
+                (Some(program), Some(dir)) => format!("{program} \u{b7} {}", short(dir)),
+                (Some(program), None) => program.to_string(),
+                (None, Some(dir)) => format!("{label} \u{b7} {}", short(dir)),
+                (None, None) => format!("{label} #{}", s.id),
+            };
+            (s.id, name)
+        })
+        .collect();
+    named
+        .iter()
+        .map(|(id, name)| {
+            let twice = named.iter().filter(|(_, other)| other == name).count() > 1;
+            if twice && !name.ends_with(&format!("#{id}")) {
+                (*id, format!("{name} #{id}"))
+            } else {
+                (*id, name.clone())
+            }
+        })
+        .collect()
+}
+
 /// `zsh`, then `zsh 2`, `zsh 3`, in the order the panes were opened.
 fn local_name(label: &str, index: usize) -> String {
     if index == 0 {
@@ -520,6 +572,64 @@ mod tests {
             pane: None,
             agent: false,
         }));
+    }
+
+    fn session(
+        id: u64,
+        program: Option<&'static str>,
+        cwd: Option<&'static str>,
+    ) -> LocalSession<'static> {
+        LocalSession { id, program, cwd }
+    }
+
+    #[test]
+    fn a_detached_local_session_is_named_by_what_runs_and_where() {
+        let names = local_session_names(
+            &[
+                session(1, Some("claude"), Some("/Users/j/berth")),
+                session(2, Some("zsh"), Some("/Users/j/work/api")),
+                session(3, Some("zsh"), Some("/Users/j")),
+                session(4, Some("top"), Some("/opt/x")),
+            ],
+            "zsh",
+            Some("/Users/j"),
+        );
+        let names: Vec<&str> = names.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "claude \u{b7} ~/berth",
+                "zsh \u{b7} ~/work/api",
+                "zsh \u{b7} ~",
+                "top \u{b7} /opt/x"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_number_is_used_only_when_nothing_else_tells_them_apart() {
+        let names = local_session_names(
+            &[
+                session(5, None, None),
+                session(6, Some("vim"), None),
+                session(7, None, Some("/srv")),
+                session(8, Some("claude"), Some("/a")),
+                session(9, Some("claude"), Some("/a")),
+            ],
+            "zsh",
+            None,
+        );
+        let names: Vec<&str> = names.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "zsh #5",
+                "vim",
+                "zsh \u{b7} /srv",
+                "claude \u{b7} /a #8",
+                "claude \u{b7} /a #9"
+            ]
+        );
     }
 
     #[test]

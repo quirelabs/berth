@@ -149,12 +149,13 @@ fn to_app() -> Vec<(ToApp, &'static str)> {
                 id: 7,
                 name: "work".into(),
                 cwd: None,
+                program: Some("claude".into()),
                 cols: 80,
                 rows: 24,
                 claude: Some(claude.clone()),
                 pid: Some(4242),
             }]),
-            "00010704776f726b0050180101012430623963356635652d376233392d346135352d386135332d326238663064316339653131010f2f686f6d652f752f70726f6a656374019221",
+            "00010704776f726b000106636c6175646550180101012430623963356635652d376233392d346135352d386135332d326238663064316339653131010f2f686f6d652f752f70726f6a656374019221",
         ),
         (ToApp::Created { session: 8 }, "0108"),
         (
@@ -170,16 +171,18 @@ fn to_app() -> Vec<(ToApp, &'static str)> {
                 session: 7,
                 seq: 1234,
                 screen: Packed(Vec::new()),
+                history_follows: true,
             },
-            "0307d20900",
+            "0307d2090001",
         ),
         (
             ToApp::History {
                 session: 7,
                 newest: 99,
                 lines: Packed(Vec::new()),
+                complete: true,
             },
-            "04076300",
+            "0407630001",
         ),
         (
             ToApp::Event {
@@ -287,6 +290,7 @@ fn a_packed_screen_unpacks_to_the_frozen_body() {
         session: 7,
         seq: 1234,
         screen: Packed::pack(&screen()).unwrap(),
+        history_follows: false,
     };
     let ToApp::Screen { screen: packed, .. } = ToApp::decode(&message.encode().unwrap()).unwrap()
     else {
@@ -302,6 +306,7 @@ fn history_packs_rows() {
         session: 7,
         newest: 99,
         lines: Packed::pack(&lines).unwrap(),
+        complete: false,
     };
     let ToApp::History { lines: packed, .. } = ToApp::decode(&message.encode().unwrap()).unwrap()
     else {

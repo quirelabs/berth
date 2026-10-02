@@ -30,6 +30,10 @@ use crate::theme::{Appearance, Theme, hsla};
 use crate::{runtime, session};
 use gpui::svg;
 
+/// How long output may go undrawn before the window is taken to be hidden,
+/// and how often that is checked.
+const SEEN_EVERY: Duration = Duration::from_secs(1);
+
 /// How often the local server's session list is read for the sidebar.
 const LOCAL_LIST_EVERY: Duration = Duration::from_secs(3);
 
@@ -285,6 +289,9 @@ pub struct Workspace {
     /// The local server's sessions, as last listed: what the sidebar shows
     /// under this machine besides the open tabs.
     local_sessions: Vec<berth_proto::v1::SessionInfo>,
+    /// Whether the window is taken to be drawn, as the local server was last
+    /// told (D50).
+    window_seen: bool,
 }
 
 impl Workspace {
@@ -333,6 +340,7 @@ impl Workspace {
             claude_base: install_claude_support(),
             local_server: Default::default(),
             local_sessions: Vec::new(),
+            window_seen: true,
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -342,7 +350,74 @@ impl Workspace {
         this.warm(cx);
         this.watch_saves(cx);
         this.watch_local_sessions(cx);
+        this.watch_window_seen(cx);
         this
+    }
+
+    /// Tell the local server when the window is not being drawn, so its
+    /// workers send nothing meanwhile (D50).
+    ///
+    /// gpui says whether the window is focused, not whether it is visible or
+    /// minimized, and focus is the wrong question: a window in the background
+    /// still shows its output. So it is read from what is drawn: output
+    /// arriving with no frame painted for a second means macOS is not drawing
+    /// the window. The next frame painted, or the window becoming active,
+    /// means it is again. A wrong guess undoes itself at the next paint, key
+    /// or click.
+    fn watch_window_seen(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(SEEN_EVERY).await;
+                let changed = this.update(cx, |this, cx| this.check_window_seen(cx));
+                if changed.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn check_window_seen(&mut self, cx: &mut Context<Self>) {
+        let Some(Ok(server)) = self.local_server.get().cloned() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let recent = |at: Option<std::time::Instant>| at.is_some_and(|at| now - at < SEEN_EVERY);
+        let local = || self.panes.iter().filter(|p| p.session.is_some());
+        let painted = local().any(|p| recent(p.view.read(cx).last_frame_at));
+        let busy = local().any(|p| recent(p.view.read(cx).intake.last_output()));
+        let seen = if self.window_seen {
+            painted || !busy
+        } else {
+            painted
+        };
+        if seen != self.window_seen {
+            self.set_window_seen(seen, server, cx);
+        }
+    }
+
+    fn set_window_seen(
+        &mut self,
+        seen: bool,
+        server: berth_core::server::local::LocalServer,
+        cx: &mut Context<Self>,
+    ) {
+        self.window_seen = seen;
+        tracing::info!(seen, "the window is drawn: told the local server");
+        cx.background_executor()
+            .spawn(async move {
+                let _ = runtime::spawn(async move { server.set_visible(seen).await }).await;
+            })
+            .detach();
+    }
+
+    /// The window became active: it is certainly drawn.
+    pub fn window_activated(&mut self, cx: &mut Context<Self>) {
+        if !self.window_seen
+            && let Some(Ok(server)) = self.local_server.get().cloned()
+        {
+            self.set_window_seen(true, server, cx);
+        }
     }
 
     /// Why local tabs skip the local server, if they do: the dogfooding
@@ -390,12 +465,21 @@ impl Workspace {
         .detach();
     }
 
-    /// Local server sessions that no pane shows.
-    fn detached_local(&self) -> Vec<&berth_proto::v1::SessionInfo> {
-        self.local_sessions
+    /// Local server sessions that no pane shows, with the names the tree
+    /// gives them.
+    fn detached_local(&self) -> Vec<(u64, String)> {
+        let sessions: Vec<crate::sidebar::LocalSession> = self
+            .local_sessions
             .iter()
             .filter(|s| !self.panes.iter().any(|p| p.session == Some(s.id)))
-            .collect()
+            .map(|s| crate::sidebar::LocalSession {
+                id: s.id,
+                program: s.program.as_deref(),
+                cwd: s.cwd.as_deref(),
+            })
+            .collect();
+        let home = std::env::home_dir().map(|h| h.to_string_lossy().to_string());
+        crate::sidebar::local_session_names(&sessions, &render::local_label(), home.as_deref())
     }
 
     // -- sessions ----------------------------------------------------------
@@ -1336,7 +1420,12 @@ impl Workspace {
             pane,
             alias: strings::LOCAL_ALIAS.to_string(),
             slug: session.to_string(),
-            session: strings::local_detached_name(&render::local_label(), session),
+            session: self
+                .detached_local()
+                .into_iter()
+                .find(|(id, _)| *id == session)
+                .map(|(_, name)| name)
+                .unwrap_or_else(|| format!("{} #{session}", render::local_label())),
         });
         self.modal_focused = false;
         cx.notify();

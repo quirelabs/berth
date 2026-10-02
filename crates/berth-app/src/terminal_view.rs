@@ -68,6 +68,9 @@ pub struct Intake {
     echo: Mutex<Option<Echo>>,
     /// The recent keystroke-to-echo time, which sets how long to look.
     recent_echo: Mutex<Option<Duration>>,
+    /// When output last arrived: with no frame since, the window is not being
+    /// drawn (D50).
+    last_output: Mutex<Option<Instant>>,
 }
 
 /// The first output after a keystroke.
@@ -104,6 +107,7 @@ impl Intake {
     /// is Berth's own render cost.
     pub fn arrived(&self, len: usize, seq: u64) {
         self.bytes.fetch_add(len as u64, Ordering::Relaxed);
+        *lock(&self.last_output) = Some(Instant::now());
         if let Some(sent) = lock(&self.keystroke).take() {
             let round_trip = sent.elapsed();
             let mut recent = lock(&self.recent_echo);
@@ -114,6 +118,11 @@ impl Intake {
                 seq,
             });
         }
+    }
+
+    /// When output last arrived.
+    pub fn last_output(&self) -> Option<Instant> {
+        *lock(&self.last_output)
     }
 
     /// The echo, if a frame showing write `painted` shows it.

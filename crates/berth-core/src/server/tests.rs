@@ -72,11 +72,20 @@ async fn server() -> Server {
     }
 }
 
+/// The next message, confirming output and screens as an app does: a worker
+/// that is waiting for a screen to be confirmed sends nothing more (D49).
 async fn next(client: &mut Client) -> ToApp {
-    timeout(Duration::from_secs(10), client.from_server.recv())
+    let message = timeout(Duration::from_secs(10), client.from_server.recv())
         .await
         .expect("the server answered in time")
-        .expect("the connection stayed open")
+        .expect("the connection stayed open");
+    if let ToApp::Output { session, seq, .. } | ToApp::Screen { session, seq, .. } = &message {
+        let _ = client.to_server.try_send(ToServer::Confirmed {
+            session: *session,
+            seq: *seq,
+        });
+    }
+    message
 }
 
 async fn create(client: &mut Client) -> SessionId {
@@ -385,7 +394,7 @@ async fn a_client_that_fell_behind_catches_up() {
     // Reading again: a screen arrives before long, then the session answers.
     let screen = timeout(Duration::from_secs(20), async {
         loop {
-            if let Some(ToApp::Screen { .. }) = slow.from_server.recv().await {
+            if let ToApp::Screen { .. } = next(&mut slow).await {
                 return;
             }
         }
@@ -521,5 +530,263 @@ mod through_the_app {
 
         // Reading again, the flooding pane reaches the end.
         until(&mut flood_events, "flood_done").await;
+    }
+}
+
+mod sync_under_load {
+    //! Piece 5's gate (D51): after a flood that prunes the history several
+    //! times, with the app falling behind on the way, the app's scrollback
+    //! equals the worker's line for line.
+    use super::*;
+    use crate::pty::PtyEvent;
+    use crate::server::local::{LocalServer, Start};
+    use berth_term::size::{CellSize, TermSize};
+    use berth_term::terminal::Terminal;
+
+    fn text(row: &v1::Row) -> String {
+        row.cells
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The worker's own history and screen, as a fresh attach receives them.
+    async fn worker_view(places: &Places, session: SessionId) -> (Vec<String>, Vec<String>) {
+        let mut raw = client::connect(places).await.unwrap();
+        raw.to_server
+            .send(ToServer::Attach {
+                session,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .unwrap();
+        let mut screen = None;
+        let mut history: Vec<String> = Vec::new();
+        loop {
+            match next(&mut raw).await {
+                ToApp::Screen {
+                    screen: packed,
+                    history_follows: true,
+                    ..
+                } => {
+                    let s: v1::Screen = packed.unpack().unwrap();
+                    screen = Some(s.lines.iter().map(text).collect());
+                }
+                ToApp::History {
+                    lines, complete, ..
+                } if screen.is_some() => {
+                    let rows: Vec<v1::Row> = lines.unpack().unwrap();
+                    history.extend(rows.iter().map(text));
+                    if complete {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        history.reverse();
+        (history, screen.unwrap_or_default())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_a_pruning_flood_the_app_holds_the_workers_history_line_for_line() {
+        let server = server().await;
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let session = app.create(None, 80, 24, None, None).await.unwrap();
+        let (pty, mut events) = app.attach(session, 80, 24, None).await.unwrap();
+
+        // The app's terminal, fed as the app's pump feeds it.
+        let terminal = std::sync::Arc::new(Terminal::new(
+            TermSize::new(80, 24),
+            CellSize::new(8.0, 16.0),
+        ));
+        let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, done) = tokio::sync::oneshot::channel::<()>();
+        // Keeps feeding to the end: the screen and history that close the
+        // flood come after its last line is first seen.
+        let _feeding = {
+            let terminal = terminal.clone();
+            let pause = pause.clone();
+            let mut done_tx = Some(done_tx);
+            tokio::spawn(async move {
+                let mut tail = Vec::new();
+                loop {
+                    while pause.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    match events.recv().await {
+                        Some(PtyEvent::Output(bytes)) => {
+                            terminal.advance(&bytes);
+                            tail.extend_from_slice(&bytes);
+                            if String::from_utf8_lossy(&tail).contains("flood_done")
+                                && let Some(tx) = done_tx.take()
+                            {
+                                let _ = tx.send(());
+                            }
+                            if tail.len() > 8192 {
+                                tail.drain(..tail.len() - 4096);
+                            }
+                        }
+                        Some(_) => {}
+                        None => return,
+                    }
+                }
+            })
+        };
+
+        pty.write(b"seq 1 200000; echo flood_do\"\"ne\n".to_vec())
+            .await;
+        // Fall behind for a while in the middle of it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pause.store(true, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        pause.store(false, std::sync::atomic::Ordering::Relaxed);
+        timeout(Duration::from_secs(60), done)
+            .await
+            .expect("the flood reached the app")
+            .unwrap();
+        // Let the last screen and its history land, and the terminal parse.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let (worker_history, worker_screen) = worker_view(&server.places, session).await;
+        let app_screen = terminal.wire_screen().unwrap();
+        let mut app_history: Vec<String> = terminal
+            .wire_history(Some(app_screen.first_line), u32::MAX)
+            .lines
+            .iter()
+            .map(text)
+            .collect();
+        app_history.reverse();
+        let app_screen: Vec<String> = app_screen.lines.iter().map(text).collect();
+
+        assert!(
+            worker_history.len() > 9_000,
+            "the worker kept {}",
+            worker_history.len()
+        );
+        assert_eq!(app_screen, worker_screen, "the screens differ");
+        // Line for line, newest backwards, for as far as both hold.
+        let both = app_history.len().min(worker_history.len());
+        let app_tail = &app_history[app_history.len() - both..];
+        let worker_tail = &worker_history[worker_history.len() - both..];
+        if let Some(at) = (0..both).find(|&i| app_tail[i] != worker_tail[i]) {
+            panic!(
+                "line {at} of the last {both} differs: app {:?}, worker {:?}",
+                app_tail[at], worker_tail[at]
+            );
+        }
+        // And as many: the last thing the app did was rebuild from the
+        // worker's history, and nothing since has pruned it.
+        assert_eq!(
+            app_history.len(),
+            worker_history.len(),
+            "app {} lines, worker {}",
+            app_history.len(),
+            worker_history.len()
+        );
+    }
+
+    /// Attach a raw client and take the screen and history it is sent first.
+    async fn attached(server: &Server) -> (Client, SessionId) {
+        let mut app = client::connect(&server.places).await.unwrap();
+        let session = create(&mut app).await;
+        app.to_server
+            .send(ToServer::Attach {
+                session,
+                cols: 40,
+                rows: 10,
+            })
+            .await
+            .unwrap();
+        loop {
+            if let ToApp::History { complete: true, .. } = next(&mut app).await {
+                break;
+            }
+        }
+        (app, session)
+    }
+
+    /// A program leaving the alternate screen is followed by a screen with
+    /// its history, so what lies underneath is right even for an app that
+    /// only ever saw the program (D49).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leaving_the_alternate_screen_sends_a_screen_with_history() {
+        let server = server().await;
+        let (mut app, session) = attached(&server).await;
+        type_line(
+            &app,
+            session,
+            "printf '\\033[?1049h'; sleep 0.3; printf 'in_alt'; sleep 0.3; printf '\\033[?1049l'; sleep 0.3; echo back_ou\"\"t",
+        )
+        .await;
+        let got = timeout(Duration::from_secs(10), async {
+            loop {
+                if let ToApp::Screen {
+                    history_follows: true,
+                    screen,
+                    ..
+                } = next(&mut app).await
+                {
+                    let screen: v1::Screen = screen.unpack().unwrap();
+                    if !screen.modes.alternate_screen {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(got.is_ok(), "no screen after leaving the alternate screen");
+    }
+
+    /// While the window is hidden nothing is sent; shown again, a screen
+    /// with what happened meanwhile (D50).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hidden_window_is_sent_nothing_until_shown() {
+        let server = server().await;
+        let (mut app, session) = attached(&server).await;
+        app.to_server
+            .send(ToServer::Visible { visible: false })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        type_line(&app, session, "echo while_$((4*4))").await;
+        let quiet = timeout(Duration::from_millis(800), async {
+            loop {
+                if let ToApp::Output { bytes, .. } = next(&mut app).await
+                    && String::from_utf8_lossy(&bytes).contains("while_16")
+                {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "output reached a hidden window");
+
+        app.to_server
+            .send(ToServer::Visible { visible: true })
+            .await
+            .unwrap();
+        loop {
+            if let ToApp::Screen {
+                history_follows: true,
+                screen,
+                ..
+            } = next(&mut app).await
+            {
+                let screen: v1::Screen = screen.unpack().unwrap();
+                let text: String = screen
+                    .lines
+                    .iter()
+                    .flat_map(|r| r.cells.iter().map(|c| c.text.as_str()))
+                    .collect();
+                assert!(text.contains("while_16"), "{text}");
+                break;
+            }
+        }
     }
 }
