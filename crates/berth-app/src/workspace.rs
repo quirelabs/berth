@@ -30,6 +30,9 @@ use crate::theme::{Appearance, Theme, hsla};
 use crate::{runtime, session};
 use gpui::svg;
 
+/// How often the local server's session list is read for the sidebar.
+const LOCAL_LIST_EVERY: Duration = Duration::from_secs(3);
+
 /// A tooltip body. gpui wants a view, and this is the whole of it.
 struct Note {
     text: gpui::SharedString,
@@ -125,6 +128,11 @@ struct Pane {
     /// A local session from a previous run whose tab has not been shown yet,
     /// so its shell has not started (D46).
     restored: Option<saving::Restored>,
+    /// The local server's session this pane shows (D50).
+    session: Option<u64>,
+    /// Why this local pane runs a shell of its own instead, shown on it: it
+    /// will not survive quitting (D50).
+    direct: Option<String>,
 }
 
 impl Pane {
@@ -271,6 +279,12 @@ pub struct Workspace {
     /// Where the Claude plugin and shim were put, or `None` if they could not
     /// be, in which case panes open without the shim (D48).
     claude_base: Option<std::path::PathBuf>,
+    /// The local server, once started, or why local tabs run without it
+    /// (D50).
+    local_server: session::LocalServerCell,
+    /// The local server's sessions, as last listed: what the sidebar shows
+    /// under this machine besides the open tabs.
+    local_sessions: Vec<berth_proto::v1::SessionInfo>,
 }
 
 impl Workspace {
@@ -317,6 +331,8 @@ impl Workspace {
             expanded: std::collections::BTreeMap::new(),
             menu: None,
             claude_base: install_claude_support(),
+            local_server: Default::default(),
+            local_sessions: Vec::new(),
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -325,7 +341,61 @@ impl Workspace {
         this.restore_local(cx);
         this.warm(cx);
         this.watch_saves(cx);
+        this.watch_local_sessions(cx);
         this
+    }
+
+    /// Why local tabs skip the local server, if they do: the dogfooding
+    /// escape hatch, by environment or setting (D50).
+    fn local_direct(&self) -> Option<String> {
+        if berth_core::env::local_direct() {
+            Some(strings::LOCAL_DIRECT_BY_ENV.to_string())
+        } else if self.settings.local_direct {
+            Some(strings::LOCAL_DIRECT_BY_SETTING.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Keep the local server's session list current for the sidebar. Only
+    /// once the server is up: this never starts it.
+    fn watch_local_sessions(&self, cx: &mut Context<Self>) {
+        let cell = self.local_server.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(LOCAL_LIST_EVERY).await;
+                let Some(Ok(server)) = cell.get().cloned() else {
+                    if this.update(cx, |_, _| ()).is_err() {
+                        return;
+                    }
+                    continue;
+                };
+                let listed = runtime::spawn(async move { server.list().await })
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok());
+                let alive = this.update(cx, |this, cx| {
+                    if let Some(list) = listed
+                        && list != this.local_sessions
+                    {
+                        this.local_sessions = list;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Local server sessions that no pane shows.
+    fn detached_local(&self) -> Vec<&berth_proto::v1::SessionInfo> {
+        self.local_sessions
+            .iter()
+            .filter(|s| !self.panes.iter().any(|p| p.session == Some(s.id)))
+            .collect()
     }
 
     // -- sessions ----------------------------------------------------------
@@ -488,38 +558,50 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Open a shell on this machine.
-    ///
-    /// No connection, no tmux, no reconnect machine, because there is nothing
-    /// to reconnect to. The view, the pump and therefore the recording are the
-    /// same ones a remote session uses (D36).
+    /// Open a shell on this machine: a new session on the local server
+    /// (D50), which outlives the app, or, when the server is off or will not
+    /// start, a shell of its own that says on the tab that it will not.
     fn open_local(&mut self, place: Place, cx: &mut Context<Self>) {
         tracing::info!(shell = %berth_core::local::login_shell(), "opening a local shell");
         let pane_env = self.pane_env();
         let token = Some(pane_env.token.clone());
+        let cell = self.local_server.clone();
+        let direct = self.local_direct();
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let opened = runtime::spawn(session::open_local(80, 24, palette, pane_env))
-                .await
-                .map_err(|_| strings::RUNTIME_DROPPED.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()));
+            let opened = runtime::spawn(session::open_local_tab(
+                cell,
+                direct,
+                (80, 24),
+                palette,
+                pane_env,
+                None,
+            ))
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
 
             match opened {
-                Ok(local) => {
+                Ok(tab) => {
                     let _ = this.update(cx, |this, cx| {
-                        this.place_pane(
+                        let id = this.place_pane(
                             None,
                             strings::LOCAL_ALIAS.to_string(),
                             token,
-                            local.terminal,
-                            local.pty,
-                            local.events,
+                            tab.local.terminal,
+                            tab.local.pty,
+                            tab.local.events,
                             installed,
                             place,
                             cx,
                         );
+                        if let Some(pane) = this.pane_mut(id) {
+                            pane.session = tab.session;
+                            pane.direct = tab.direct;
+                        }
                         this.report_cold_start(strings::LOCAL_ALIAS);
+                        this.refresh_local_sessions(cx);
                     });
                     if crate::bench::Bench::from_env() == Some(crate::bench::Bench::LocalCat) {
                         Self::run_local_benchmark(&this, cx).await;
@@ -532,6 +614,77 @@ impl Workspace {
                         cx.notify();
                     });
                 }
+            }
+        })
+        .detach();
+    }
+
+    /// Show a local server session that no tab shows, in a tab of its own.
+    fn attach_local(&mut self, session_id: u64, cx: &mut Context<Self>) {
+        if let Some(pane) = self.panes.iter().find(|p| p.session == Some(session_id)) {
+            let id = pane.id;
+            self.focus_pane(id, cx);
+            return;
+        }
+        let Some(Ok(server)) = self.local_server.get().cloned() else {
+            return;
+        };
+        tracing::info!(session = session_id, "attaching a local session");
+        cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
+            let attached = runtime::spawn(async move {
+                session::attach_session(&server, session_id, 80, 24, palette).await
+            })
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| match attached {
+                Ok(local) => {
+                    // Claude status for a session opened in an earlier run
+                    // waits for the worker to report it (step 2, piece 6): the
+                    // pane's token is not known here.
+                    let id = this.place_pane(
+                        None,
+                        strings::LOCAL_ALIAS.to_string(),
+                        None,
+                        local.terminal,
+                        local.pty,
+                        local.events,
+                        installed,
+                        Place::Tab { show: true },
+                        cx,
+                    );
+                    if let Some(pane) = this.pane_mut(id) {
+                        pane.session = Some(session_id);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not attach a local session");
+                    this.warnings.push(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Read the local server's session list now, rather than at the next
+    /// interval: after opening, closing or ending a session.
+    fn refresh_local_sessions(&self, cx: &mut Context<Self>) {
+        let Some(Ok(server)) = self.local_server.get().cloned() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let listed = runtime::spawn(async move { server.list().await })
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+            if let Some(list) = listed {
+                let _ = this.update(cx, |this, cx| {
+                    this.local_sessions = list;
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -620,6 +773,8 @@ impl Workspace {
             view,
             claude: token.map(ClaudePane::new),
             restored: None,
+            session: None,
+            direct: None,
         });
 
         match place {
@@ -1158,6 +1313,10 @@ impl Workspace {
 
     /// Ask before ending a session. Never kill directly from a click.
     fn ask_kill(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(session) = self.pane(id).and_then(|p| p.session) {
+            self.ask_kill_local(session, Some(id), cx);
+            return;
+        }
         let Some(pane) = self.pane(id).filter(|p| !p.is_local()) else {
             return;
         };
@@ -1166,6 +1325,18 @@ impl Workspace {
             alias: pane.alias().to_string(),
             slug: pane.slug.clone(),
             session: pane.tmux_name(),
+        });
+        self.modal_focused = false;
+        cx.notify();
+    }
+
+    /// Ask before ending a local server session (D50), shown or not.
+    fn ask_kill_local(&mut self, session: u64, pane: Option<u64>, cx: &mut Context<Self>) {
+        self.modal = Some(Modal::Kill {
+            pane,
+            alias: strings::LOCAL_ALIAS.to_string(),
+            slug: session.to_string(),
+            session: strings::local_detached_name(&render::local_label(), session),
         });
         self.modal_focused = false;
         cx.notify();
@@ -1266,6 +1437,10 @@ impl Workspace {
     /// End a tmux session and everything running in it, and close its pane if
     /// it has one.
     fn kill(&mut self, alias: String, slug: String, pane: Option<u64>, cx: &mut Context<Self>) {
+        if alias == strings::LOCAL_ALIAS {
+            self.kill_local(&slug, pane, cx);
+            return;
+        }
         let session = berth_core::session::Session::new(slug.clone(), 80, 24);
         let name = session.tmux_name();
         let command = session.kill_command();
@@ -1287,6 +1462,26 @@ impl Workspace {
         })
         .detach();
 
+        if let Some(pane) = pane {
+            self.close(pane, cx);
+        }
+        cx.notify();
+    }
+
+    /// End a local server session: its shell and everything running in it.
+    fn kill_local(&mut self, session: &str, pane: Option<u64>, cx: &mut Context<Self>) {
+        let (Ok(session), Some(Ok(server))) =
+            (session.parse::<u64>(), self.local_server.get().cloned())
+        else {
+            return;
+        };
+        tracing::warn!(session, "ending a local session");
+        self.local_sessions.retain(|s| s.id != session);
+        cx.spawn(async move |this, cx| {
+            let _ = runtime::spawn(async move { server.kill(session).await }).await;
+            let _ = this.update(cx, |this, cx| this.refresh_local_sessions(cx));
+        })
+        .detach();
         if let Some(pane) = pane {
             self.close(pane, cx);
         }
@@ -1345,14 +1540,18 @@ impl Workspace {
         };
         let facts = match target {
             Target::Pane(id) => Facts {
-                local: self.pane(*id).is_some_and(|p| p.is_local()),
+                local: self
+                    .pane(*id)
+                    .is_some_and(|p| p.is_local() && p.session.is_none()),
                 connected: false,
             },
             Target::Host(alias) => Facts {
                 local: false,
                 connected: self.conns.contains_key(alias),
             },
-            Target::Detached { .. } | Target::Local => Facts::default(),
+            Target::Detached { .. } | Target::LocalDetached { .. } | Target::Local => {
+                Facts::default()
+            }
         };
         crate::menu::actions(target, facts)
     }
@@ -1370,6 +1569,10 @@ impl Workspace {
                 self.ask_kill_detached(alias, slug, cx)
             }
             (Action::Open, Target::Detached { alias, slug }) => self.open_session(alias, slug, cx),
+            (Action::Open, Target::LocalDetached { session }) => self.attach_local(session, cx),
+            (Action::EndSession, Target::LocalDetached { session }) => {
+                self.ask_kill_local(session, None, cx)
+            }
             (Action::NewTerminal, Target::Local) => {
                 self.new_terminal(crate::sidebar::Folder::Local, cx)
             }

@@ -13,6 +13,8 @@ pub enum Target {
     Pane(u64),
     /// A remote session running with no tab.
     Detached { alias: String, slug: String },
+    /// A local server session running with no tab (D50).
+    LocalDetached { session: u64 },
     /// A host folder.
     Host(String),
     /// The "This machine" folder.
@@ -41,7 +43,8 @@ pub enum Action {
 /// What the menu needs to know beyond the target itself.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Facts {
-    /// The pane is a local shell.
+    /// The pane is a local shell of its own, which closing ends. A local
+    /// session on the local server detaches like a remote one (D50).
     pub local: bool,
     /// The host has a live connection.
     pub connected: bool,
@@ -52,7 +55,9 @@ pub fn actions(target: &Target, facts: Facts) -> Vec<Action> {
     match target {
         Target::Pane(_) if facts.local => vec![Action::Rename, Action::Close],
         Target::Pane(_) => vec![Action::Rename, Action::Detach, Action::EndSession],
-        Target::Detached { .. } => vec![Action::Open, Action::EndSession],
+        Target::Detached { .. } | Target::LocalDetached { .. } => {
+            vec![Action::Open, Action::EndSession]
+        }
         Target::Host(_) if facts.connected => vec![Action::NewTerminal, Action::RenameHost],
         Target::Host(_) => vec![Action::Connect, Action::RenameHost],
         Target::Local => vec![Action::NewTerminal],
@@ -109,6 +114,20 @@ mod tests {
         assert!(actions.contains(&Action::Close));
         assert!(!actions.contains(&Action::EndSession));
         assert!(!actions.contains(&Action::Detach));
+    }
+
+    /// A local session on the local server detaches like a remote one, and
+    /// ending it is its own, confirmed action (D50).
+    #[test]
+    fn a_local_server_session_detaches_and_ends_like_a_remote_one() {
+        assert_eq!(
+            actions(&Target::Pane(1), Facts::default()),
+            [Action::Rename, Action::Detach, Action::EndSession]
+        );
+        assert_eq!(
+            actions(&Target::LocalDetached { session: 3 }, Facts::default()),
+            [Action::Open, Action::EndSession]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! needs are the ones it already had.
 
 use super::*;
+use gpui::prelude::FluentBuilder as _;
 
 impl Workspace {
     fn warnings(&self) -> impl IntoElement {
@@ -39,12 +40,18 @@ impl Workspace {
             .collect();
         let open = self.open_sessions();
         let shell = local_label();
+        let detached: Vec<String> = self
+            .detached_local()
+            .iter()
+            .map(|s| strings::local_detached_name(&shell, s.id))
+            .collect();
         let rows = crate::sidebar::rows(&Input {
             hosts: &hosts,
             open: &open,
             running: &self.running,
             expanded: &self.expanded,
             local_label: &shell,
+            local_detached: &detached,
         });
 
         let mut list = div().flex().flex_col().gap(px(1.0));
@@ -282,13 +289,23 @@ impl Workspace {
         let detached = pane.is_none();
 
         let slug = name.clone();
+        // A local server session no tab shows, found again by the name the
+        // tree gave it.
+        let shell = local_label();
+        let local_session = self
+            .detached_local()
+            .iter()
+            .find(|s| strings::local_detached_name(&shell, s.id) == name)
+            .map(|s| s.id);
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
             (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {
                 alias: alias.clone(),
                 slug: name.clone(),
             }),
-            (crate::sidebar::Folder::Local, None) => None,
+            (crate::sidebar::Folder::Local, None) => {
+                local_session.map(|session| crate::menu::Target::LocalDetached { session })
+            }
         };
         let mut row = div()
             .id(("session", index))
@@ -306,7 +323,11 @@ impl Workspace {
                 (crate::sidebar::Folder::Host(alias), None) => {
                     this.open_session(alias.clone(), slug.clone(), cx)
                 }
-                (crate::sidebar::Folder::Local, None) => {}
+                (crate::sidebar::Folder::Local, None) => {
+                    if let Some(session) = local_session {
+                        this.attach_local(session, cx)
+                    }
+                }
             }))
             .hover(|row| row.bg(hsla(theme.border)))
             .flex()
@@ -862,11 +883,25 @@ impl Workspace {
                         cx.listener(move |this, _, _, cx| this.focus_pane(pane_id, cx)),
                     )
                     .flex()
+                    .flex_col()
                     .flex_1()
                     .overflow_hidden()
                     .border_1()
                     .border_color(hsla(if focused { theme.accent } else { theme.border }))
-                    .child(pane.view.clone())
+                    // Never a silent fallback: a local tab running its shell
+                    // outside the local server says so, and why (D50).
+                    .when_some(pane.direct.clone(), |this, reason| {
+                        this.child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .text_xs()
+                                .bg(hsla(theme.border))
+                                .text_color(hsla(theme.text_muted))
+                                .child(strings::local_direct_notice(&reason)),
+                        )
+                    })
+                    .child(div().flex().flex_1().min_h_0().child(pane.view.clone()))
                     .into_any_element()
             }
             Node::Split {
@@ -1078,7 +1113,7 @@ const TAB_LABEL_CHARS: usize = 22;
 const INDENT: f32 = 36.0;
 
 /// What a local shell is called in the tree: the shell's own name.
-fn local_label() -> String {
+pub(super) fn local_label() -> String {
     let shell = berth_core::local::login_shell();
     let name = shell
         .rsplit(['/', '\\'])

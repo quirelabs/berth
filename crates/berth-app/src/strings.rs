@@ -21,6 +21,22 @@ pub const SESSION_DETACHED_TOOLTIP: &str =
 /// alias: a config with an entry called `local` must not collide with it.
 pub const LOCAL_ALIAS: &str = "local";
 
+/// On a local tab that runs a shell directly rather than on the local server
+/// (D50), with why. Never a silent fallback.
+pub fn local_direct_notice(reason: &str) -> String {
+    format!("This session won't survive quitting: {reason}")
+}
+/// A local server session no tab shows, in the sidebar: the shell's name
+/// and the session's number.
+pub fn local_detached_name(label: &str, session: u64) -> String {
+    format!("{label} #{session}")
+}
+pub const LOCAL_DIRECT_BY_ENV: &str = "BERTH_LOCAL_DIRECT is set";
+pub const LOCAL_DIRECT_BY_SETTING: &str = "local_direct is on in settings";
+pub fn local_server_failed(error: &str) -> String {
+    format!("the local server could not start ({error})")
+}
+
 pub const STATE_DISCONNECTED: &str = "Disconnected";
 pub const STATE_CONNECTING: &str = "Connecting";
 pub const STATE_CONNECTED: &str = "Connected";

@@ -24,6 +24,10 @@ pub(super) struct Restored {
     pub cwd: Option<PathBuf>,
     /// The Claude conversation to resume in it, if one was running (D48).
     pub claude: Option<SavedClaude>,
+    /// The local server's session it showed, to attach to again if it is
+    /// still running (D50), and that session's pane token.
+    pub session: Option<u64>,
+    pub token: Option<String>,
 }
 
 /// Where a pane's directory comes from when saving: already known, or to be
@@ -123,12 +127,18 @@ impl Workspace {
             restored: Some(Restored {
                 cwd: saved.cwd,
                 claude: saved.claude,
+                session: saved.session,
+                token: saved.token,
             }),
+            session: None,
+            direct: None,
         });
         id
     }
 
-    /// Start a new shell in a restored pane, where the old one was.
+    /// Bring a restored pane back: attach to its session if the local server
+    /// still runs it (D50), and otherwise start a new one where the old one
+    /// was, resuming its Claude conversation (D46, D48).
     fn resume(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(pane) = self.pane_mut(id) else {
             return;
@@ -157,38 +167,85 @@ impl Workspace {
                 type_it = Some(claude.session.clone());
             }
         }
-        if let Some(pane) = self.pane_mut(id) {
-            pane.claude = Some(super::ClaudePane::new(pane_env.token.clone()));
-        }
-        tracing::info!(cwd = ?restored.cwd, "starting a shell in a restored session");
+        let fresh_token = pane_env.token.clone();
+        let saved_token = restored
+            .token
+            .as_deref()
+            .and_then(berth_core::claude::PaneToken::parse);
+        let cell = self.local_server.clone();
+        let direct = self.local_direct();
+        let saved_session = restored.session;
+        tracing::info!(cwd = ?restored.cwd, session = ?saved_session, "bringing back a restored session");
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
             let opened = runtime::spawn(async move {
-                match &dir {
-                    Some(cwd) => {
-                        berth_core::local::open_in(cwd, size.cols, size.rows, Some(&pane_env)).await
-                    }
-                    None => berth_core::local::open(size.cols, size.rows, Some(&pane_env)).await,
+                if let Some(session_id) = saved_session
+                    && let Ok(server) = session::local_server(cell.clone(), direct.clone()).await
+                    && server
+                        .list()
+                        .await
+                        .is_ok_and(|list| list.iter().any(|s| s.id == session_id))
+                {
+                    let local =
+                        session::attach_session(&server, session_id, size.cols, size.rows, palette)
+                            .await?;
+                    return Ok((
+                        session::LocalTab {
+                            local,
+                            session: Some(session_id),
+                            direct: None,
+                        },
+                        true,
+                    ));
                 }
+                let tab = session::open_local_tab(
+                    cell,
+                    direct,
+                    (size.cols, size.rows),
+                    palette,
+                    pane_env,
+                    dir,
+                )
+                .await?;
+                Ok::<_, berth_core::Error>((tab, false))
             })
             .await
             .map_err(|_| strings::RUNTIME_DROPPED.to_string())
             .and_then(|r| r.map_err(|e| e.to_string()));
 
             let _ = this.update(cx, |this, cx| match opened {
-                Ok((pty, events)) => {
-                    if let Some(session) = &type_it {
+                Ok((tab, reattached)) => {
+                    let pty = tab.local.pty;
+                    if let Some(pane) = this.pane_mut(id) {
+                        pane.session = tab.session;
+                        pane.direct = tab.direct;
+                        let token = if reattached {
+                            saved_token
+                        } else {
+                            Some(fresh_token)
+                        };
+                        pane.claude = token.map(super::ClaudePane::new);
+                    }
+                    if !reattached && let Some(session) = &type_it {
                         resume_claude(&pty, session);
                     }
                     view.update(cx, |view, _| {
-                        view.resume(pty);
-                        session::start_pump(view, events);
+                        // A session still running brings its own screen; a
+                        // new shell takes the old prompt's line.
+                        if reattached {
+                            view.swap_pty(pty);
+                        } else {
+                            view.resume(pty);
+                        }
+                        session::start_pump(view, tab.local.events);
                     });
+                    this.refresh_local_sessions(cx);
                     cx.notify();
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "could not start a shell in a restored session");
+                    tracing::warn!(%error, "could not bring back a restored session");
                     this.warnings.push(error);
                     cx.notify();
                 }
@@ -228,6 +285,17 @@ impl Workspace {
                     },
                 );
                 saved.push(SavedPane {
+                    session: match &pane.restored {
+                        Some(restored) => restored.session,
+                        None => pane.session,
+                    },
+                    token: match &pane.restored {
+                        Some(restored) => restored.token.clone(),
+                        None => pane
+                            .session
+                            .and(pane.claude.as_ref())
+                            .map(|c| c.token.as_str().to_string()),
+                    },
                     cwd: None,
                     cols: size.cols,
                     rows: size.rows,

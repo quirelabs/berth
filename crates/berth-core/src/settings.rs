@@ -39,6 +39,11 @@ pub struct Settings {
     /// Names shown instead of a host's alias, by alias. Berth never writes to
     /// ssh config, so a host is renamed here and only here.
     pub host_names: std::collections::BTreeMap<String, String>,
+    /// Local tabs go straight to a shell, as before the local server, which
+    /// then does not survive quitting. An escape hatch while the server is
+    /// dogfooded, so a bug in it cannot block a day's work. Removed before
+    /// v0.1.0 (D50).
+    pub local_direct: bool,
 }
 
 impl Default for Settings {
@@ -46,6 +51,7 @@ impl Default for Settings {
         Self {
             font_size: DEFAULT_FONT_SIZE,
             host_names: std::collections::BTreeMap::new(),
+            local_direct: false,
         }
     }
 }

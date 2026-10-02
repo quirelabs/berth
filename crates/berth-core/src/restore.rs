@@ -89,6 +89,16 @@ pub struct SavedPane {
     /// tab can resume it (D48). Absent in files from before D48.
     #[serde(default)]
     pub claude: Option<SavedClaude>,
+    /// The local server's session this pane showed (D50), to attach to again
+    /// if it is still running. Absent in files from before the server, and
+    /// after a reboot it names nothing.
+    #[serde(default)]
+    pub session: Option<u64>,
+    /// That session's pane token, so Claude's signals from it are believed
+    /// again after a relaunch (D48). Keeps stray output from being believed;
+    /// it protects nothing from code running as the user.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// A Claude conversation to resume: its id and the directory it is scoped to.
@@ -217,6 +227,8 @@ mod tests {
             rows: 24,
             screen: "\x1b[0m\x1b[H\x1b[2J\x1b[1;1H$ ls\r\n\"quoted\" \\ back".into(),
             claude: None,
+            session: None,
+            token: None,
         }
     }
 
@@ -367,6 +379,28 @@ mod tests {
         let loaded = Saved::load_from(&path);
         assert_eq!(loaded.tabs.len(), 1);
         assert_eq!(loaded.tabs[0].panes[0].claude, None);
+        assert_eq!(
+            loaded.tabs[0].panes[0].session, None,
+            "nor a server session (D50)"
+        );
+    }
+
+    /// A pane on the local server keeps its session and token across a save.
+    #[test]
+    fn a_server_session_is_remembered() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        let mut tab = split_tab();
+        tab.panes[0].session = Some(7);
+        tab.panes[0].token = Some("0123456789abcdef0123456789abcdef".into());
+        let saved = Saved {
+            version: VERSION,
+            tabs: vec![tab],
+        };
+        saved.save_to(&path);
+        let loaded = Saved::load_from(&path);
+        assert_eq!(loaded.tabs[0].panes[0].session, Some(7));
+        assert_eq!(loaded.tabs[0].panes[1].session, None);
     }
 
     /// An id that is not a strict UUID would be typed into a shell. It is

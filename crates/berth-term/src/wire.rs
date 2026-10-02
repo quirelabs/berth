@@ -192,11 +192,22 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
             .rposition(|c| !is_blank(c))
             .map_or(0, |i| i + 1);
         // A wrapped row is written to the edge, so the next character wraps
-        // onto the next row exactly as it did in the program.
-        let end = if row.wrapped && y + 1 < screen.lines.len() {
-            row.cells.len()
-        } else {
+        // onto the next row exactly as it did in the program. The exception
+        // is the empty cell a wide glyph leaves when it does not fit in the
+        // last column: left unwritten, the glyph wraps by itself and the
+        // terminal leaves that cell exactly as it was.
+        let runs_on = row.wrapped && y + 1 < screen.lines.len();
+        let wide_next = screen
+            .lines
+            .get(y + 1)
+            .and_then(|next| next.cells.first())
+            .is_some_and(|cell| cell.width == 2);
+        let end = if !runs_on {
             last
+        } else if wide_next && row.cells.last().is_some_and(|c| c.text.is_empty()) {
+            row.cells.len() - 1
+        } else {
+            row.cells.len()
         };
         let mut style: Option<(u16, v1::Color, v1::Color)> = None;
         for cell in &row.cells[..end] {
@@ -215,7 +226,7 @@ pub fn replay(screen: &v1::Screen) -> Vec<u8> {
             }
         }
         out.push_str("\x1b[0m");
-        placed_after_wrap = row.wrapped && end == row.cells.len() && y + 1 < screen.lines.len();
+        placed_after_wrap = runs_on;
     }
     let _ = write!(
         out,
@@ -307,6 +318,47 @@ mod tests {
         assert_eq!(got.lines, sent.lines);
         assert_eq!(got.cursor, sent.cursor);
         assert_eq!(got.modes, sent.modes);
+    }
+
+    fn round_trip(cols: u16, rows: u16, input: &str) {
+        let from = terminal(cols, rows, 100);
+        from.advance(input.as_bytes());
+        let sent = from.wire_screen().unwrap();
+        let to = terminal(cols, rows, 100);
+        to.advance(&super::replay(&sent));
+        let got = to.wire_screen().unwrap();
+        for (y, (a, b)) in sent.lines.iter().zip(&got.lines).enumerate() {
+            assert_eq!(a, b, "row {y} drifted for {input:?}");
+        }
+        assert_eq!(got.cursor, sent.cursor, "cursor drifted for {input:?}");
+    }
+
+    /// Where replay drifts, if it does: glyphs wider than a cell, graphemes
+    /// of several code points, and rows that end exactly at the edge.
+    #[test]
+    fn replay_keeps_wide_and_combined_glyphs_and_edge_wraps() {
+        // Wide characters, mid-row and across a soft wrap.
+        round_trip(
+            10,
+            4,
+            "ab\u{65e5}\u{672c}\u{8a9e}cd\u{4e2d}\u{6587}\u{5b57}",
+        );
+        // A wide glyph that does not fit in the last column wraps whole.
+        round_trip(5, 3, "abcd\u{65e5}x");
+        // Emoji with a skin-tone modifier, a ZWJ family and a flag.
+        round_trip(
+            16,
+            3,
+            "\u{1f44d}\u{1f3fd} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} \u{1f1f3}\u{1f1f1} ok",
+        );
+        // Combining marks, one and several on a base.
+        round_trip(10, 3, "e\u{301}a\u{308}\u{301}n\u{303}\u{3b1}\u{301}");
+        // A line exactly as wide as the row, then more: the wrap sits at the
+        // right edge, and the next row starts with what followed.
+        round_trip(8, 4, "12345678abc");
+        round_trip(8, 4, "12345678\r\nnext");
+        // Styled cells at the edge of a wrapped row keep their style.
+        round_trip(6, 3, "\x1b[41mabcdef\x1b[0mgh");
     }
 
     #[test]

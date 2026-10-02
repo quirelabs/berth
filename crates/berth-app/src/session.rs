@@ -55,14 +55,106 @@ pub struct Local {
     pub events: mpsc::Receiver<PtyEvent>,
 }
 
-/// Open a shell on this machine, with the same terminal a remote one gets.
-pub async fn open_local(
+/// The local server, started on first use, or why local tabs run without it
+/// (D50). Shared by every local tab, so it is started once.
+pub type LocalServerCell =
+    Arc<tokio::sync::OnceCell<Result<berth_core::server::local::LocalServer, String>>>;
+
+/// The local server, or why there is none: the escape hatch is on, or it
+/// would not start.
+pub async fn local_server(
+    cell: LocalServerCell,
+    direct: Option<String>,
+) -> Result<berth_core::server::local::LocalServer, String> {
+    cell.get_or_init(|| async move {
+        match direct {
+            Some(reason) => Err(reason),
+            None => berth_core::server::local::LocalServer::standard()
+                .await
+                .map_err(|e| crate::strings::local_server_failed(&e.to_string())),
+        }
+    })
+    .await
+    .clone()
+}
+
+/// A local tab as it opened.
+pub struct LocalTab {
+    pub local: Local,
+    /// The local server's session it shows.
+    pub session: Option<u64>,
+    /// Why it runs a shell of its own instead, which the tab says (D50).
+    pub direct: Option<String>,
+}
+
+/// Open a local tab: a new session on the local server, or, when the server
+/// is off or will not start, a shell of its own that says so.
+pub async fn open_local_tab(
+    cell: LocalServerCell,
+    direct: Option<String>,
+    size: (u16, u16),
+    palette: berth_term::terminal::Palette,
+    pane: berth_core::claude::PaneEnv,
+    cwd: Option<std::path::PathBuf>,
+) -> berth_core::Result<LocalTab> {
+    let (cols, rows) = size;
+    let reason = match local_server(cell, direct).await {
+        Ok(server) => {
+            let created = server
+                .create(
+                    cwd.clone(),
+                    cols,
+                    rows,
+                    Some(pane.token.as_str().to_string()),
+                    pane.resume.clone(),
+                )
+                .await;
+            match created {
+                Ok(session) => {
+                    let local = attach_session(&server, session, cols, rows, palette).await?;
+                    return Ok(LocalTab {
+                        local,
+                        session: Some(session),
+                        direct: None,
+                    });
+                }
+                Err(error) => crate::strings::local_server_failed(&error.to_string()),
+            }
+        }
+        Err(reason) => reason,
+    };
+    tracing::warn!(%reason, "a local tab runs its shell directly");
+    let (pty, events) = match &cwd {
+        Some(dir) => berth_core::local::open_in(dir, cols, rows, Some(&pane)).await?,
+        None => berth_core::local::open(cols, rows, Some(&pane)).await?,
+    };
+    Ok(LocalTab {
+        local: Local {
+            pty,
+            terminal: terminal_for(cols, rows, palette),
+            events,
+        },
+        session: None,
+        direct: Some(reason),
+    })
+}
+
+/// Attach to a session already running on the local server.
+pub async fn attach_session(
+    server: &berth_core::server::local::LocalServer,
+    session: u64,
     cols: u16,
     rows: u16,
     palette: berth_term::terminal::Palette,
-    pane: berth_core::claude::PaneEnv,
 ) -> berth_core::Result<Local> {
-    let (pty, events) = berth_core::local::open(cols, rows, Some(&pane)).await?;
+    // The shell's pid, which saving reads the directory from (D46).
+    let pid = server
+        .list()
+        .await
+        .ok()
+        .and_then(|list| list.into_iter().find(|s| s.id == session))
+        .and_then(|s| s.pid);
+    let (pty, events) = server.attach(session, cols, rows, pid).await?;
     Ok(Local {
         pty,
         terminal: terminal_for(cols, rows, palette),

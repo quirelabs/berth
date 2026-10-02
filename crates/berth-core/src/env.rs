@@ -21,6 +21,7 @@
 //! | `BERTH_BENCH_SETTLE` | seconds the cat benchmark waits before measuring |
 //! | `BERTH_REFRESH_HZ`   | the display's refresh rate, for the frame budget |
 //! | `BERTH_PIXEL_CHECK`  | run the pixel test, which needs a window server |
+//! | `BERTH_LOCAL_DIRECT` | `1` sends local tabs straight to a shell, not the local server; removed before v0.1.0 |
 //! | `BERTH_TEST_HOST`    | the alias the live suites connect to            |
 //! | `BERTH_TEST_CLAUDE`  | `1` runs the live Claude Code suite, which spends a few tokens |
 //! | `BERTH_TEST_OTHER_USER` | a second local account the socket tests connect as, through `sudo -n -u` |
@@ -74,6 +75,7 @@ pub const BENCH: &str = "BERTH_BENCH";
 pub const BENCH_SETTLE: &str = "BERTH_BENCH_SETTLE";
 pub const REFRESH_HZ: &str = "BERTH_REFRESH_HZ";
 pub const PIXEL_CHECK: &str = "BERTH_PIXEL_CHECK";
+pub const LOCAL_DIRECT: &str = "BERTH_LOCAL_DIRECT";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
 pub const TEST_OTHER_USER: &str = "BERTH_TEST_OTHER_USER";
@@ -105,6 +107,7 @@ const NAMES: &[&str] = &[
     TEST_HOST,
     TEST_CLAUDE,
     TEST_OTHER_USER,
+    LOCAL_DIRECT,
     WORKER_PANE,
     WORKER_RESUME,
 ];
@@ -163,6 +166,12 @@ pub fn data() -> Option<PathBuf> {
 /// so a settings page has something to set.
 pub fn shell() -> Option<String> {
     text(SHELL)
+}
+
+/// Whether local tabs skip the local server and go straight to a shell: the
+/// dogfooding escape hatch, removed before v0.1.0 (D50).
+pub fn local_direct() -> bool {
+    text(LOCAL_DIRECT).is_some_and(|v| v == "1")
 }
 
 /// The pane token a worker process's shell presents to Claude's hook.

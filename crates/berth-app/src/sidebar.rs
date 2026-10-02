@@ -67,6 +67,9 @@ pub struct Input<'a> {
     pub expanded: &'a BTreeMap<Folder, bool>,
     /// What a local shell is called, before numbering.
     pub local_label: &'a str,
+    /// Local server sessions no pane shows, by the name the tree gives them
+    /// (D50).
+    pub local_detached: &'a [String],
 }
 
 /// Berth's own sessions from one host's scan, with whether an agent is running
@@ -129,13 +132,19 @@ pub fn rows(input: &Input) -> Vec<Row> {
         );
     }
 
-    let local: Vec<(String, Option<u64>, bool)> = input
+    let mut local: Vec<(String, Option<u64>, bool)> = input
         .open
         .iter()
         .filter(|o| o.host.is_none())
         .enumerate()
         .map(|(index, o)| (local_name(input.local_label, index), Some(o.pane), false))
         .collect();
+    local.extend(
+        input
+            .local_detached
+            .iter()
+            .map(|name| (name.clone(), None, false)),
+    );
     push_folder(&mut out, Folder::Local, local, input.expanded);
 
     out
@@ -242,6 +251,7 @@ mod tests {
             running,
             expanded,
             local_label: "zsh",
+            local_detached: &[],
         })
     }
 
@@ -483,6 +493,33 @@ mod tests {
         let rows = build(&hosts, &open, &BTreeMap::new(), &BTreeMap::new());
         assert!(session_names(&rows, &Folder::Host("local".into())).is_empty());
         assert_eq!(session_names(&rows, &Folder::Local), ["zsh"]);
+    }
+
+    /// Local server sessions no tab shows sit under this machine, after the
+    /// open ones, with no pane (D50).
+    #[test]
+    fn detached_local_sessions_are_listed_under_this_machine() {
+        let open = [OpenSession {
+            pane: 1,
+            host: None,
+            slug: "local",
+        }];
+        let detached = ["zsh #4".to_string()];
+        let rows = rows(&Input {
+            hosts: &[],
+            open: &open,
+            running: &BTreeMap::new(),
+            expanded: &BTreeMap::new(),
+            local_label: "zsh",
+            local_detached: &detached,
+        });
+        assert_eq!(session_names(&rows, &Folder::Local), ["zsh", "zsh #4"]);
+        assert!(rows.contains(&Row::Session {
+            folder: Folder::Local,
+            name: "zsh #4".into(),
+            pane: None,
+            agent: false,
+        }));
     }
 
     #[test]
