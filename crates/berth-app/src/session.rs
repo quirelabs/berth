@@ -78,6 +78,10 @@ pub async fn local_server(
     .clone()
 }
 
+/// What Claude is doing in local server sessions, as their workers report
+/// it (D50), for the workspace to fold into its panes.
+pub type ClaudeReports = tokio::sync::mpsc::UnboundedSender<(u64, berth_proto::v1::Claude)>;
+
 /// A local tab as it opened.
 pub struct LocalTab {
     pub local: Local,
@@ -312,20 +316,34 @@ fn pump(terminal: SharedTerminal, intake: Arc<Intake>, mut events: mpsc::Receive
         let (batch, closed) = take_batch(first, &mut events);
         let mut bytes = Vec::new();
         for event in batch {
-            if let PtyEvent::Output(chunk) = event {
-                bytes.extend_from_slice(&chunk);
+            match event {
+                PtyEvent::Output(chunk) => bytes.extend_from_slice(&chunk),
+                // In order with the output: what came before it is fed first.
+                PtyEvent::Rebuild(step) => {
+                    feed(&terminal, &intake, &mut bytes);
+                    terminal.shadow(step);
+                }
+                PtyEvent::Exit(_) | PtyEvent::Closed => {}
             }
         }
-        if !bytes.is_empty() {
-            let seq = terminal.advance(&bytes);
-            intake.arrived(bytes.len(), seq);
-            terminal.wait_for_room(MAX_BACKLOG);
-        }
+        feed(&terminal, &intake, &mut bytes);
         // The last holder: the view is gone and nobody will see this.
         if closed || Arc::strong_count(&terminal) == 1 {
             break;
         }
     }
+}
+
+/// Hand gathered output to the parser, and hold the pump back while the
+/// parser is behind.
+fn feed(terminal: &SharedTerminal, intake: &Intake, bytes: &mut Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let seq = terminal.advance(bytes);
+    intake.arrived(bytes.len(), seq);
+    bytes.clear();
+    terminal.wait_for_room(MAX_BACKLOG);
 }
 
 /// Take `first` plus whatever is *already* queued, and never wait for more.

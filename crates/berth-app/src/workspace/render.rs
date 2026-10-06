@@ -40,10 +40,25 @@ impl Workspace {
             .collect();
         let open = self.open_sessions();
         let shell = local_label();
-        let detached: Vec<String> = self
+        let detached: Vec<(String, bool)> = self
             .detached_local()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|(id, name)| {
+                // Claude running in it, as its worker last reported (D50).
+                let agent = self
+                    .local_sessions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .and_then(|s| s.claude.as_ref())
+                    .is_some_and(|c| {
+                        !matches!(
+                            c.state,
+                            berth_proto::v1::ClaudeState::Finished
+                                | berth_proto::v1::ClaudeState::Interrupted
+                        )
+                    });
+                (name, agent)
+            })
             .collect();
         let rows = crate::sidebar::rows(&Input {
             hosts: &hosts,

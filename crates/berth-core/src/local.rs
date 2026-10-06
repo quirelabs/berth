@@ -373,6 +373,12 @@ pub async fn open_shell(
         if let Some(path) = pane.path_with_shim(std::env::var_os("PATH")) {
             command.env("PATH", path);
         }
+        // A worker's shell: the hook reports to the worker's socket instead
+        // of the terminal (D50).
+        if let Some((hook, bin)) = &pane.hook {
+            command.env(crate::env::HOOK, hook);
+            command.env(crate::env::BIN, bin);
+        }
     }
     match cwd {
         Some(cwd) => command.cwd(cwd),
@@ -509,7 +515,7 @@ mod tests {
                     }
                 }
                 PtyEvent::Closed => return seen,
-                PtyEvent::Exit(_) => {}
+                PtyEvent::Exit(_) | PtyEvent::Rebuild(_) => {}
             }
         }
         seen

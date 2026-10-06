@@ -40,6 +40,11 @@
 //! `BERTH_RESUME` tells a wrapper which Claude conversation to resume before
 //! the first prompt.
 //!
+//! In a worker's shell, `BERTH_HOOK` names the worker's hook socket and
+//! `BERTH_BIN` the binary that talks to it (D50); the hook calls
+//! `"$BERTH_BIN" --hook` with what it would otherwise write to the terminal,
+//! and that reads `BERTH_HOOK` back.
+//!
 //! Two carry a session's Claude settings from the supervisor to the worker
 //! process it starts (D50), in the environment rather than the command line
 //! so other users cannot read them in the process list: `BERTH_WORKER_PANE`,
@@ -79,6 +84,8 @@ pub const LOCAL_DIRECT: &str = "BERTH_LOCAL_DIRECT";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
 pub const TEST_OTHER_USER: &str = "BERTH_TEST_OTHER_USER";
+pub const HOOK: &str = "BERTH_HOOK";
+pub const BIN: &str = "BERTH_BIN";
 pub const WORKER_PANE: &str = "BERTH_WORKER_PANE";
 pub const WORKER_RESUME: &str = "BERTH_WORKER_RESUME";
 
@@ -108,6 +115,8 @@ const NAMES: &[&str] = &[
     TEST_CLAUDE,
     TEST_OTHER_USER,
     LOCAL_DIRECT,
+    HOOK,
+    BIN,
     WORKER_PANE,
     WORKER_RESUME,
 ];
@@ -172,6 +181,11 @@ pub fn shell() -> Option<String> {
 /// dogfooding escape hatch, removed before v0.1.0 (D50).
 pub fn local_direct() -> bool {
     text(LOCAL_DIRECT).is_some_and(|v| v == "1")
+}
+
+/// The hook socket a `berth --hook` call reports to.
+pub fn hook() -> Option<PathBuf> {
+    text(HOOK).map(PathBuf::from)
 }
 
 /// The pane token a worker process's shell presents to Claude's hook.

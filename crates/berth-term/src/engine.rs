@@ -57,12 +57,30 @@ enum Command {
     WireScreen(mpsc::SyncSender<Option<v1::Screen>>),
     /// How many history lines the primary screen holds.
     HistoryHeld(mpsc::SyncSender<usize>),
+    /// A replacement built beside the terminal on screen (D50).
+    Shadow(Shadow),
     /// History lines older than `before`, or the newest if `None`.
     WireHistory {
         before: Option<u64>,
         max: u32,
         reply: mpsc::SyncSender<WireHistory>,
     },
+}
+
+/// Building a replacement terminal off to the side while the one on screen
+/// keeps taking output, then swapping it in at one publish, so in one frame.
+/// How the app rebuilds a pane's scrollback from the worker's history without
+/// ever stopping the pane (D50).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shadow {
+    /// Start an empty replacement, the size the terminal is now.
+    Begin,
+    /// Feed it: the history and screen, and every output since.
+    Write(Vec<u8>),
+    /// Swap it in. The terminal it replaces is dropped.
+    Commit,
+    /// Drop it unused.
+    Abort,
 }
 
 /// How much history a terminal keeps. Both limits apply and the first reached
@@ -433,6 +451,17 @@ impl Terminal {
         rx.recv_timeout(CATCH_UP_LIMIT).unwrap_or(0)
     }
 
+    /// A step in building a replacement beside this terminal; see
+    /// [`Shadow`]. Never waits.
+    pub fn shadow(&self, step: Shadow) {
+        if let Shadow::Write(bytes) = &step {
+            self.shared
+                .backlog
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+        }
+        self.send(Command::Shadow(step));
+    }
+
     pub fn screen_ansi(&self) -> String {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(Command::LiveScreen(tx));
@@ -529,6 +558,18 @@ fn ghostty_rgb(c: Rgb) -> RgbColor {
 
 pub(crate) type Ghostty = libghostty_vt::Terminal<'static, 'static>;
 
+/// A libghostty terminal with Berth's limits and colours.
+fn new_ghostty(cols: u16, rows: u16, scrollback: Scrollback, palette: &Palette) -> Option<Ghostty> {
+    let mut term = libghostty_vt::Terminal::new(cols.max(1), rows.max(1)).ok()?;
+    term.set_scrollback_max_bytes(scrollback.bytes).ok()?;
+    term.set_scrollback_max_lines(scrollback.lines).ok()?;
+    let table = palette.table().map(ghostty_rgb);
+    let _ = term.set_default_color_palette(Some(GhosttyPalette(table)));
+    let _ = term.set_default_fg_color(Some(ghostty_rgb(palette.foreground)));
+    let _ = term.set_default_bg_color(Some(ghostty_rgb(palette.background)));
+    Some(term)
+}
+
 pub(crate) fn modes_of(term: &Ghostty) -> Modes {
     Modes {
         alternate_screen: matches!(
@@ -569,6 +610,10 @@ struct Engine {
     numbering: Numbering,
     /// The most bytes parsed between two numbering updates.
     slice: usize,
+    /// A replacement being built beside the terminal, and the limits to give
+    /// it.
+    shadow: Option<Ghostty>,
+    scrollback: Scrollback,
 }
 
 /// Numbers history lines so that a line keeps its number for as long as it
@@ -651,9 +696,7 @@ impl Engine {
         scrollback: Scrollback,
         shared: Arc<Shared>,
     ) -> Option<Self> {
-        let mut term = libghostty_vt::Terminal::new(size.cols.max(1), size.rows.max(1)).ok()?;
-        term.set_scrollback_max_bytes(scrollback.bytes).ok()?;
-        term.set_scrollback_max_lines(scrollback.lines).ok()?;
+        let term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
         let mut engine = Self {
             term,
             screen: Screen::new()?,
@@ -669,6 +712,8 @@ impl Engine {
             seen_shell_marker: false,
             numbering: Numbering::default(),
             slice: scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096),
+            shadow: None,
+            scrollback,
         };
         engine.numbering.update(&engine.term);
         engine.apply_palette(Palette::default());
@@ -728,6 +773,7 @@ impl Engine {
                 let first_line = self.numbering.first_line(&self.term);
                 let _ = reply.send(crate::wire::screen(&self.term, first_line));
             }
+            Command::Shadow(step) => self.shadow(step),
             Command::HistoryHeld(reply) => {
                 let held = if modes_of(&self.term).alternate_screen {
                     0
@@ -769,6 +815,48 @@ impl Engine {
             }
         }
         self.scanner = scanner;
+    }
+
+    fn shadow(&mut self, step: Shadow) {
+        match step {
+            Shadow::Begin => {
+                let cols = self.term.cols().unwrap_or(80);
+                let rows = self.term.rows().unwrap_or(24);
+                self.shadow = new_ghostty(cols, rows, self.scrollback, &self.palette);
+                if self.shadow.is_none() {
+                    tracing::warn!("could not start a replacement terminal");
+                }
+            }
+            Shadow::Write(bytes) => {
+                if let Some(shadow) = &mut self.shadow {
+                    shadow.vt_write(&bytes);
+                }
+                self.shared
+                    .backlog
+                    .fetch_sub(bytes.len(), Ordering::Relaxed);
+            }
+            Shadow::Commit => {
+                if let Some(shadow) = self.shadow.take() {
+                    let (w, h) = (
+                        self.cell_size.width.max(1.0) as u32,
+                        self.cell_size.height.max(1.0) as u32,
+                    );
+                    self.term = shadow;
+                    // The pixel size the old one was told, for whatever asks it.
+                    let cols = self.term.cols().unwrap_or(80);
+                    let rows = self.term.rows().unwrap_or(24);
+                    let _ = self.term.resize(cols, rows, w, h);
+                    self.numbering = Numbering::default();
+                    self.numbering.update(&self.term);
+                    self.screen = match Screen::new() {
+                        Some(screen) => screen,
+                        None => return,
+                    };
+                    self.rebuild = true;
+                }
+            }
+            Shadow::Abort => self.shadow = None,
+        }
     }
 
     fn wire_history(&self, before: Option<u64>, max: u32) -> WireHistory {
@@ -1181,6 +1269,46 @@ mod tests {
         let after = term.snapshot();
         assert!(Arc::ptr_eq(&before.rows[0], &after.rows[0]));
         assert!(!Arc::ptr_eq(&before.rows[1], &after.rows[1]));
+    }
+
+    /// The terminal on screen keeps taking output while a replacement is
+    /// built beside it, and the replacement, history and all, takes its
+    /// place in one publish.
+    #[test]
+    fn a_replacement_is_built_aside_and_swapped_in() {
+        let term = Terminal::new(TermSize::new(20, 5), CellSize::new(8.0, 16.0));
+        term.advance(b"old screen\r\n");
+        term.shadow(Shadow::Begin);
+        let history: String = (0..30).map(|n| format!("kept {n}\r\n")).collect();
+        term.shadow(Shadow::Write(history.into_bytes()));
+        // Live output still reaches the screen meanwhile.
+        term.advance(b"live\r\n");
+        term.shadow(Shadow::Write(b"live\r\n".to_vec()));
+        assert!(term.visible_text().contains("live"));
+        assert!(term.visible_text().contains("old screen"));
+        assert_eq!(term.history_held(), 0, "the screen has no history yet");
+
+        let before = term.revision();
+        term.shadow(Shadow::Commit);
+        assert_ne!(term.revision(), before, "the swap is a repaint");
+        assert!(!term.visible_text().contains("old screen"));
+        assert!(term.visible_text().contains("live"));
+        assert!(term.history_held() > 20, "the history came with it");
+        // And it carries on as the terminal.
+        term.advance(b"after\r\n");
+        assert!(term.visible_text().contains("after"));
+    }
+
+    #[test]
+    fn an_abandoned_replacement_changes_nothing() {
+        let term = Terminal::new(TermSize::new(20, 5), CellSize::new(8.0, 16.0));
+        term.advance(b"stays\r\n");
+        term.shadow(Shadow::Begin);
+        term.shadow(Shadow::Write(b"never shown\r\n".to_vec()));
+        term.shadow(Shadow::Abort);
+        term.shadow(Shadow::Commit);
+        assert!(term.visible_text().contains("stays"));
+        assert!(!term.visible_text().contains("never shown"));
     }
 
     #[test]

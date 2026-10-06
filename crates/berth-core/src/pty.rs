@@ -29,6 +29,9 @@ pub enum PtyEvent {
     Exit(u32),
     /// The channel closed, for any reason.
     Closed,
+    /// A step in rebuilding the terminal beside the one on screen, from the
+    /// local server's history (D50). Only the local server sends these.
+    Rebuild(berth_term::Shadow),
 }
 
 /// Something the UI wants to do to the other side.

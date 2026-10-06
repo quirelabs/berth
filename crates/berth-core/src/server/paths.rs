@@ -60,6 +60,11 @@ impl Places {
         endpoint(&self.run, &format!("w{session}"))
     }
 
+    /// Where a worker's Claude hook reports (D50).
+    pub fn hook(&self, session: SessionId) -> PathBuf {
+        endpoint(&self.run, &format!("h{session}"))
+    }
+
     pub fn supervisor_pid(&self) -> PathBuf {
         self.run.join("s.pid")
     }

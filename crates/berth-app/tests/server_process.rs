@@ -195,3 +195,75 @@ async fn sessions_run_in_worker_processes_that_outlive_the_supervisor() {
         "its pid file went with it"
     );
 }
+
+/// The real hook script, as Claude would run it in a worker's shell: through
+/// `berth --hook` to the worker process, and on to the app (D50).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hook_script_reports_through_the_worker() {
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    let dir = tempfile::tempdir().unwrap();
+    let data: PathBuf = dir.path().to_path_buf();
+    let _supervisor = start(&data).await;
+    let mut app = client::connect(&places(&data)).await.unwrap();
+    app.to_server
+        .send(ToServer::Create {
+            name: None,
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            pane: Some(TOKEN.into()),
+            resume: None,
+        })
+        .await
+        .unwrap();
+    let session = loop {
+        if let ToApp::Created { session } = next(&mut app).await {
+            break session;
+        }
+    };
+    app.to_server
+        .send(ToServer::Attach {
+            session,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .unwrap();
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../berth-core/claude/plugin/hook.sh");
+    let payload = r#"{"hook_event_name":"UserPromptSubmit","session_id":"0b9c5f5e-7b39-4a55-8a53-2b8f0d1c9e11"}"#;
+    let mut child = Command::new("/bin/sh")
+        .arg(&script)
+        .env("BERTH_PANE", TOKEN)
+        .env("BERTH_HOOK", places(&data).hook(session))
+        .env("BERTH_BIN", env!("CARGO_BIN_EXE_berth"))
+        .env("CLAUDE_PROJECT_DIR", "/tmp")
+        .env_remove("BERTH_TTY")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    assert!(child.wait().unwrap().success(), "a hook always exits 0");
+
+    let claude = loop {
+        if let ToApp::Event {
+            event: v1::Event::Claude(claude),
+            ..
+        } = next(&mut app).await
+        {
+            break claude;
+        }
+    };
+    assert_eq!(claude.state, v1::ClaudeState::Working);
+    assert_eq!(claude.cwd.as_deref(), Some("/tmp"));
+    app.to_server
+        .send(ToServer::Kill { session })
+        .await
+        .unwrap();
+}

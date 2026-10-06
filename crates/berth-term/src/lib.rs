@@ -12,7 +12,7 @@ pub mod size;
 pub mod terminal;
 mod wire;
 
-pub use engine::{Scrollback, WireHistory};
+pub use engine::{Scrollback, Shadow, WireHistory};
 pub use keys::{Key, KeyEvent, Modifiers, TermMode, alt_scroll, encode};
 pub use paste::{MouseButton, mouse_sgr, paste_bytes};
 pub use shell::{ShellEvent, ShellEventKind};

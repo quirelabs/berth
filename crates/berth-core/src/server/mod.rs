@@ -15,6 +15,7 @@
 //! on Unix every connection's peer is checked against the endpoint's owner.
 
 pub mod client;
+pub mod hook;
 pub mod link;
 pub mod local;
 pub mod paths;

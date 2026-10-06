@@ -292,6 +292,8 @@ pub struct Workspace {
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
+    /// Where the local server's Claude reports go, once it is up.
+    claude_reports: session::ClaudeReports,
 }
 
 impl Workspace {
@@ -341,6 +343,11 @@ impl Workspace {
             local_server: Default::default(),
             local_sessions: Vec::new(),
             window_seen: true,
+            claude_reports: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                Self::watch_claude_reports(rx, cx);
+                tx
+            },
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -429,6 +436,49 @@ impl Workspace {
             Some(strings::LOCAL_DIRECT_BY_SETTING.to_string())
         } else {
             None
+        }
+    }
+
+    /// Fold what workers report about Claude into the panes that show their
+    /// sessions, and the session list (D50). The worker checked the token.
+    fn watch_claude_reports(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<(u64, berth_proto::v1::Claude)>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some((session, claude)) = rx.recv().await {
+                let alive = this.update(cx, |this, cx| {
+                    for pane in this.panes.iter_mut().filter(|p| p.session == Some(session)) {
+                        let token = pane
+                            .claude
+                            .as_ref()
+                            .map(|c| c.token.clone())
+                            .unwrap_or_default();
+                        let mut known = ClaudePane::new(token);
+                        known.tracker = berth_core::claude::from_wire(&claude);
+                        pane.claude = Some(known);
+                    }
+                    if let Some(info) = this.local_sessions.iter_mut().find(|s| s.id == session) {
+                        info.claude = Some(claude.clone());
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Hand the local server's Claude reports to this workspace. Once per
+    /// server; harmless to repeat.
+    fn listen_for_claude(&self) {
+        if let Some(Ok(server)) = self.local_server.get() {
+            let tx = self.claude_reports.clone();
+            server.on_claude(move |session, claude| {
+                let _ = tx.send((session, claude));
+            });
         }
     }
 
@@ -684,6 +734,7 @@ impl Workspace {
                             pane.session = tab.session;
                             pane.direct = tab.direct;
                         }
+                        this.listen_for_claude();
                         this.report_cold_start(strings::LOCAL_ALIAS);
                         this.refresh_local_sessions(cx);
                     });

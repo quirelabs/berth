@@ -28,6 +28,10 @@ pub const SCREENS_PER_SECOND: u32 = 30;
 
 const SCREEN_EVERY: Duration = Duration::from_millis(1000 / SCREENS_PER_SECOND as u64);
 
+/// How long a screen waits for its confirmation before the next goes anyway:
+/// a confirmation lost on the way must not silence a session.
+const CONFIRM_WITHIN: Duration = Duration::from_secs(1);
+
 /// What to do with a chunk of output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
@@ -152,8 +156,12 @@ impl Flow {
         match self.mode {
             Mode::Raw => (self.alt_left && due).then_some(Screen::WithHistory),
             Mode::Screens => {
-                // One screen in flight at a time, and no faster than the cap.
-                if !due || self.confirmed < self.screen_seq {
+                // One screen in flight at a time, and no faster than the cap,
+                // unless its confirmation is long overdue.
+                let overdue = self
+                    .screen_at
+                    .is_some_and(|at| now.duration_since(at) >= CONFIRM_WITHIN);
+                if !due || (self.confirmed < self.screen_seq && !overdue) {
                     return None;
                 }
                 if self.dropped >= BEHIND {
@@ -252,6 +260,19 @@ mod tests {
         assert_eq!(flow.tick(start + Duration::from_millis(5)), None);
         // Confirmed, and due: the next screen.
         assert_eq!(flow.tick(start + SCREEN_EVERY), Some(Screen::Plain));
+    }
+
+    /// A lost confirmation delays the next screen, it does not silence the
+    /// session.
+    #[test]
+    fn an_unconfirmed_screen_is_followed_by_another_in_time() {
+        let start = Instant::now();
+        let mut flow = Flow::new();
+        let (seq, _) = flood(&mut flow, 0, 200, 8 * KB);
+        flow.screen_sent(seq, Screen::Plain, start);
+        flood(&mut flow, seq, 100, 8 * KB);
+        assert_eq!(flow.tick(start + SCREEN_EVERY), None);
+        assert_eq!(flow.tick(start + CONFIRM_WITHIN), Some(Screen::Plain));
     }
 
     #[test]

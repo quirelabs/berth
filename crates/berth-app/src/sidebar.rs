@@ -69,7 +69,8 @@ pub struct Input<'a> {
     pub local_label: &'a str,
     /// Local server sessions no pane shows, by the name the tree gives them
     /// (D50).
-    pub local_detached: &'a [String],
+    /// (With whether Claude runs in each.)
+    pub local_detached: &'a [(String, bool)],
 }
 
 /// Berth's own sessions from one host's scan, with whether an agent is running
@@ -143,7 +144,7 @@ pub fn rows(input: &Input) -> Vec<Row> {
         input
             .local_detached
             .iter()
-            .map(|name| (name.clone(), None, false)),
+            .map(|(name, agent)| (name.clone(), None, *agent)),
     );
     push_folder(&mut out, Folder::Local, local, input.expanded);
 
@@ -556,7 +557,7 @@ mod tests {
             host: None,
             slug: "local",
         }];
-        let detached = ["zsh #4".to_string()];
+        let detached = [("zsh #4".to_string(), true)];
         let rows = rows(&Input {
             hosts: &[],
             open: &open,
@@ -570,7 +571,7 @@ mod tests {
             folder: Folder::Local,
             name: "zsh #4".into(),
             pane: None,
-            agent: false,
+            agent: true,
         }));
     }
 

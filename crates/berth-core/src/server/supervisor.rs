@@ -381,6 +381,16 @@ impl State {
                         ..
                     }
                 );
+                // The session list says what Claude is doing, for sessions no
+                // tab shows.
+                if let ToApp::Event {
+                    event: v1::Event::Claude(claude),
+                    ..
+                } = &message
+                    && let Some(entry) = self.sessions.get_mut(&session)
+                {
+                    entry.info.claude = Some(claude.clone());
+                }
                 // A worker telling what has its terminal now.
                 if let ToApp::Sessions(list) = message {
                     if let (Some(entry), Some(info)) =
@@ -474,10 +484,18 @@ impl State {
                 }
                 self.forward(client, session, message).await;
             }
-            ToServer::Input { session, .. }
-            | ToServer::Kill { session }
-            | ToServer::Confirmed { session, .. } => {
+            ToServer::Input { session, .. } | ToServer::Kill { session } => {
                 self.forward(client, session, message).await;
+            }
+            // Never waited on: a worker busy sending output may not be
+            // reading, and waiting here would wait on the output this table
+            // is the one to take (found 2026-10-02). Confirmations are
+            // cumulative, so one dropped is carried by the next, and a worker
+            // does not wait on a lost one for long.
+            ToServer::Confirmed { session, .. } => {
+                if let Some(entry) = self.sessions.get(&session) {
+                    let _ = entry.to_worker.try_send(message);
+                }
             }
             ToServer::Visible { .. } => {
                 let attached: Vec<SessionId> = self

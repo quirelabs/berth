@@ -241,6 +241,7 @@ impl Workspace {
                         }
                         session::start_pump(view, tab.local.events);
                     });
+                    this.listen_for_claude();
                     this.refresh_local_sessions(cx);
                     cx.notify();
                 }

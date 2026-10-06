@@ -125,6 +125,9 @@ pub struct PaneEnv {
     /// A conversation for the shell's startup wrapper to resume before its
     /// first prompt. Only ever a strict UUID; see [`PaneEnv::resuming`].
     pub resume: Option<String>,
+    /// A worker's hook socket and the binary that talks to it (D50): set, the
+    /// hook tells the worker rather than writing to the terminal.
+    pub hook: Option<(PathBuf, PathBuf)>,
 }
 
 impl PaneEnv {
@@ -139,6 +142,7 @@ impl PaneEnv {
             user_zdotdir_was_set: user.is_some(),
             user_zdotdir: user.map(PathBuf::from).or_else(dirs::home_dir),
             resume: None,
+            hook: None,
         }
     }
 
@@ -332,6 +336,47 @@ pub enum State {
     Finished,
     /// Exited in the middle of a turn: a quit, a hangup, a crash.
     Interrupted,
+}
+
+/// A Claude as the wire carries it, from what a tracker knows.
+pub fn to_wire(tracker: &Tracker) -> Option<berth_proto::v1::Claude> {
+    use berth_proto::v1::ClaudeState as W;
+    let state = match tracker.state? {
+        State::Working => W::Working,
+        State::Waiting(Wait::Permission) => W::Permission,
+        State::Waiting(Wait::Idle) => W::Idle,
+        State::Waiting(Wait::YourMove) => W::YourMove,
+        State::Finished => W::Finished,
+        State::Interrupted => W::Interrupted,
+    };
+    Some(berth_proto::v1::Claude {
+        state,
+        session_id: tracker.session_id.clone(),
+        cwd: tracker
+            .cwd
+            .as_ref()
+            .map(|c| c.to_string_lossy().to_string()),
+    })
+}
+
+/// A tracker that says what a worker reported (D50): the worker checked the
+/// token, so the app takes its word.
+pub fn from_wire(claude: &berth_proto::v1::Claude) -> Tracker {
+    use berth_proto::v1::ClaudeState as W;
+    let state = match claude.state {
+        W::Working => State::Working,
+        W::Permission => State::Waiting(Wait::Permission),
+        W::Idle => State::Waiting(Wait::Idle),
+        W::YourMove => State::Waiting(Wait::YourMove),
+        W::Finished => State::Finished,
+        W::Interrupted => State::Interrupted,
+    };
+    Tracker {
+        session_id: claude.session_id.clone().filter(|s| is_session_id(s)),
+        cwd: claude.cwd.as_ref().map(PathBuf::from),
+        state: Some(state),
+        settled: matches!(state, State::Waiting(_) | State::Finished),
+    }
 }
 
 /// One pane's Claude, as its signals describe it.
@@ -754,5 +799,40 @@ mod tests {
     fn only_a_strict_uuid_is_handed_to_the_shell_to_resume() {
         assert_eq!(PaneEnv::new(None).resuming(ID).resume.as_deref(), Some(ID));
         assert_eq!(PaneEnv::new(None).resuming("x; rm -rf ~").resume, None);
+    }
+
+    #[test]
+    fn claude_crosses_the_wire_and_back() {
+        for state in [
+            State::Working,
+            State::Waiting(Wait::Permission),
+            State::Waiting(Wait::Idle),
+            State::Waiting(Wait::YourMove),
+            State::Finished,
+            State::Interrupted,
+        ] {
+            let tracker = Tracker {
+                session_id: Some(ID.into()),
+                cwd: Some(PathBuf::from("/a")),
+                state: Some(state),
+                settled: false,
+            };
+            let back = from_wire(&to_wire(&tracker).unwrap());
+            assert_eq!(back.state, Some(state));
+            assert_eq!(back.session_id.as_deref(), Some(ID));
+            assert_eq!(back.cwd, Some(PathBuf::from("/a")));
+        }
+        assert!(to_wire(&Tracker::default()).is_none());
+    }
+
+    /// Only a strict UUID is ever kept, from the wire as from the terminal.
+    #[test]
+    fn a_doubtful_session_id_from_the_wire_is_dropped() {
+        let claude = berth_proto::v1::Claude {
+            state: berth_proto::v1::ClaudeState::Working,
+            session_id: Some("x; rm -rf ~".into()),
+            cwd: None,
+        };
+        assert_eq!(from_wire(&claude).session_id, None);
     }
 }

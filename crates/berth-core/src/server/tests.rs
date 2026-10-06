@@ -80,10 +80,13 @@ async fn next(client: &mut Client) -> ToApp {
         .expect("the server answered in time")
         .expect("the connection stayed open");
     if let ToApp::Output { session, seq, .. } | ToApp::Screen { session, seq, .. } = &message {
-        let _ = client.to_server.try_send(ToServer::Confirmed {
-            session: *session,
-            seq: *seq,
-        });
+        let _ = client
+            .to_server
+            .send(ToServer::Confirmed {
+                session: *session,
+                seq: *seq,
+            })
+            .await;
     }
     message
 }
@@ -632,6 +635,8 @@ mod sync_under_load {
                                 tail.drain(..tail.len() - 4096);
                             }
                         }
+                        // As the app's pump does: in order with the output.
+                        Some(PtyEvent::Rebuild(step)) => terminal.shadow(step),
                         Some(_) => {}
                         None => return,
                     }
@@ -788,5 +793,109 @@ mod sync_under_load {
                 break;
             }
         }
+    }
+}
+
+mod claude_through_the_worker {
+    //! Piece 6 (D50): Claude's hook reports to the session's worker, which
+    //! keeps the state and tells the app.
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const UUID: &str = "0b9c5f5e-7b39-4a55-8a53-2b8f0d1c9e11";
+
+    async fn session_with_token(app: &mut Client) -> SessionId {
+        app.to_server
+            .send(ToServer::Create {
+                name: None,
+                cwd: None,
+                cols: 40,
+                rows: 10,
+                pane: Some(TOKEN.into()),
+                resume: None,
+            })
+            .await
+            .unwrap();
+        loop {
+            if let ToApp::Created { session } = next(app).await {
+                return session;
+            }
+        }
+    }
+
+    async fn claude_event(app: &mut Client) -> Option<v1::Claude> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let ToApp::Event {
+                    event: v1::Event::Claude(claude),
+                    ..
+                } = next(app).await
+                {
+                    return claude;
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    fn hook(server: &Server, session: SessionId, token: &str, event: &str) {
+        let line = format!("7717;berth;1;{token};{event};{UUID};-;L3RtcA");
+        super::super::hook::send(&server.places.hook(session), &line).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_report_reaches_the_app_and_the_session_list() {
+        let server = server().await;
+        let mut app = client::connect(&server.places).await.unwrap();
+        let session = session_with_token(&mut app).await;
+        attach(&mut app, session).await;
+
+        hook(&server, session, TOKEN, "prompt");
+        let claude = claude_event(&mut app).await.expect("Claude's state");
+        assert_eq!(claude.state, v1::ClaudeState::Working);
+
+        hook(&server, session, TOKEN, "stop");
+        let claude = claude_event(&mut app).await.expect("the turn ended");
+        assert_eq!(claude.state, v1::ClaudeState::YourMove);
+
+        let listed = list(&mut app).await;
+        assert_eq!(
+            listed[0].claude.as_ref().map(|c| c.state),
+            Some(v1::ClaudeState::YourMove)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_report_without_the_token_changes_nothing() {
+        let server = server().await;
+        let mut app = client::connect(&server.places).await.unwrap();
+        let session = session_with_token(&mut app).await;
+        attach(&mut app, session).await;
+        hook(
+            &server,
+            session,
+            "ffffffffffffffffffffffffffffffff",
+            "prompt",
+        );
+        assert!(claude_event(&mut app).await.is_none());
+    }
+
+    /// The worker keeps the state while no app is attached, and tells the
+    /// next one as it attaches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_app_that_attaches_later_is_told_what_claude_is_doing() {
+        let server = server().await;
+        let session = {
+            let mut app = client::connect(&server.places).await.unwrap();
+            session_with_token(&mut app).await
+        };
+        hook(&server, session, TOKEN, "prompt");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut app = client::connect(&server.places).await.unwrap();
+        attach(&mut app, session).await;
+        let claude = claude_event(&mut app).await.expect("told on attach");
+        assert_eq!(claude.state, v1::ClaudeState::Working);
     }
 }

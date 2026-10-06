@@ -1,6 +1,8 @@
 #!/bin/sh
 # Berth's Claude Code hook (D48). Tells Berth what Claude is doing in a Berth
-# pane by writing one escape sequence to that pane's terminal:
+# pane. In a session on Berth's own server it hands the line below to the
+# session's worker through `berth --hook` (D50); anywhere else it writes it to
+# the pane's terminal as one escape sequence:
 #
 #   ESC ] 7717 ; berth ; 1 ; <token> ; <event> ; <session-id> ; <kind> ; <cwd> BEL
 #
@@ -40,6 +42,13 @@ dir=${CLAUDE_PROJECT_DIR:-$PWD}
 cwd=$(printf '%s' "$dir" | base64 | tr -d '\n=' | tr '+/' '-_')
 
 body="7717;berth;1;$BERTH_PANE;$event;$session;$kind;$cwd"
+
+# A worker's shell: tell the worker, which keeps Claude's state even while no
+# app is attached, and never touch the terminal Claude is drawing on.
+if [ -n "$BERTH_HOOK" ] && [ -x "$BERTH_BIN" ]; then
+	"$BERTH_BIN" --hook "$body" >/dev/null 2>&1
+	exit 0
+fi
 
 # Claude runs hooks with no terminal of their own, so the pane's device is
 # named explicitly: by tmux inside tmux, by Berth outside it.

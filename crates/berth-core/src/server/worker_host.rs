@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use berth_proto::v1::{SessionId, ToApp, ToServer};
+use berth_proto::v1::{self, SessionId, ToApp, ToServer};
 use tokio::sync::mpsc;
 
 use super::link::{self, protocol};
@@ -22,8 +22,13 @@ use crate::worker::{Shell, Spec, Worker};
 /// How often the flow is asked for a screen while it wants one.
 const SCREEN_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// How often a worker looks at what has its terminal.
-const LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// When a worker looks at what has its terminal: soon after Enter is typed,
+/// once output has paused, never more often than every two seconds, and at
+/// least every thirty, so an idle session wakes for it twice a minute.
+const LOOK_AFTER_ENTER: std::time::Duration = std::time::Duration::from_millis(300);
+const LOOK_AFTER_OUTPUT: std::time::Duration = std::time::Duration::from_millis(500);
+const LOOK_AT_MOST_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+const LOOK_AT_LEAST_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What a worker process is started with.
 #[derive(Debug, Clone)]
@@ -122,6 +127,12 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     if let Some(session) = &launch.resume {
         pane = pane.resuming(session);
     }
+    // Claude's hook reports here rather than to the terminal (D50). Bound
+    // before the shell starts, so its first hook already finds it.
+    let mut hooks = Listener::bind(&places.hook(launch.session)).await?;
+    if let Ok(bin) = std::env::current_exe() {
+        pane.hook = Some((places.hook(launch.session), bin));
+    }
     let (worker, mut output) = Worker::start(Spec {
         session: launch.session,
         name: launch.name.clone(),
@@ -145,17 +156,40 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     let mut connection = 0u64;
     let mut to_supervisor: ToSupervisor = None;
     let mut _reader: Option<Owned> = None;
-    // What has the terminal is looked at now and then, and the session list
-    // told when it changes: the app names sessions by it.
-    let mut look = tokio::time::interval(LOOK_EVERY);
+    // What has the terminal is looked at when something happened, and the
+    // session list told when it changed: the app names sessions by it.
+    let mut look = Look::new();
     // Raw output or screens, as the app keeps up (D49).
     let mut flow = sync::Flow::new();
     let mut in_alternate = false;
-    look.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let (hook_tx, mut hook_lines) = mpsc::channel::<String>(16);
 
     loop {
         tokio::select! {
-            _ = look.tick() => {
+            accepted = hooks.accept() => {
+                let Ok(mut stream) = accepted else { continue };
+                let tx = hook_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(line) = super::hook::read_line(&mut stream).await {
+                        let _ = tx.send(line).await;
+                    }
+                });
+            }
+            Some(line) = hook_lines.recv() => {
+                if let Some(claude) = worker.hook_line(&line) {
+                    send(
+                        &mut to_supervisor,
+                        &ToApp::Event {
+                            session: launch.session,
+                            event: v1::Event::Claude(claude),
+                        },
+                    )
+                    .await;
+                }
+            }
+            _ = tokio::time::sleep_until(look.next) => {
+                look.looked();
                 let looking = worker.clone();
                 let changed = tokio::task::spawn_blocking(move || looking.refresh())
                     .await
@@ -168,6 +202,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
             message = output.recv() => {
                 let Some(message) = message else { break };
                 if let ToApp::Output { seq, bytes, .. } = &message {
+                    look.output();
                     // A program leaving the alternate screen gets a screen,
                     // so what lies underneath is right (D49).
                     let alternate = worker.alternate_screen();
@@ -214,6 +249,11 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                 if tag != connection {
                     continue;
                 }
+                if let ToServer::Input { bytes, .. } = &message
+                    && bytes.iter().any(|b| *b == b'\r' || *b == b'\n')
+                {
+                    look.enter();
+                }
                 match message {
                     ToServer::Confirmed { seq, .. } => flow.confirmed(seq),
                     ToServer::Visible { visible } => {
@@ -225,6 +265,18 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                         let _ = worker.handle(message).await;
                         let kind = flow.attached();
                         send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
+                        // What Claude is doing, for an app that was not here
+                        // when it last said.
+                        if let Some(claude) = worker.claude() {
+                            send(
+                                &mut to_supervisor,
+                                &ToApp::Event {
+                                    session: launch.session,
+                                    event: v1::Event::Claude(claude),
+                                },
+                            )
+                            .await;
+                        }
                     }
                     message => {
                         if let Some(reply) = worker.handle(message).await {
@@ -237,6 +289,44 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     }
     tracing::info!(session = launch.session, "worker's shell ended");
     Ok(())
+}
+
+/// When to look next at what has the terminal.
+struct Look {
+    next: tokio::time::Instant,
+    last: tokio::time::Instant,
+}
+
+impl Look {
+    fn new() -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            next: now,
+            last: now,
+        }
+    }
+
+    /// The earliest a look may come: not sooner than the floor allows.
+    fn earliest(&self, after: std::time::Duration) -> tokio::time::Instant {
+        (tokio::time::Instant::now() + after).max(self.last + LOOK_AT_MOST_EVERY)
+    }
+
+    /// Enter was typed: a program may have started. Look soon.
+    fn enter(&mut self) {
+        self.next = self.next.min(self.earliest(LOOK_AFTER_ENTER));
+    }
+
+    /// Output brings a look to just after it pauses: each chunk moves it
+    /// to half a second after itself, so a burst is looked at once, at its
+    /// end.
+    fn output(&mut self) {
+        self.next = self.earliest(LOOK_AFTER_OUTPUT);
+    }
+
+    fn looked(&mut self) {
+        self.last = tokio::time::Instant::now();
+        self.next = self.last + LOOK_AT_LEAST_EVERY;
+    }
 }
 
 type ToSupervisor = Option<super::link::FrameWrite<tokio::io::WriteHalf<super::transport::Stream>>>;

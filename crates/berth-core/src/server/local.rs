@@ -61,11 +61,15 @@ struct Route {
     behind: bool,
 }
 
+/// Told what Claude is doing in a session, as its worker reports it (D50).
+type ClaudeListener = Arc<dyn Fn(SessionId, v1::Claude) + Send + Sync>;
+
 #[derive(Default)]
 struct Shared {
     routes: HashMap<SessionId, Route>,
     waiting: VecDeque<Waiting>,
     to_server: Option<mpsc::Sender<ToServer>>,
+    claude: Option<ClaudeListener>,
 }
 
 /// The app's handle on the local server. Cheap to clone.
@@ -215,6 +219,12 @@ impl LocalServer {
         ))
     }
 
+    /// Be told whenever a worker reports what Claude is doing in its
+    /// session. Called on the connection's task: cheap work only.
+    pub fn on_claude(&self, listener: impl Fn(SessionId, v1::Claude) + Send + Sync + 'static) {
+        lock(&self.shared).claude = Some(Arc::new(listener));
+    }
+
     /// The app's window was hidden or shown: while hidden, workers send
     /// nothing, and shown again each attached session sends its screen (D50).
     pub async fn set_visible(&self, visible: bool) -> Result<()> {
@@ -241,29 +251,31 @@ impl LocalServer {
 /// Confirm output to the worker every this many bytes handed on (D49).
 const CONFIRM_EVERY: u64 = 64 * 1024;
 /// How long a pane waits for the history after a screen, and how much output
-/// it holds meanwhile, before going on without the history.
-const HISTORY_WITHIN: Duration = Duration::from_secs(2);
-const HOLD_AT_MOST: usize = 4 * 1024 * 1024;
+/// it keeps for the replacement meanwhile, before giving the rebuild up.
+const HISTORY_WITHIN: Duration = Duration::from_secs(10);
+const KEEP_AT_MOST: usize = 4 * 1024 * 1024;
 
 /// A screen whose history is on its way.
 struct Rebuilding {
     screen: v1::Screen,
     /// Ranges as they came, each newest first.
     ranges: Vec<Vec<v1::Row>>,
-    /// Output after the screen, applied once the history is in.
-    held: Vec<Vec<u8>>,
-    held_bytes: usize,
+    /// Output since the screen, which the pane already shows, kept for the
+    /// replacement.
+    kept: Vec<u8>,
     since: std::time::Instant,
 }
 
 /// The server's messages for one session, as pty events.
 ///
-/// A screen is drawn as soon as it arrives. When history follows it, later
-/// output is held until the history is in, and then the terminal is rebuilt
-/// from both, so its scrollback equals the worker's line for line under the
-/// worker's numbers; the app never numbers lines itself (D51). Output is
-/// confirmed back as it is handed on, which is how the worker knows whether
-/// the app keeps up.
+/// A screen is drawn as soon as it arrives, and output keeps going to the
+/// pane as it comes. When history follows the screen, a replacement terminal
+/// is built beside the one on screen from the history, the screen and every
+/// output since, and swapped in at once when the history is complete, so the
+/// pane never stops, and its scrollback then equals the worker's line for
+/// line under the worker's numbers; the app never numbers lines itself (D50,
+/// D51). Output is confirmed back as it is handed on, which is how the worker
+/// knows whether the app keeps up.
 async fn translate(
     server: LocalServer,
     session: SessionId,
@@ -275,7 +287,7 @@ async fn translate(
     let mut confirmed = 0u64;
     let mut rebuilding: Option<Rebuilding> = None;
     while let Some(message) = from_server.recv().await {
-        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut out: Vec<PtyEvent> = Vec::new();
         let screen_now = matches!(message, ToApp::Screen { .. });
         match message {
             ToApp::Screen {
@@ -286,15 +298,14 @@ async fn translate(
             } => match screen.unpack::<v1::Screen>() {
                 Ok(screen) => {
                     drawn = seq;
-                    out.push(berth_term::replay(&screen));
-                    // A screen without history supersedes one still waiting:
-                    // output was dropped in between, so what was held no
-                    // longer follows on from it.
+                    out.push(PtyEvent::Output(berth_term::replay(&screen)));
+                    // A new screen supersedes a rebuild still waiting: output
+                    // was dropped in between, so what was kept no longer
+                    // follows on from its screen.
                     rebuilding = history_follows.then(|| Rebuilding {
                         screen,
                         ranges: Vec::new(),
-                        held: Vec::new(),
-                        held_bytes: 0,
+                        kept: Vec::new(),
                         since: std::time::Instant::now(),
                     });
                 }
@@ -318,8 +329,14 @@ async fn translate(
                 if complete && let Some(done) = rebuilding.take() {
                     let mut history: Vec<v1::Row> = done.ranges.into_iter().flatten().collect();
                     history.reverse();
-                    out.push(berth_term::rebuild(&history, &done.screen));
-                    out.extend(done.held);
+                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Begin));
+                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(
+                        berth_term::rebuild(&history, &done.screen),
+                    )));
+                    if !done.kept.is_empty() {
+                        out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(done.kept)));
+                    }
+                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Commit));
                 }
             }
             ToApp::Output { seq, bytes, .. } => {
@@ -327,25 +344,19 @@ async fn translate(
                     continue;
                 }
                 drawn = seq;
-                match rebuilding.as_mut() {
-                    Some(pending)
-                        if pending.since.elapsed() < HISTORY_WITHIN
-                            && pending.held_bytes + bytes.len() <= HOLD_AT_MOST =>
+                if let Some(pending) = rebuilding.as_mut() {
+                    if pending.since.elapsed() < HISTORY_WITHIN
+                        && pending.kept.len() + bytes.len() <= KEEP_AT_MOST
                     {
-                        pending.held_bytes += bytes.len();
-                        pending.held.push(bytes);
-                    }
-                    Some(_) => {
-                        // The history is not coming in time: go on without
-                        // it, rather than freeze the pane.
+                        pending.kept.extend_from_slice(&bytes);
+                    } else {
+                        // The history is not coming in time: the pane carries
+                        // on as it is, without the rebuilt scrollback.
                         tracing::warn!(session, "history did not arrive in time");
-                        if let Some(gave_up) = rebuilding.take() {
-                            out.extend(gave_up.held);
-                        }
-                        out.push(bytes);
+                        rebuilding = None;
                     }
-                    None => out.push(bytes),
                 }
+                out.push(PtyEvent::Output(bytes));
             }
             ToApp::Event {
                 event: v1::Event::Exited { code },
@@ -357,8 +368,8 @@ async fn translate(
             }
             _ => continue,
         }
-        for bytes in out {
-            if events.send(PtyEvent::Output(bytes)).await.is_err() {
+        for event in out {
+            if events.send(event).await.is_err() {
                 return;
             }
         }
@@ -461,6 +472,16 @@ fn deliver(shared: &Arc<Mutex<Shared>>, message: ToApp) {
                     take(shared, |w| matches!(w, Waiting::Created(_)))
             {
                 let _ = tx.send(Err(why.clone()));
+            }
+            return;
+        }
+        ToApp::Event {
+            session,
+            event: v1::Event::Claude(claude),
+        } => {
+            let listener = lock(shared).claude.clone();
+            if let Some(listener) = listener {
+                listener(*session, claude.clone());
             }
             return;
         }

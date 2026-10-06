@@ -130,6 +130,11 @@ fn main() -> std::process::ExitCode {
 
     // Berth's own server (D50): the same binary, started without a window.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Claude's hook reporting to a worker: as quick and as quiet as possible.
+    if args.first().map(String::as_str) == Some("--hook") {
+        berth_core::server::hook::run_process(&args);
+        return std::process::ExitCode::SUCCESS;
+    }
     if matches!(
         args.first().map(String::as_str),
         Some("--supervisor" | "--worker")

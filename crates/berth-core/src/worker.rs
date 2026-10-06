@@ -81,6 +81,9 @@ pub struct Worker {
     name: String,
     /// As last looked at; the starting directory until then.
     live: Mutex<Live>,
+    /// The token Claude's hook presents, and what its signals said (D48, D50).
+    token: Option<crate::claude::PaneToken>,
+    claude: Mutex<crate::claude::Tracker>,
     size: Mutex<(u16, u16)>,
     pty: Pty,
     terminal: Arc<Terminal>,
@@ -136,6 +139,8 @@ impl Worker {
                         .map(|dir| dir.to_string_lossy().to_string()),
                 }),
                 size: Mutex::new((spec.cols, spec.rows)),
+                token: spec.pane.as_ref().map(|p| p.token.clone()),
+                claude: Mutex::new(crate::claude::Tracker::default()),
                 pty,
                 terminal,
                 seq,
@@ -187,6 +192,26 @@ impl Worker {
         }
     }
 
+    /// What Claude is doing in this session, as its hook last said.
+    pub fn claude(&self) -> Option<v1::Claude> {
+        crate::claude::to_wire(&self.claude.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// A line from Claude's hook: believed if it carries this session's
+    /// token, as the app believed it from the terminal (D48). Returns the new
+    /// state when it changed.
+    pub fn hook_line(&self, line: &str) -> Option<v1::Claude> {
+        let token = self.token.as_ref()?;
+        let payload = line.trim().strip_prefix("7717;berth;")?;
+        let signal = crate::claude::parse(payload, token)?;
+        let mut tracker = self.claude.lock().unwrap_or_else(|p| p.into_inner());
+        let before = tracker.clone();
+        tracker.apply(&signal);
+        (*tracker != before)
+            .then(|| crate::claude::to_wire(&tracker))
+            .flatten()
+    }
+
     /// Whether a full-screen program has the terminal, as of the screen last
     /// published. Never waits.
     pub fn alternate_screen(&self) -> bool {
@@ -204,7 +229,7 @@ impl Worker {
             program: live.program,
             cols,
             rows,
-            claude: None,
+            claude: self.claude(),
             pid: self.pty.local_pid(),
         }
     }
@@ -335,6 +360,7 @@ fn pump(
                 },
             },
             PtyEvent::Closed => break,
+            PtyEvent::Rebuild(_) => continue,
         };
         if tx.blocking_send(message).is_err() {
             // Nobody is listening any more. The shell keeps running only as
@@ -591,6 +617,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(running.is_some(), "never saw sleep take the terminal");
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const UUID: &str = "0b9c5f5e-7b39-4a55-8a53-2b8f0d1c9e11";
+
+    fn with_token() -> Spec {
+        let mut pane = crate::claude::PaneEnv::new(None);
+        pane.token = crate::claude::PaneToken::parse(TOKEN).unwrap();
+        Spec {
+            pane: Some(pane),
+            ..spec(None)
+        }
+    }
+
+    /// The hook's line, as it would have reached the terminal (D48), is
+    /// believed by the worker on the same terms (D50).
+    #[tokio::test]
+    async fn a_hook_line_with_the_token_tells_the_worker_what_claude_does() {
+        let (worker, _rx) = Worker::start(with_token()).await.unwrap();
+        let line = format!("7717;berth;1;{TOKEN};prompt;{UUID};-;L3RtcA");
+        let claude = worker.hook_line(&line).expect("believed");
+        assert_eq!(claude.state, v1::ClaudeState::Working);
+        assert_eq!(claude.session_id.as_deref(), Some(UUID));
+        assert_eq!(claude.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(worker.info().claude, Some(claude));
+        assert!(
+            worker.hook_line(&line).is_none(),
+            "the same again is no change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_line_without_the_token_is_not_believed() {
+        let (worker, _rx) = Worker::start(with_token()).await.unwrap();
+        let wrong = "ffffffffffffffffffffffffffffffff";
+        assert!(
+            worker
+                .hook_line(&format!("7717;berth;1;{wrong};prompt;{UUID};-;L3RtcA"))
+                .is_none()
+        );
+        assert!(
+            worker
+                .hook_line(&format!("1;{TOKEN};prompt;{UUID};-;L3RtcA"))
+                .is_none(),
+            "only the hook's own line"
+        );
+        assert_eq!(worker.info().claude, None);
     }
 
     #[tokio::test]
