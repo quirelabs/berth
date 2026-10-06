@@ -1,0 +1,72 @@
+name: server
+
+# berth-server for Linux hosts: the binaries step 3's bootstrap ships, built
+# the one way they are ever built (D49, D50). Every push builds them, so the
+# speed floor and the hosts always run what a release would.
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # Zig 0.16.0 and Ghostty's source at the pinned commit, both checksummed.
+      # The same Zig builds libghostty-vt for the target and links the binary.
+      - uses: ./.github/actions/ghostty
+      - run: cargo install cargo-zigbuild --version 0.23.4 --locked
+      - run: cargo zigbuild --release --locked -p berth-core --bin berth-server --target ${{ matrix.target }}
+
+      # Static, so it runs on any distribution and any libc: nothing for the
+      # host to have but the kernel.
+      - name: Static, and for the right machine
+        shell: bash
+        run: |
+          set -eux
+          bin=target/${{ matrix.target }}/release/berth-server
+          file "$bin"
+          file "$bin" | grep -q 'statically linked'
+          case "${{ matrix.target }}" in
+            x86_64-*) file "$bin" | grep -q 'x86-64' ;;
+            aarch64-*) file "$bin" | grep -q 'ARM aarch64' ;;
+          esac
+
+      - name: Name and checksum
+        shell: bash
+        run: |
+          set -eux
+          mkdir dist
+          name=berth-server-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/berth-server "dist/$name"
+          cd dist
+          sha256sum "$name" > "$name.sha256"
+          cat "$name.sha256"
+
+      # The x86_64 build runs on the runner too: the modes start, and a small
+      # throughput run gets through the whole server path. CJK, which has no
+      # floor: a shared runner says nothing about the floor, berth-test does.
+      - name: Runs
+        if: startsWith(matrix.target, 'x86_64')
+        run: dist/berth-server-${{ matrix.target }} --bench-throughput cjk --mb 4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berth-server-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error

@@ -237,11 +237,13 @@ pub async fn measure(kind: Kind, megabytes: usize, scratch: &Path) -> Result<Rat
     result
 }
 
-/// `--bench-throughput [kind ...] [--mb N]`: each kind's rate, against its
-/// floor. Fails if any is under it.
+/// `--bench-throughput [kind ...] [--mb N] [--write DIR]`: each kind's rate,
+/// against its floor. Fails if any is under it. With `--write`, only writes
+/// the streams into DIR instead, so tmux can be timed on the same bytes.
 pub async fn run_process(args: &[String]) -> Result<bool> {
     let mut kinds = Vec::new();
     let mut megabytes = 64;
+    let mut write = None;
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
         if arg == "--mb" {
@@ -249,6 +251,11 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                 .next()
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| Error::Server("--mb needs a number".into()))?;
+        } else if arg == "--write" {
+            write =
+                Some(PathBuf::from(it.next().ok_or_else(|| {
+                    Error::Server("--write needs a directory".into())
+                })?));
         } else {
             kinds.push(
                 Kind::parse(arg).ok_or_else(|| Error::Server(format!("unknown kind {arg}")))?,
@@ -257,6 +264,15 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
     }
     if kinds.is_empty() {
         kinds = Kind::ALL.to_vec();
+    }
+    if let Some(dir) = write {
+        std::fs::create_dir_all(&dir)?;
+        for kind in kinds {
+            let path = dir.join(format!("{}.txt", kind.name()));
+            write_stream(kind, &path, megabytes)?;
+            println!("{}", path.display());
+        }
+        return Ok(true);
     }
     let scratch: PathBuf = std::env::temp_dir().join(format!("berth-bench-{}", std::process::id()));
     std::fs::create_dir_all(&scratch)?;
