@@ -14,6 +14,8 @@
 //! runtime directory is private to them (a DACL for the pipe on Windows), and
 //! on Unix every connection's peer is checked against the endpoint's owner.
 
+pub mod bench;
+pub mod cli;
 pub mod client;
 pub mod hook;
 pub mod link;

@@ -74,6 +74,33 @@ jobs:
           BERTH_PIXEL_CHECK: "1"
         run: cargo test -p berth-app --test renders_text
 
+  # The local server's flood, fallback and catch-up tests, twenty times in a
+  # row. A race that shows once in six runs (D50 found one) fails the build
+  # here instead of slipping through a single green run.
+  server-stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/ghostty
+      - run: cargo test -p berth-core --lib --no-run
+      - name: Server tests, twenty runs
+        shell: bash
+        run: |
+          set -e
+          for run in $(seq 1 20); do
+            echo "::group::run $run"
+            cargo test -p berth-core --lib server::tests
+            echo "::endgroup::"
+          done
+
   # probe.sh must run everywhere Berth can connect to.
   probe:
     runs-on: ubuntu-latest

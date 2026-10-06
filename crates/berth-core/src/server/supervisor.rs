@@ -355,6 +355,7 @@ impl State {
                 if let Some(client) = reply_to {
                     self.send_client(client, ToApp::Created { session });
                 }
+                self.push_sessions();
             }
             Event::WorkerFailed {
                 session,
@@ -383,27 +384,34 @@ impl State {
                 );
                 // The session list says what Claude is doing, for sessions no
                 // tab shows.
+                let mut changed = false;
                 if let ToApp::Event {
                     event: v1::Event::Claude(claude),
                     ..
                 } = &message
                     && let Some(entry) = self.sessions.get_mut(&session)
                 {
+                    changed = entry.info.claude.as_ref() != Some(claude);
                     entry.info.claude = Some(claude.clone());
                 }
                 // A worker telling what has its terminal now.
                 if let ToApp::Sessions(list) = message {
                     if let (Some(entry), Some(info)) =
                         (self.sessions.get_mut(&session), list.into_iter().next())
+                        && (entry.info.program != info.program || entry.info.cwd != info.cwd)
                     {
                         entry.info.program = info.program;
                         entry.info.cwd = info.cwd;
+                        self.push_sessions();
                     }
                     return;
                 }
                 self.send_attached(session, message);
                 if ended {
                     self.sessions.remove(&session);
+                }
+                if changed || ended {
+                    self.push_sessions();
                 }
             }
             Event::WorkerGone(session) => {
@@ -418,17 +426,34 @@ impl State {
                         },
                     );
                     self.sessions.remove(&session);
+                    self.push_sessions();
                 }
             }
+        }
+    }
+
+    fn session_list(&self) -> Vec<SessionInfo> {
+        let mut list: Vec<SessionInfo> = self.sessions.values().map(|s| s.info.clone()).collect();
+        list.sort_by_key(|s| s.id);
+        list
+    }
+
+    /// Tell every client the session list, as it changes: a session started
+    /// or ended, or what runs in one, where, or what Claude is doing there
+    /// changed. Apps keep their list from these rather than asking for it on
+    /// a timer.
+    fn push_sessions(&mut self) {
+        let list = self.session_list();
+        let clients: Vec<ClientId> = self.clients.keys().copied().collect();
+        for client in clients {
+            self.send_client(client, ToApp::Sessions(list.clone()));
         }
     }
 
     async fn client_said(&mut self, client: ClientId, message: ToServer) {
         match message {
             ToServer::ListSessions => {
-                let mut list: Vec<SessionInfo> =
-                    self.sessions.values().map(|s| s.info.clone()).collect();
-                list.sort_by_key(|s| s.id);
+                let list = self.session_list();
                 self.send_client(client, ToApp::Sessions(list));
             }
             ToServer::Create {

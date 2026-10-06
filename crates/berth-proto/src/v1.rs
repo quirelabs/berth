@@ -61,6 +61,9 @@ pub enum ToServer {
 /// Server to app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToApp {
+    /// Every session, in answer to [`ToServer::ListSessions`], and unasked
+    /// whenever the list changes: a session starts or ends, or what runs in
+    /// one, where, or Claude's state there changes.
     Sessions(Vec<SessionInfo>),
     Created {
         session: SessionId,

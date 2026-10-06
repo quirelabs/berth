@@ -96,31 +96,17 @@ fn render_probe() {
     });
 }
 
-/// Run as the supervisor or a worker, on a runtime of its own.
-fn serve(args: &[String]) -> std::process::ExitCode {
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!(%error, "could not start the server's runtime");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let result = runtime.block_on(async {
-        match args.first().map(String::as_str) {
-            Some("--supervisor") => berth_core::server::supervisor::run_process().await,
-            _ => berth_core::server::worker_host::run_process(args).await,
-        }
-    });
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            tracing::error!(%error, "the server stopped");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
 fn main() -> std::process::ExitCode {
+    // Claude's hook reporting to a worker, on every Claude event: before
+    // anything else, so nothing but the report is paid for (no logging, no
+    // window, no GPU).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--hook")
+        && let Some(code) = berth_core::server::cli::run(&args)
+    {
+        return code;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -129,17 +115,8 @@ fn main() -> std::process::ExitCode {
         .init();
 
     // Berth's own server (D50): the same binary, started without a window.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Claude's hook reporting to a worker: as quick and as quiet as possible.
-    if args.first().map(String::as_str) == Some("--hook") {
-        berth_core::server::hook::run_process(&args);
-        return std::process::ExitCode::SUCCESS;
-    }
-    if matches!(
-        args.first().map(String::as_str),
-        Some("--supervisor" | "--worker")
-    ) {
-        return serve(&args);
+    if let Some(code) = berth_core::server::cli::run(&args) {
+        return code;
     }
 
     if std::env::args().any(|a| a == "--render-probe") {

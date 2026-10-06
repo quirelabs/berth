@@ -120,16 +120,32 @@ fn keep_tail(text: &mut Vec<u8>) {
     }
 }
 
-/// Everything that arrives until `needle` shows in the session's output.
+/// Everything that arrives until `needle` shows in the session's output, or
+/// on a screen: after a flood the line can come inside the screen that ends
+/// the fallback rather than as output of its own.
 async fn until_output(client: &mut Client, needle: &str) {
     let mut text = Vec::new();
     loop {
-        if let ToApp::Output { bytes, .. } = next(client).await {
-            text.extend_from_slice(&bytes);
-            if String::from_utf8_lossy(&text).contains(needle) {
-                return;
+        match next(client).await {
+            ToApp::Output { bytes, .. } => {
+                text.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&text).contains(needle) {
+                    return;
+                }
+                keep_tail(&mut text);
             }
-            keep_tail(&mut text);
+            ToApp::Screen { screen, .. } => {
+                let screen: v1::Screen = screen.unpack().unwrap();
+                let shown: String = screen
+                    .lines
+                    .iter()
+                    .flat_map(|r| r.cells.iter().map(|c| c.text.as_str()))
+                    .collect();
+                if shown.contains(needle) {
+                    return;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -898,4 +914,43 @@ mod claude_through_the_worker {
         let claude = claude_event(&mut app).await.expect("told on attach");
         assert_eq!(claude.state, v1::ClaudeState::Working);
     }
+}
+
+/// The session list is pushed as it changes: a client that never asks still
+/// hears of a session starting and ending (D50).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_list_is_pushed_as_it_changes() {
+    let server = server().await;
+    let mut watching = client::connect(&server.places).await.unwrap();
+    let mut other = client::connect(&server.places).await.unwrap();
+
+    let session = create(&mut other).await;
+    let pushed = timeout(Duration::from_secs(5), async {
+        loop {
+            if let ToApp::Sessions(list) = next(&mut watching).await
+                && list.iter().any(|s| s.id == session)
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(pushed.is_ok(), "the new session was not pushed");
+
+    other
+        .to_server
+        .send(ToServer::Kill { session })
+        .await
+        .unwrap();
+    let ended = timeout(Duration::from_secs(5), async {
+        loop {
+            if let ToApp::Sessions(list) = next(&mut watching).await
+                && list.iter().all(|s| s.id != session)
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the ended session was not pushed");
 }

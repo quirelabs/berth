@@ -34,9 +34,6 @@ use gpui::svg;
 /// and how often that is checked.
 const SEEN_EVERY: Duration = Duration::from_secs(1);
 
-/// How often the local server's session list is read for the sidebar.
-const LOCAL_LIST_EVERY: Duration = Duration::from_secs(3);
-
 /// A tooltip body. gpui wants a view, and this is the whole of it.
 struct Note {
     text: gpui::SharedString,
@@ -292,8 +289,10 @@ pub struct Workspace {
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
-    /// Where the local server's Claude reports go, once it is up.
+    /// Where the local server's Claude reports and session lists go, once
+    /// it is up.
     claude_reports: session::ClaudeReports,
+    session_lists: session::SessionLists,
 }
 
 impl Workspace {
@@ -348,6 +347,11 @@ impl Workspace {
                 Self::watch_claude_reports(rx, cx);
                 tx
             },
+            session_lists: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                Self::watch_session_lists(rx, cx);
+                tx
+            },
             statuses: std::collections::BTreeMap::new(),
             started: std::time::Instant::now(),
             cold_start_reported: false,
@@ -356,7 +360,6 @@ impl Workspace {
         this.restore_local(cx);
         this.warm(cx);
         this.watch_saves(cx);
-        this.watch_local_sessions(cx);
         this.watch_window_seen(cx);
         this
     }
@@ -471,38 +474,30 @@ impl Workspace {
         .detach();
     }
 
-    /// Hand the local server's Claude reports to this workspace. Once per
-    /// server; harmless to repeat.
+    /// Hand the local server's Claude reports and session lists to this
+    /// workspace. Once per server; harmless to repeat.
     fn listen_for_claude(&self) {
         if let Some(Ok(server)) = self.local_server.get() {
             let tx = self.claude_reports.clone();
             server.on_claude(move |session, claude| {
                 let _ = tx.send((session, claude));
             });
+            let lists = self.session_lists.clone();
+            server.on_sessions(move |list| {
+                let _ = lists.send(list);
+            });
         }
     }
 
-    /// Keep the local server's session list current for the sidebar. Only
-    /// once the server is up: this never starts it.
-    fn watch_local_sessions(&self, cx: &mut Context<Self>) {
-        let cell = self.local_server.clone();
+    /// Keep the session list as the supervisor pushes it (D50): no timer.
+    fn watch_session_lists(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<berth_proto::v1::SessionInfo>>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(LOCAL_LIST_EVERY).await;
-                let Some(Ok(server)) = cell.get().cloned() else {
-                    if this.update(cx, |_, _| ()).is_err() {
-                        return;
-                    }
-                    continue;
-                };
-                let listed = runtime::spawn(async move { server.list().await })
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok());
+            while let Some(list) = rx.recv().await {
                 let alive = this.update(cx, |this, cx| {
-                    if let Some(list) = listed
-                        && list != this.local_sessions
-                    {
+                    if list != this.local_sessions {
                         this.local_sessions = list;
                         cx.notify();
                     }

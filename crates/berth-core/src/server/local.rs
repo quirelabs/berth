@@ -63,6 +63,8 @@ struct Route {
 
 /// Told what Claude is doing in a session, as its worker reports it (D50).
 type ClaudeListener = Arc<dyn Fn(SessionId, v1::Claude) + Send + Sync>;
+/// Told the session list whenever the supervisor says it changed.
+type SessionsListener = Arc<dyn Fn(Vec<SessionInfo>) + Send + Sync>;
 
 #[derive(Default)]
 struct Shared {
@@ -70,6 +72,7 @@ struct Shared {
     waiting: VecDeque<Waiting>,
     to_server: Option<mpsc::Sender<ToServer>>,
     claude: Option<ClaudeListener>,
+    sessions: Option<SessionsListener>,
 }
 
 /// The app's handle on the local server. Cheap to clone.
@@ -223,6 +226,12 @@ impl LocalServer {
     /// session. Called on the connection's task: cheap work only.
     pub fn on_claude(&self, listener: impl Fn(SessionId, v1::Claude) + Send + Sync + 'static) {
         lock(&self.shared).claude = Some(Arc::new(listener));
+    }
+
+    /// Be told the session list whenever it changes; the supervisor pushes
+    /// it, so nobody polls. Called on the connection's task: cheap work only.
+    pub fn on_sessions(&self, listener: impl Fn(Vec<SessionInfo>) + Send + Sync + 'static) {
+        lock(&self.shared).sessions = Some(Arc::new(listener));
     }
 
     /// The app's window was hidden or shown: while hidden, workers send
@@ -462,6 +471,11 @@ fn deliver(shared: &Arc<Mutex<Shared>>, message: ToApp) {
         ToApp::Sessions(list) => {
             if let Some(Waiting::Listed(tx)) = take(shared, |w| matches!(w, Waiting::Listed(_))) {
                 let _ = tx.send(list.clone());
+            }
+            // Answers and unasked pushes alike: the list as it is now.
+            let listener = lock(shared).sessions.clone();
+            if let Some(listener) = listener {
+                listener(list.clone());
             }
             return;
         }

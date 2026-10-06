@@ -82,6 +82,9 @@ pub async fn local_server(
 /// it (D50), for the workspace to fold into its panes.
 pub type ClaudeReports = tokio::sync::mpsc::UnboundedSender<(u64, berth_proto::v1::Claude)>;
 
+/// The local server's session list as the supervisor pushes it.
+pub type SessionLists = tokio::sync::mpsc::UnboundedSender<Vec<berth_proto::v1::SessionInfo>>;
+
 /// A local tab as it opened.
 pub struct LocalTab {
     pub local: Local,
