@@ -217,7 +217,9 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                         flow.left_alternate_screen();
                     }
                     in_alternate = alternate;
-                    if flow.output(*seq, bytes.len() as u64) == sync::Output::Drop {
+                    if flow.output(*seq, bytes.len() as u64, std::time::Instant::now())
+                        == sync::Output::Drop
+                    {
                         continue;
                     }
                 }
@@ -262,7 +264,10 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                     look.enter();
                 }
                 match message {
-                    ToServer::Confirmed { seq, .. } => flow.confirmed(seq),
+                    ToServer::Confirmed { seq, .. } => {
+                        flow.confirmed(seq, std::time::Instant::now());
+                    }
+                    ToServer::SendHistory { .. } => flow.history_wanted(),
                     ToServer::Visible { visible } => {
                         if let Some(kind) = flow.visible(visible) {
                             send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;

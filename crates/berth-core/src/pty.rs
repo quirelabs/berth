@@ -40,7 +40,13 @@ pub enum PtyEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PtyInput {
     Data(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// The view scrolled up into its history. Only a session on Berth's
+    /// own server can do anything with it: fetch history it missed (D50).
+    WantHistory,
     Close,
 }
 
@@ -105,6 +111,13 @@ impl Pty {
             })
             .await
             .is_ok()
+    }
+
+    /// The view scrolled up into its history: a session on Berth's own
+    /// server fetches the lines it missed while it was behind, if any.
+    /// Every other kind of session has nothing to fetch.
+    pub async fn want_history(&self) -> bool {
+        self.input.send(PtyInput::WantHistory).await.is_ok()
     }
 
     pub async fn close(&self) -> bool {
@@ -187,6 +200,7 @@ pub(crate) async fn open(
                                 break;
                             }
                         }
+                        Some(PtyInput::WantHistory) => {}
                         Some(PtyInput::Close) | None => break,
                     }
                 }

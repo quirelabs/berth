@@ -217,8 +217,8 @@ pub struct Delivered {
 }
 
 /// The run-up to the worker's switch from raw output to screens. The worker
-/// switches when, as it sends, confirmations trail by more than
-/// [`super::sync::BEHIND`]. The client confirms each chunk as it arrives, so
+/// switches when, as it sends, confirmations trail by more than its window,
+/// at least [`super::sync::MIN_WINDOW`]. The client confirms each chunk as it arrives, so
 /// the time it took to receive that last window bounds the round trip the
 /// confirmations had: far under a millisecond, the sender outran any round
 /// trip; tens of milliseconds, confirmations were held up on their way back.
@@ -238,7 +238,7 @@ impl Switch {
     fn of(arrivals: &[(Instant, u64)], started: Instant) -> Option<Self> {
         let &(last_at, last_seq) = arrivals.last()?;
         let &(first_at, first_seq) = arrivals.first()?;
-        let window_start = last_seq.saturating_sub(super::sync::BEHIND);
+        let window_start = last_seq.saturating_sub(super::sync::MIN_WINDOW);
         let window_at = arrivals
             .iter()
             .find(|(_, seq)| *seq >= window_start)

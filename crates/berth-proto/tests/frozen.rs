@@ -119,6 +119,7 @@ fn to_server() -> Vec<(ToServer, &'static str)> {
             "0707808080808020",
         ),
         (ToServer::Visible { visible: false }, "0800"),
+        (ToServer::SendHistory { session: 7 }, "0907"),
     ];
     for (message, _) in &all {
         match message {
@@ -130,7 +131,8 @@ fn to_server() -> Vec<(ToServer, &'static str)> {
             | ToServer::Input { .. }
             | ToServer::Resize { .. }
             | ToServer::Confirmed { .. }
-            | ToServer::Visible { .. } => {}
+            | ToServer::Visible { .. }
+            | ToServer::SendHistory { .. } => {}
         }
     }
     all

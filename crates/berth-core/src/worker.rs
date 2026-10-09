@@ -183,7 +183,10 @@ impl Worker {
                 None
             }
             // Nothing to do: output keeps flowing whether anyone reads it.
-            ToServer::Detach { .. } | ToServer::Confirmed { .. } | ToServer::Visible { .. } => None,
+            ToServer::Detach { .. }
+            | ToServer::Confirmed { .. }
+            | ToServer::Visible { .. }
+            | ToServer::SendHistory { .. } => None,
             // Asked by a supervisor finding its workers again: this session.
             ToServer::ListSessions => Some(ToApp::Sessions(vec![self.info()])),
             ToServer::Create { .. } => Some(ToApp::Refused {

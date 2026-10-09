@@ -56,6 +56,11 @@ pub enum ToServer {
     /// The app's window was hidden or shown. While hidden the server sends
     /// nothing; on showing, one screen per attached session (D50).
     Visible { visible: bool },
+    /// The app wants the history it missed while it was behind: its user
+    /// scrolled up into lines it does not have. Sent at once if the app keeps
+    /// up again; otherwise the server sends it after output has been calm
+    /// for a second (D50).
+    SendHistory { session: SessionId },
 }
 
 /// Server to app.
@@ -76,8 +81,9 @@ pub enum ToApp {
         bytes: Vec<u8>,
     },
     /// The whole visible screen as of output `seq`, a packed [`Screen`]. Sent
-    /// on attach, when the app has fallen behind, and when a program leaves
-    /// the alternate screen.
+    /// on attach, while the app is behind and when it catches up, when a
+    /// program leaves the alternate screen, and with the history the app
+    /// missed once output is calm or the app asks for it.
     Screen {
         session: SessionId,
         seq: u64,
@@ -85,8 +91,9 @@ pub enum ToApp {
         /// History follows: every line the server holds above this screen,
         /// as [`ToApp::History`] ranges ending with one marked `complete`. The
         /// app rebuilds its scrollback from them, so it equals the server's
-        /// line for line. False for the screens sent while an app is behind,
-        /// which would otherwise resend the history thirty times a second.
+        /// line for line. False for the screens sent while an app is behind
+        /// and the one that ends it: the history the app missed follows
+        /// later, once, with a screen of its own.
         history_follows: bool,
     },
     /// History lines, a packed `Vec<Row>`, newest first: line `newest`, then
@@ -251,7 +258,7 @@ pub enum Color {
 /// How many variants each message enum has. The frozen-bytes test checks
 /// these against the enums, so a variant added here without a new version
 /// fails the build's tests.
-pub const TO_SERVER_VARIANTS: u32 = 9;
+pub const TO_SERVER_VARIANTS: u32 = 10;
 pub const TO_APP_VARIANTS: u32 = 7;
 
 impl ToServer {
@@ -299,13 +306,13 @@ mod tests {
 
     #[test]
     fn a_message_from_a_newer_build_is_refused_by_name() {
-        // Tag 9, one past the last v1 message to the server.
+        // Tag 10, one past the last v1 message to the server.
         assert_eq!(
-            ToServer::decode(&[9]),
+            ToServer::decode(&[10]),
             Err(Error::UnknownMessage {
                 version: 1,
                 direction: Direction::ToServer,
-                tag: 9,
+                tag: 10,
             })
         );
         assert_eq!(

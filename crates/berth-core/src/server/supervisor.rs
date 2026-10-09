@@ -522,6 +522,9 @@ impl State {
                     let _ = entry.to_worker.try_send(message);
                 }
             }
+            ToServer::SendHistory { session } => {
+                self.forward(client, session, message).await;
+            }
             ToServer::Visible { .. } => {
                 let attached: Vec<SessionId> = self
                     .sessions

@@ -424,11 +424,12 @@ async fn a_client_that_fell_behind_catches_up() {
     until_output(&mut slow, "back_6").await;
 }
 
-/// A client that fell behind gets screens while the flood goes on, not only
-/// once it ends: a pane must never freeze under heavy output (D50). The
-/// flood here never ends, so every screen counted came during it.
+/// A client that fell behind is never left frozen while the flood goes on:
+/// screens, or raw output once it keeps up again, arrive every quarter of a
+/// second, not only once the flood ends (D50). The flood here never ends, so
+/// everything counted came during it.
 #[tokio::test(flavor = "multi_thread")]
-async fn screens_keep_coming_during_a_flood() {
+async fn a_pane_that_fell_behind_never_freezes_during_a_flood() {
     let server = server().await;
     let mut slow = client::connect(&server.places).await.unwrap();
     let session = create(&mut slow).await;
@@ -436,16 +437,28 @@ async fn screens_keep_coming_during_a_flood() {
     type_line(&slow, session, "yes berth_flood_line").await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
+    let mut quiet = Vec::new();
+    let started = std::time::Instant::now();
+    let mut last = started;
     let mut screens = 0;
     let _ = timeout(Duration::from_secs(3), async {
         loop {
-            if let ToApp::Screen { .. } = next(&mut slow).await {
-                screens += 1;
+            let message = next(&mut slow).await;
+            if matches!(message, ToApp::Screen { .. } | ToApp::Output { .. }) {
+                if matches!(message, ToApp::Screen { .. }) {
+                    screens += 1;
+                }
+                let now = std::time::Instant::now();
+                if now.duration_since(last) > Duration::from_millis(250) {
+                    quiet.push(now.duration_since(last));
+                }
+                last = now;
             }
         }
     })
     .await;
-    assert!(screens >= 10, "only {screens} screens in 3 s of flood");
+    assert!(screens >= 1, "it never fell behind: no screen at all");
+    assert!(quiet.is_empty(), "frozen for {quiet:?} during the flood");
     let _ = slow.to_server.send(ToServer::Kill { session }).await;
 }
 
@@ -574,6 +587,55 @@ mod through_the_app {
 
         // Reading again, the flooding pane reaches the end.
         until(&mut flood_events, "flood_done").await;
+    }
+
+    /// Whether a rebuild of the pane's scrollback completes within `within`,
+    /// reading everything else on the way.
+    async fn rebuilt_within(events: &mut Receiver<PtyEvent>, within: Duration) -> bool {
+        timeout(within, async {
+            while let Some(event) = events.recv().await {
+                if event == PtyEvent::Rebuild(berth_term::Shadow::Commit) {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// After falling behind, a pane gets the history it missed only when
+    /// output calms down or when it scrolls up and asks: never while output
+    /// keeps coming unasked, and at once when asked (D50).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missed_history_comes_when_the_pane_scrolls_up_for_it() {
+        let server = server().await;
+        let app = LocalServer::start(server.places.clone(), Start::External)
+            .await
+            .unwrap();
+        let session = app.create(None, 40, 10, None, None).await.unwrap();
+        let (pty, mut events) = app.attach(session, 40, 10, None).await.unwrap();
+        // The attach's own rebuild first, and whatever else it brings.
+        assert!(rebuilt_within(&mut events, Duration::from_secs(10)).await);
+        let _ = timeout(Duration::from_millis(500), async {
+            while events.recv().await.is_some() {}
+        })
+        .await;
+
+        pty.write(
+            b"yes berth_flood | head -n 3000000; while :; do seq 1 3000; sleep 0.02; done\n"
+                .to_vec(),
+        )
+        .await;
+        // Nobody reads the pane for a while: it falls behind.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Reading again while output keeps coming, faster than calm: the
+        // pane catches up, and no history comes unasked.
+        assert!(!rebuilt_within(&mut events, Duration::from_secs(3)).await);
+        // Scrolled up into it: the history comes.
+        pty.want_history().await;
+        assert!(rebuilt_within(&mut events, Duration::from_secs(5)).await);
+        let _ = app.kill(session).await;
     }
 }
 

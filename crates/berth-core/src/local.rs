@@ -469,6 +469,7 @@ pub async fn open_shell(
                         });
                     }
                 }
+                PtyInput::WantHistory => {}
                 PtyInput::Close => break,
             }
         }

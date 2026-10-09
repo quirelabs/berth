@@ -490,6 +490,18 @@ impl TerminalView {
         self.terminal.scroll(scroll);
         self.selection = None;
         self.drag_anchor = None;
+        // Up into the history: a session on Berth's own server that fell
+        // behind fetches the lines it missed (D50). Asked once per gap.
+        if matches!(scroll, Scroll::Lines(lines) if lines > 0) || scroll == Scroll::PageUp {
+            self.want_history();
+        }
+    }
+
+    fn want_history(&self) {
+        let Some(pty) = self.pty.clone() else { return };
+        crate::runtime::handle().spawn(async move {
+            pty.want_history().await;
+        });
     }
 
     /// Put the view back on the live grid.

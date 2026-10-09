@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -208,10 +209,17 @@ impl LocalServer {
         .await?;
 
         let (events_tx, events) = mpsc::channel(OUTPUT_QUEUE_SIZE);
-        tokio::spawn(translate(self.clone(), session, from_server, events_tx));
+        let missing = Arc::new(AtomicU8::new(HISTORY_WHOLE));
+        tokio::spawn(translate(
+            self.clone(),
+            session,
+            from_server,
+            events_tx,
+            missing.clone(),
+        ));
 
         let (input, from_pty) = mpsc::channel(INPUT_QUEUE_SIZE);
-        tokio::spawn(forward(self.clone(), session, from_pty));
+        tokio::spawn(forward(self.clone(), session, from_pty, missing));
         Ok((
             Pty {
                 input,
@@ -257,12 +265,22 @@ impl LocalServer {
     }
 }
 
-/// Confirm output to the worker every this many bytes handed on (D49).
+/// Confirm output to the worker every this many bytes handed on (D49), or
+/// every this many messages, whichever comes first: the worker counts both
+/// (`sync::MAX_IN_FLIGHT`), and a pty's small chunks reach the count first.
 const CONFIRM_EVERY: u64 = 64 * 1024;
+const CONFIRM_EVERY_MESSAGES: u32 = 32;
 /// How long a pane waits for the history after a screen, and how much output
 /// it keeps for the replacement meanwhile, before giving the rebuild up.
 const HISTORY_WITHIN: Duration = Duration::from_secs(10);
 const KEEP_AT_MOST: usize = 4 * 1024 * 1024;
+
+/// Whether a pane's scrollback has the history the worker holds: whole, with
+/// a gap from falling behind, or with a gap the worker was asked to fill. The
+/// view's scrolling asks at most once per gap.
+const HISTORY_WHOLE: u8 = 0;
+const HISTORY_GAP: u8 = 1;
+const HISTORY_ASKED: u8 = 2;
 
 /// A screen whose history is on its way.
 struct Rebuilding {
@@ -290,10 +308,12 @@ async fn translate(
     session: SessionId,
     mut from_server: mpsc::Receiver<ToApp>,
     events: mpsc::Sender<PtyEvent>,
+    missing: Arc<AtomicU8>,
 ) {
     // Output at or below the last screen's number is already on it.
     let mut drawn = 0u64;
     let mut confirmed = 0u64;
+    let mut unconfirmed_messages = 0u32;
     let mut rebuilding: Option<Rebuilding> = None;
     while let Some(message) = from_server.recv().await {
         let mut out: Vec<PtyEvent> = Vec::new();
@@ -308,6 +328,16 @@ async fn translate(
                 Ok(screen) => {
                     drawn = seq;
                     out.push(PtyEvent::Output(berth_term::replay(&screen)));
+                    // A screen without its history means output was dropped:
+                    // the scrollback has a gap until history comes.
+                    if !history_follows {
+                        let _ = missing.compare_exchange(
+                            HISTORY_WHOLE,
+                            HISTORY_GAP,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
                     // A new screen supersedes a rebuild still waiting: output
                     // was dropped in between, so what was kept no longer
                     // follows on from its screen.
@@ -346,6 +376,7 @@ async fn translate(
                         out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(done.kept)));
                     }
                     out.push(PtyEvent::Rebuild(berth_term::Shadow::Commit));
+                    missing.store(HISTORY_WHOLE, Ordering::Relaxed);
                 }
             }
             ToApp::Output { seq, bytes, .. } => {
@@ -353,6 +384,7 @@ async fn translate(
                     continue;
                 }
                 drawn = seq;
+                unconfirmed_messages += 1;
                 if let Some(pending) = rebuilding.as_mut() {
                     if pending.since.elapsed() < HISTORY_WITHIN
                         && pending.kept.len() + bytes.len() <= KEEP_AT_MOST
@@ -363,6 +395,8 @@ async fn translate(
                         // on as it is, without the rebuilt scrollback.
                         tracing::warn!(session, "history did not arrive in time");
                         rebuilding = None;
+                        // Still missing; scrolling up may ask again.
+                        missing.store(HISTORY_GAP, Ordering::Relaxed);
                     }
                 }
                 out.push(PtyEvent::Output(bytes));
@@ -384,8 +418,12 @@ async fn translate(
         }
         // Every so many bytes, and as soon as a screen is drawn: a worker
         // waiting on it sends nothing more until it is confirmed.
-        if drawn >= confirmed + CONFIRM_EVERY || (screen_now && drawn > confirmed) {
+        if drawn >= confirmed + CONFIRM_EVERY
+            || unconfirmed_messages >= CONFIRM_EVERY_MESSAGES
+            || (screen_now && drawn > confirmed)
+        {
             confirmed = drawn;
+            unconfirmed_messages = 0;
             let _ = server
                 .send(ToServer::Confirmed {
                     session,
@@ -398,9 +436,26 @@ async fn translate(
 }
 
 /// What the view does to its pty, as messages for the session.
-async fn forward(server: LocalServer, session: SessionId, mut from_pty: mpsc::Receiver<PtyInput>) {
+async fn forward(
+    server: LocalServer,
+    session: SessionId,
+    mut from_pty: mpsc::Receiver<PtyInput>,
+    missing: Arc<AtomicU8>,
+) {
     while let Some(input) = from_pty.recv().await {
         let message = match input {
+            PtyInput::WantHistory => {
+                let asked = missing.compare_exchange(
+                    HISTORY_GAP,
+                    HISTORY_ASKED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                if asked.is_err() {
+                    continue;
+                }
+                ToServer::SendHistory { session }
+            }
             PtyInput::Data(bytes) => ToServer::Input { session, bytes },
             PtyInput::Resize { cols, rows } => {
                 server.resized(session, cols, rows);
