@@ -118,8 +118,24 @@ impl Scanner {
     pub fn scan<'a>(&mut self, input: &'a [u8]) -> Vec<Piece<'a>> {
         let mut pieces = Vec::new();
         let mut run_start = 0usize;
+        let mut index = 0usize;
 
-        for (index, byte) in input.iter().enumerate() {
+        while index < input.len() {
+            // Ordinary text, and the inside of an OSC that cannot be ours (a
+            // window title, a hyperlink), are skipped to the next byte that
+            // could matter, eight at a time: most output is one or the other.
+            match self.state {
+                State::Text => match find(&input[index..], 0x1b, 0x1b) {
+                    Some(at) => index += at,
+                    None => break,
+                },
+                State::Osc if self.uninteresting => match find(&input[index..], 0x07, 0x1b) {
+                    Some(at) => index += at,
+                    None => break,
+                },
+                _ => {}
+            }
+            let byte = &input[index];
             match self.state {
                 State::Text => {
                     if *byte == 0x1b {
@@ -182,6 +198,7 @@ impl Scanner {
                     }
                 }
             }
+            index += 1;
         }
 
         if run_start < input.len() {
@@ -235,6 +252,27 @@ impl Scanner {
             _ => None,
         }
     }
+}
+
+/// The first byte in `hay` that is `a` or `b`, looked for eight bytes at a
+/// time: a word holds a zero byte exactly where it equals the one sought.
+fn find(hay: &[u8], a: u8, b: u8) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let (wa, wb) = (ONES * u64::from(a), ONES * u64::from(b));
+    let zero_at = |x: u64| x.wrapping_sub(ONES) & !x & HIGHS;
+    let (words, rest) = hay.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let w = u64::from_le_bytes(*word);
+        let hits = zero_at(w ^ wa) | zero_at(w ^ wb);
+        if hits != 0 {
+            // A borrow can mark a byte past the first match, never before
+            // it, so the lowest mark is exact.
+            return Some(i * 8 + (hits.trailing_zeros() / 8) as usize);
+        }
+    }
+    let at = words.len() * 8;
+    rest.iter().position(|&x| x == a || x == b).map(|i| at + i)
 }
 
 #[cfg(test)]
@@ -482,5 +520,65 @@ mod tests {
         let stream: &[u8] = b"\x1b]133;A\x07$ \x1b]7717;berth;p\x07";
         assert_eq!(markers(&[stream]), [ShellEventKind::PromptStart]);
         assert_eq!(agents(&[stream]), ["p"]);
+    }
+
+    proptest::proptest! {
+        /// The word-at-a-time search finds what a byte-by-byte one does.
+        #[test]
+        fn find_agrees_with_a_plain_search(
+            hay in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(0x1bu8),
+                    proptest::strategy::Just(0x07u8),
+                    proptest::strategy::Just(0x00u8),
+                    proptest::strategy::Just(0x1au8),
+                    proptest::strategy::Just(0x80u8),
+                    proptest::num::u8::ANY,
+                ],
+                0..64,
+            ),
+            a in proptest::prop_oneof![
+                proptest::strategy::Just(0x1bu8),
+                proptest::strategy::Just(0x07u8),
+            ],
+        ) {
+            let plain = hay.iter().position(|&x| x == a || x == 0x1b);
+            proptest::prop_assert_eq!(find(&hay, a, 0x1b), plain);
+        }
+
+        /// However the stream is cut, the same markers and signals come out
+        /// and every byte passes through, titles and colours around them.
+        #[test]
+        fn scanning_does_not_depend_on_the_cuts(
+            parts in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::strategy::Just(b"plain text ".to_vec()),
+                    proptest::strategy::Just(b"\x1b[38;5;3mcol\x1b[0m".to_vec()),
+                    proptest::strategy::Just(b"\x1b]0;a title\x07".to_vec()),
+                    proptest::strategy::Just(b"\x1b]2;title st\x1b\\".to_vec()),
+                    proptest::strategy::Just(b"\x1b]133;A\x07".to_vec()),
+                    proptest::strategy::Just(b"\x1b]133;D;1\x1b\\".to_vec()),
+                    proptest::strategy::Just(b"\x1b]7717;berth;sig\x07".to_vec()),
+                    proptest::strategy::Just(b"\x1b\x1b]133;C\x07".to_vec()),
+                ],
+                0..20,
+            ),
+            cuts in proptest::collection::vec(1usize..17, 0..40),
+        ) {
+            let stream: Vec<u8> = parts.concat();
+            let mut chunks: Vec<&[u8]> = Vec::new();
+            let mut rest: &[u8] = &stream;
+            for cut in cuts {
+                if rest.is_empty() {
+                    break;
+                }
+                let (head, tail) = rest.split_at(cut.min(rest.len()));
+                chunks.push(head);
+                rest = tail;
+            }
+            chunks.push(rest);
+            proptest::prop_assert_eq!(markers(&chunks), markers(&[&stream]));
+            proptest::prop_assert_eq!(agents(&chunks), agents(&[&stream]));
+        }
     }
 }

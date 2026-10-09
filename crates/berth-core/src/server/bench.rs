@@ -570,6 +570,32 @@ pub struct Rung {
     pub name: &'static str,
     pub seconds: f64,
     pub usage: Option<Usage>,
+    /// For a rung with a pty: the reads it took.
+    pub reads: Option<Reads>,
+}
+
+/// The pty's reads during a run: how many, and how big. Each is one chunk
+/// the pump hands to the engine.
+#[derive(Debug, Clone, Default)]
+pub struct Reads {
+    pub count: u64,
+    pub bytes: u64,
+    /// Reads of at most 256 B, 1 KB, 4 KB, and more.
+    pub sizes: [u64; 4],
+}
+
+impl Reads {
+    fn add(&mut self, len: usize) {
+        self.count += 1;
+        self.bytes += len as u64;
+        let bucket = match len {
+            0..=256 => 0,
+            257..=1024 => 1,
+            1025..=4096 => 2,
+            _ => 3,
+        };
+        self.sizes[bucket] += 1;
+    }
 }
 
 /// The same bytes through each layer between the spike's measure and the
@@ -605,6 +631,7 @@ pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
             name,
             seconds,
             usage,
+            reads: None,
         }
     };
     let through = |terminal: Terminal| {
@@ -641,6 +668,7 @@ pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
         name,
         seconds: took.map_or(f64::NAN, |d| d.as_secs_f64()),
         usage: None,
+        reads: None,
     }));
     rungs
 }
@@ -680,11 +708,15 @@ pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path, pin: boo
         })
         .await;
     let mut tail = Vec::new();
+    let mut reads = Reads::default();
     loop {
         let message = tokio::time::timeout(Duration::from_secs(60), output.recv())
             .await
             .map_err(|_| Error::Server("the worker went quiet".into()))?
             .ok_or_else(|| Error::Server("the worker ended".into()))?;
+        if let ToApp::Output { bytes, .. } = &message {
+            reads.add(bytes.len());
+        }
         if shows(&message, "BENCH_DONE", &mut tail) {
             break;
         }
@@ -708,6 +740,7 @@ pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path, pin: boo
         },
         seconds,
         usage,
+        reads: Some(reads),
     })
 }
 
@@ -813,6 +846,18 @@ pub async fn run_engine(args: &[String]) -> Result<bool> {
                     rung.name, used.user, used.system, used.minor_faults
                 ),
                 None => println!("  {:<21} {rate:>6.1} MB/s", rung.name),
+            }
+            if let Some(reads) = rung.reads.filter(|r| r.count > 0) {
+                println!(
+                    "  {:<21} {} reads, {:.0} B each; <=256 B {}, <=1 KB {}, <=4 KB {}, more {}",
+                    "",
+                    reads.count,
+                    reads.bytes as f64 / reads.count as f64,
+                    reads.sizes[0],
+                    reads.sizes[1],
+                    reads.sizes[2],
+                    reads.sizes[3]
+                );
             }
         }
     }
