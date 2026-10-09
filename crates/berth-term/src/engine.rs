@@ -585,6 +585,50 @@ pub fn time_parse_alone(bytes: &[u8], size: TermSize, scrollback: Scrollback) ->
     Some(started.elapsed())
 }
 
+/// The engine thread's own work, added a step at a time on one thread, each
+/// timed over all of `bytes` in 8 KB writes: libghostty alone, then with the
+/// marker scanner in front, then also numbering history every slice as
+/// [`Engine::write`] does. What remains between the last step and a
+/// [`Terminal::headless`] is the thread and the copy across to it.
+pub fn time_parse_steps(
+    bytes: &[u8],
+    size: TermSize,
+    scrollback: Scrollback,
+) -> Vec<(&'static str, Option<Duration>)> {
+    let slice = scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096);
+    let run = |scan: bool, number: bool| {
+        let mut term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
+        let mut scanner = Scanner::new();
+        let mut numbering = Numbering::default();
+        let started = Instant::now();
+        for chunk in bytes.chunks(8192) {
+            let pieces = if scan {
+                scanner.scan(chunk)
+            } else {
+                vec![Piece::Bytes(chunk)]
+            };
+            for piece in pieces {
+                if let Piece::Bytes(bytes) = piece {
+                    if number {
+                        for part in bytes.chunks(slice) {
+                            term.vt_write(part);
+                            numbering.update(&term);
+                        }
+                    } else {
+                        term.vt_write(bytes);
+                    }
+                }
+            }
+        }
+        Some(started.elapsed())
+    };
+    vec![
+        ("alone", run(false, false)),
+        ("with the scanner", run(true, false)),
+        ("and numbering", run(true, true)),
+    ]
+}
+
 /// A libghostty terminal with Berth's limits and colours.
 fn new_ghostty(cols: u16, rows: u16, scrollback: Scrollback, palette: &Palette) -> Option<Ghostty> {
     let mut term = libghostty_vt::Terminal::new(cols.max(1), rows.max(1)).ok()?;

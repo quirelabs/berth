@@ -29,7 +29,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         match mode {
             "--supervisor" => super::supervisor::run_process().await.map(|()| true),
             "--worker" => super::worker_host::run_process(args).await.map(|()| true),
-            "--bench-engine" => super::bench::run_engine(args),
+            "--bench-engine" => super::bench::run_engine(args).await,
             _ => super::bench::run_process(args).await,
         }
     });

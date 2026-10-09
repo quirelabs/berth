@@ -212,6 +212,49 @@ pub struct Report {
 pub struct Delivered {
     pub output: usize,
     pub screens: usize,
+    /// How raw output ran up to the first screen, if one came.
+    pub switch: Option<Switch>,
+}
+
+/// The run-up to the worker's switch from raw output to screens. The worker
+/// switches when, as it sends, confirmations trail by more than
+/// [`super::sync::BEHIND`]. The client confirms each chunk as it arrives, so
+/// the time it took to receive that last window bounds the round trip the
+/// confirmations had: far under a millisecond, the sender outran any round
+/// trip; tens of milliseconds, confirmations were held up on their way back.
+#[derive(Debug, Clone, Copy)]
+pub struct Switch {
+    /// Since the command went, when the last raw output arrived.
+    pub at_ms: f64,
+    /// Raw output received before it, in bytes.
+    pub raw: u64,
+    /// How long the last window of raw output took to arrive.
+    pub last_window_ms: f64,
+    /// The longest wait between two raw chunks.
+    pub longest_gap_ms: f64,
+}
+
+impl Switch {
+    fn of(arrivals: &[(Instant, u64)], started: Instant) -> Option<Self> {
+        let &(last_at, last_seq) = arrivals.last()?;
+        let &(first_at, first_seq) = arrivals.first()?;
+        let window_start = last_seq.saturating_sub(super::sync::BEHIND);
+        let window_at = arrivals
+            .iter()
+            .find(|(_, seq)| *seq >= window_start)
+            .map_or(first_at, |(at, _)| *at);
+        let longest_gap = arrivals
+            .windows(2)
+            .map(|w| w[1].0.duration_since(w[0].0))
+            .max()
+            .unwrap_or_default();
+        Some(Self {
+            at_ms: last_at.duration_since(started).as_secs_f64() * 1000.0,
+            raw: last_seq - first_seq,
+            last_window_ms: last_at.duration_since(window_at).as_secs_f64() * 1000.0,
+            longest_gap_ms: longest_gap.as_secs_f64() * 1000.0,
+        })
+    }
 }
 
 /// The processes worth accounting for, by role, as pids.
@@ -373,11 +416,23 @@ pub async fn measure(
             .map_err(|_| Error::Server("closed".into()))?;
         let mut tail = Vec::new();
         let mut delivered = Delivered::default();
+        // Raw output as it arrived, until the first screen: when and how far.
+        let mut arrivals: Vec<(Instant, u64)> = Vec::new();
         loop {
             let message = next(&mut app).await?;
             match &message {
-                ToApp::Output { bytes, .. } => delivered.output += bytes.len(),
-                ToApp::Screen { .. } => delivered.screens += 1,
+                ToApp::Output { bytes, seq, .. } => {
+                    delivered.output += bytes.len();
+                    if delivered.screens == 0 {
+                        arrivals.push((Instant::now(), *seq));
+                    }
+                }
+                ToApp::Screen { .. } => {
+                    if delivered.screens == 0 {
+                        delivered.switch = Switch::of(&arrivals, started);
+                    }
+                    delivered.screens += 1;
+                }
                 _ => {}
             }
             if shows(&message, "BENCH_DONE", &mut tail) {
@@ -483,6 +538,15 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                     delivered.output as f64 / MB as f64,
                     delivered.screens
                 );
+                if let Some(switch) = delivered.switch {
+                    println!(
+                        "  switched   at {:.1} ms after {:.2} MB raw; last 256 KB took {:.2} ms, longest gap {:.2} ms",
+                        switch.at_ms,
+                        switch.raw as f64 / MB as f64,
+                        switch.last_window_ms,
+                        switch.longest_gap_ms
+                    );
+                }
                 for (role, used) in usage {
                     println!(
                         "  {role:<10} user {:>5.2} s  sys {:>5.2} s  faults {:>8} minor {:>4} major",
@@ -553,7 +617,7 @@ pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
         while terminal.snapshot().seq < last {}
         Some(started.elapsed())
     };
-    vec![
+    let mut rungs = vec![
         timed("alone, spike limits", &|| {
             engine::time_parse_alone(&bytes, size, spike)
         }),
@@ -570,11 +634,75 @@ pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
                 worker,
             ))
         }),
-    ]
+    ];
+    // The engine thread's own work, one step at a time, on this thread.
+    let steps = engine::time_parse_steps(&bytes, size, worker);
+    rungs.extend(steps.into_iter().map(|(name, took)| Rung {
+        name,
+        seconds: took.map_or(f64::NAN, |d| d.as_secs_f64()),
+        usage: None,
+    }));
+    rungs
 }
 
-/// `--bench-engine [kind ...] [--mb N]`: [`ladder`] for each kind.
-pub fn run_engine(args: &[String]) -> Result<bool> {
+/// The worker on its own: a shell in a pty running `cat`, the pump and the
+/// headless engine, as a worker runs them, with its output read and dropped
+/// here instead of going to a supervisor. Between the ladder's headless
+/// terminal and the whole server path: what the pty and `cat` add.
+pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path) -> Result<Rung> {
+    let file = scratch.join(format!("{}.txt", kind.name()));
+    write_stream(kind, &file, megabytes)?;
+    let (worker, mut output) = crate::worker::Worker::start(crate::worker::Spec {
+        session: 1,
+        name: "bench".into(),
+        cwd: Some(scratch.to_path_buf()),
+        cols: 100,
+        rows: 30,
+        pane: None,
+        shell: Some(Shell {
+            program: "/bin/sh".into(),
+            login: false,
+        }),
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while output.try_recv().is_ok() {}
+    let engine = thread_named("self", "berth-terminal").map(|tid| format!("self/task/{tid}"));
+    let before = engine.as_deref().and_then(Usage::of);
+    let started = Instant::now();
+    worker
+        .handle(ToServer::Input {
+            session: 1,
+            bytes: format!("cat '{}'; echo BENCH_DO\"\"NE\n", file.display()).into_bytes(),
+        })
+        .await;
+    let mut tail = Vec::new();
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(60), output.recv())
+            .await
+            .map_err(|_| Error::Server("the worker went quiet".into()))?
+            .ok_or_else(|| Error::Server("the worker ended".into()))?;
+        if shows(&message, "BENCH_DONE", &mut tail) {
+            break;
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let usage = engine
+        .as_deref()
+        .and_then(Usage::of)
+        .zip(before)
+        .map(|(a, b)| a.since(b));
+    let _ = std::fs::remove_file(&file);
+    Ok(Rung {
+        name: "worker, no server",
+        seconds,
+        usage,
+    })
+}
+
+/// `--bench-engine [kind ...] [--mb N]`: [`ladder`] for each kind, then
+/// [`worker_alone`].
+pub async fn run_engine(args: &[String]) -> Result<bool> {
     let mut kinds = Vec::new();
     let mut megabytes = 64;
     let mut it = args.iter().skip(1);
@@ -593,9 +721,16 @@ pub fn run_engine(args: &[String]) -> Result<bool> {
     if kinds.is_empty() {
         kinds = Kind::ALL.to_vec();
     }
+    let scratch: PathBuf = std::env::temp_dir().join(format!("berth-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)?;
     for kind in kinds {
         println!("{}", kind.name());
-        for rung in ladder(kind, megabytes) {
+        let mut rungs = ladder(kind, megabytes);
+        match worker_alone(kind, megabytes, &scratch).await {
+            Ok(rung) => rungs.push(rung),
+            Err(error) => println!("  worker, no server: did not finish: {error}"),
+        }
+        for rung in rungs {
             let rate = megabytes as f64 / rung.seconds;
             match rung.usage {
                 Some(used) => println!(
@@ -606,6 +741,7 @@ pub fn run_engine(args: &[String]) -> Result<bool> {
             }
         }
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     Ok(true)
 }
 
