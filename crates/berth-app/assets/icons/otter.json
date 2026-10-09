@@ -1,0 +1,302 @@
+{
+  "size": [
+    20,
+    14
+  ],
+  "palette": {
+    "light": {
+      "fur": "#5F5E5A",
+      "belly": "#D3D1C7",
+      "eye": "#2C2C2A",
+      "water": "#85B7EB",
+      "water_hi": "#B5D4F4",
+      "water_deep": "#378ADD",
+      "kelp": "#3B6D11",
+      "z": "#888780",
+      "need": "#EF9F27",
+      "done": "#639922",
+      "error": "#E24B4A"
+    },
+    "dark": {
+      "fur": "#B4B2A9",
+      "belly": "#F1EFE8",
+      "eye": "#2C2C2A",
+      "water": "#378ADD",
+      "water_hi": "#85B7EB",
+      "water_deep": "#185FA5",
+      "kelp": "#639922",
+      "z": "#B4B2A9",
+      "need": "#FAC775",
+      "done": "#97C459",
+      "error": "#F09595"
+    }
+  },
+  "providers": {
+    "claude": {
+      "colors": {
+        "base": "#D85A30",
+        "hi": "#F0997B",
+        "shade": "#993C1D"
+      },
+      "shape": [
+        ".XX.",
+        "XhXX",
+        ".XX."
+      ]
+    },
+    "codex": {
+      "colors": {
+        "base": "#0F6E56",
+        "hi": "#5DCAA5",
+        "shade": "#085041"
+      },
+      "shape": [
+        "XXXX",
+        "XhhX",
+        "XXXX"
+      ]
+    },
+    "plain": {
+      "colors": {
+        "base": "#444441",
+        "hi": "#888780",
+        "shade": "#2C2C2A"
+      },
+      "shape": [
+        "....",
+        ".hX.",
+        ".XX."
+      ]
+    }
+  },
+  "states": {
+    "working": {
+      "frame_ms": 250,
+      "loop": true,
+      "frames": [
+        {
+          "pixels": [
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "...FF..F....F.......",
+            "..FFFF.F....F.......",
+            ".FFEFF.F....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 3,
+            "col": 8,
+            "sunk": false
+          }
+        },
+        {
+          "pixels": [
+            "....................",
+            "....................",
+            "....................",
+            "....................",
+            "...FF...............",
+            "..FFFF.F....F.......",
+            ".FFEFF.F....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 4,
+            "col": 8,
+            "sunk": false
+          }
+        }
+      ]
+    },
+    "needs_you": {
+      "frame_ms": 500,
+      "loop": true,
+      "frames": [
+        {
+          "pixels": [
+            "......N.............",
+            "......N.............",
+            "......F.............",
+            "......F.............",
+            "...FF.F.............",
+            "..FFFFF.....F.......",
+            ".FFEFFF.....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 4,
+            "col": 8,
+            "sunk": false
+          }
+        },
+        {
+          "pixels": [
+            ".....N..............",
+            ".....NN.............",
+            "......N.............",
+            "......F.............",
+            "...FF.F.............",
+            "..FFFFF.....F.......",
+            ".FFEFFF.....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 4,
+            "col": 8,
+            "sunk": false
+          }
+        }
+      ]
+    },
+    "done": {
+      "frame_ms": 400,
+      "loop": false,
+      "frames": [
+        {
+          "pixels": [
+            "....................",
+            "...............D....",
+            ".......F....F.......",
+            ".......F....F.......",
+            "...FF..F....F.......",
+            "..FFFF.F....F.......",
+            ".FFEFF.F....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 1,
+            "col": 8,
+            "sunk": false
+          }
+        },
+        {
+          "pixels": [
+            "...............D....",
+            "..............DDD...",
+            ".......F....F..D....",
+            ".......F....F.......",
+            "...FF..F....F.......",
+            "..FFFF.F....F.......",
+            ".FFEFF.F....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 1,
+            "col": 8,
+            "sunk": false
+          }
+        }
+      ]
+    },
+    "idle": {
+      "frame_ms": 0,
+      "loop": false,
+      "frames": [
+        {
+          "pixels": [
+            ".....zzzz...........",
+            ".......z............",
+            "......z.............",
+            ".....zzzz...........",
+            "...FF...............",
+            "..FFFF..............",
+            ".FEEFF.F....F...FF..",
+            "EBBBBFBBBkkBBBBFFF..",
+            ".BBBFFFBBBkkBBBFFFF.",
+            "..FFFFFFFFFkFFFFFFFF",
+            "wwwwFFFFFFFkFFFFwFFw",
+            "hwwwwhwwwwhwkwwhwwww",
+            "wwwwwwwwwwwwkwwwwwww",
+            "dddddddddddkdddddddd"
+          ],
+          "stone": {
+            "row": 5,
+            "col": 8,
+            "sunk": false
+          }
+        }
+      ]
+    },
+    "error": {
+      "frame_ms": 0,
+      "loop": false,
+      "frames": [
+        {
+          "pixels": [
+            "...............R....",
+            "...............R....",
+            "...............R....",
+            "....................",
+            "...FF..........R....",
+            "..FFFF.F....F.......",
+            ".FFEFF.F....F...FF..",
+            "EBBBBFBBBBBBBBBFFF..",
+            ".BBBFFFBBBBBBBBFFFF.",
+            "..FFFFFFFFFFFFFFFFFF",
+            "wwwwFFFFFFFFFFFFwFFw",
+            "hwwwwhwwwwhwwwwhwwww",
+            "wwwwwwwwwwwwwwwwwwww",
+            "dddddddddddddddddddd"
+          ],
+          "stone": {
+            "row": 11,
+            "col": 8,
+            "sunk": true
+          }
+        }
+      ]
+    }
+  },
+  "pixel_key": {
+    ".": "transparent",
+    "F": "fur",
+    "B": "belly",
+    "E": "eye",
+    "w": "water",
+    "h": "water_hi",
+    "d": "water_deep",
+    "k": "kelp",
+    "z": "z",
+    "N": "need",
+    "D": "done",
+    "R": "error"
+  }
+}

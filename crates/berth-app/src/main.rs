@@ -6,6 +6,7 @@ mod icons;
 mod input;
 mod menu;
 mod metrics;
+mod otter;
 mod panes;
 mod reconnect;
 mod render_probe;

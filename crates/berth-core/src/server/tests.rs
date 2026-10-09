@@ -519,6 +519,60 @@ async fn program_status_reaches_the_app_and_outlives_it() {
     let _ = later.to_server.send(ToServer::Kill { session }).await;
 }
 
+/// A session two apps have open ends for both when one ends it, also right
+/// after a flood, with the second app attaching at its end and reading
+/// nothing: the worker must go, not linger with its shell dead.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_session_two_apps_have_open_ends_it() {
+    let server = server().await;
+    let mut first = client::connect(&server.places).await.unwrap();
+    let session = create(&mut first).await;
+    attach(&mut first, session).await;
+    type_line(
+        &first,
+        session,
+        "yes berth_flood | head -n 800000; echo flood_do\"\"ne",
+    )
+    .await;
+    until_output(&mut first, "flood_done").await;
+
+    let second = client::connect(&server.places).await.unwrap();
+    second
+        .to_server
+        .send(ToServer::Attach {
+            session,
+            cols: 40,
+            rows: 10,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    first
+        .to_server
+        .send(ToServer::Kill { session })
+        .await
+        .unwrap();
+
+    // Neither app reads from here on, as an app that is busy would not.
+    let gone = timeout(Duration::from_secs(5), async {
+        loop {
+            if !server
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&session)
+                .is_some_and(|task| !task.is_finished())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(gone.is_ok(), "the worker outlived its session");
+    drop(second);
+}
+
 /// A client that keeps up at the rates of normal work, a fast build log at a
 /// few MB/s in bursts, stays on the raw stream: no screen at all (D50).
 #[tokio::test(flavor = "multi_thread")]

@@ -289,10 +289,65 @@ pub struct Workspace {
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
+    /// The session whose finished or failed status the focused pane was
+    /// showing at the last look: still so at the next, the user has seen it
+    /// (D53).
+    status_shown: Option<u64>,
+    /// The otter icons' clock (D53): when the looping poses began, when each
+    /// pane's or session's `done` began (it plays for two seconds), whether
+    /// motion is off, and the one timer every icon shares. The timer is only
+    /// set while an icon on screen has another frame coming.
+    otter_epoch: std::time::Instant,
+    otter_done: std::collections::HashMap<OtterKey, std::time::Instant>,
+    otter_still: bool,
+    otter_timer: Option<gpui::Task<()>>,
     /// Where the local server's Claude reports and session lists go, once
     /// it is up.
     claude_reports: session::ClaudeReports,
     session_lists: session::SessionLists,
+}
+
+/// Whose otter: a pane's, or a local session's that no pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OtterKey {
+    Pane(u64),
+    Session(u64),
+}
+
+/// What an otter shows and says.
+struct OtterLook {
+    pose: crate::otter::Pose,
+    stone: crate::otter::Stone,
+    /// The tooltip.
+    text: String,
+}
+
+impl OtterLook {
+    fn of_status(status: &berth_proto::v1::Status) -> Self {
+        Self {
+            pose: crate::otter::Pose::of_status(status.state),
+            stone: crate::otter::Stone::of_app(status.app.as_deref()),
+            text: render::status_text(status),
+        }
+    }
+
+    fn of_claude(state: berth_core::claude::State) -> Self {
+        Self {
+            pose: crate::otter::Pose::of_claude(state),
+            stone: crate::otter::Stone::Claude,
+            text: render::claude_text(state).into(),
+        }
+    }
+
+    /// An agent is there and has said nothing of what it is doing: asleep,
+    /// with a plain stone.
+    fn presence() -> Self {
+        Self {
+            pose: crate::otter::Pose::Idle,
+            stone: crate::otter::Stone::Plain,
+            text: strings::AGENT_TOOLTIP.into(),
+        }
+    }
 }
 
 impl Workspace {
@@ -342,6 +397,11 @@ impl Workspace {
             local_server: Default::default(),
             local_sessions: Vec::new(),
             window_seen: true,
+            status_shown: None,
+            otter_epoch: std::time::Instant::now(),
+            otter_done: std::collections::HashMap::new(),
+            otter_still: false,
+            otter_timer: None,
             claude_reports: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 Self::watch_claude_reports(rx, cx);
@@ -402,7 +462,38 @@ impl Workspace {
             painted
         };
         if seen != self.window_seen {
-            self.set_window_seen(seen, server, cx);
+            self.set_window_seen(seen, server.clone(), cx);
+        }
+        self.check_status_seen(server, cx);
+    }
+
+    /// A finished or failed program status stays on the icon until the user
+    /// has seen it: the pane focused, in a window that is drawn, across two
+    /// looks, so for a second or more. Then the worker is told and drops the
+    /// record, for every app and the session list alike (D53).
+    fn check_status_seen(
+        &mut self,
+        server: berth_core::server::local::LocalServer,
+        cx: &mut Context<Self>,
+    ) {
+        use berth_proto::v1::StatusState;
+        let showing = self
+            .focused()
+            .and_then(|pane| pane.session)
+            .filter(|_| self.window_seen)
+            .filter(|session| {
+                self.session_status(*session)
+                    .is_some_and(|s| matches!(s.state, StatusState::Done | StatusState::Error))
+            });
+        let seen = showing.filter(|session| self.status_shown == Some(*session));
+        self.status_shown = showing;
+        if let Some(session) = seen {
+            self.status_shown = None;
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = runtime::spawn(async move { server.status_seen(session).await }).await;
+                })
+                .detach();
         }
     }
 
@@ -868,6 +959,78 @@ impl Workspace {
     /// The same for the session a pane shows.
     fn pane_status(&self, id: u64) -> Option<&berth_proto::v1::Status> {
         self.session_status(self.pane(id)?.session?)
+    }
+
+    /// What a pane's otter shows: what its session's programs report (OSC
+    /// 7501, D53) first, Claude's hooks for a Claude too old to report that
+    /// way, and nothing if neither has said anything.
+    fn pane_otter(&self, id: u64) -> Option<OtterLook> {
+        if let Some(status) = self.pane_status(id) {
+            return Some(OtterLook::of_status(status));
+        }
+        self.claude_state(id).map(OtterLook::of_claude)
+    }
+
+    /// The same for a local session no pane shows.
+    fn session_otter(&self, session: u64) -> Option<OtterLook> {
+        self.session_status(session).map(OtterLook::of_status)
+    }
+
+    /// The frame an otter is on now.
+    fn otter_frame(&self, key: OtterKey, pose: crate::otter::Pose) -> usize {
+        pose.frame_at(self.otter_shown(key, pose), self.otter_still)
+            .0
+    }
+
+    /// How long a pose has been showing: since its `done` began, or since
+    /// the clock every looping icon shares, so they move together.
+    fn otter_shown(&self, key: OtterKey, pose: crate::otter::Pose) -> std::time::Duration {
+        let since = match pose {
+            crate::otter::Pose::Done => self.otter_done.get(&key).copied(),
+            _ => None,
+        };
+        since.unwrap_or(self.otter_epoch).elapsed()
+    }
+
+    /// Before drawing: note which otters have just become `done`, and set
+    /// the one timer for the next frame any of them needs. No icon moving,
+    /// motion reduced or the window not drawn: no timer, and no wakeups.
+    fn tend_otters(&mut self, cx: &mut Context<Self>) {
+        use crate::otter::Pose;
+        self.otter_still = cx.reduce_motion();
+        let shown: Vec<(OtterKey, Pose)> = self
+            .panes
+            .iter()
+            .filter_map(|pane| Some((OtterKey::Pane(pane.id), self.pane_otter(pane.id)?.pose)))
+            .chain(self.local_sessions.iter().filter_map(|info| {
+                Some((
+                    OtterKey::Session(info.id),
+                    self.session_otter(info.id)?.pose,
+                ))
+            }))
+            .collect();
+        let now = std::time::Instant::now();
+        self.otter_done
+            .retain(|key, _| shown.contains(&(*key, Pose::Done)));
+        for (key, pose) in &shown {
+            if *pose == Pose::Done {
+                self.otter_done.entry(*key).or_insert(now);
+            }
+        }
+        let next = shown
+            .iter()
+            .filter_map(|(key, pose)| {
+                pose.frame_at(self.otter_shown(*key, *pose), self.otter_still)
+                    .1
+            })
+            .min()
+            .filter(|_| self.window_seen);
+        self.otter_timer = next.map(|wait| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
     }
 
     /// What a pane's Claude is doing, when its hooks have said.

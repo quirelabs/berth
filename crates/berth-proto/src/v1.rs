@@ -61,6 +61,10 @@ pub enum ToServer {
     /// up again; otherwise the server sends it after output has been calm
     /// for a second (D50).
     SendHistory { session: SessionId },
+    /// The user has looked at the session: its pane was focused for about a
+    /// second. Finished and failed program status records, kept to be seen,
+    /// now go (D53).
+    StatusSeen { session: SessionId },
 }
 
 /// Server to app.
@@ -307,7 +311,7 @@ pub enum Color {
 /// How many variants each message enum has. The frozen-bytes test checks
 /// these against the enums, so a variant added here without a new version
 /// fails the build's tests.
-pub const TO_SERVER_VARIANTS: u32 = 10;
+pub const TO_SERVER_VARIANTS: u32 = 11;
 pub const TO_APP_VARIANTS: u32 = 7;
 
 impl ToServer {
@@ -355,13 +359,13 @@ mod tests {
 
     #[test]
     fn a_message_from_a_newer_build_is_refused_by_name() {
-        // Tag 10, one past the last v1 message to the server.
+        // Tag 11, one past the last v1 message to the server.
         assert_eq!(
-            ToServer::decode(&[10]),
+            ToServer::decode(&[11]),
             Err(Error::UnknownMessage {
                 version: 1,
                 direction: Direction::ToServer,
-                tag: 10,
+                tag: 11,
             })
         );
         assert_eq!(

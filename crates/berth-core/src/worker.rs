@@ -231,7 +231,8 @@ impl Worker {
             ToServer::Detach { .. }
             | ToServer::Confirmed { .. }
             | ToServer::Visible { .. }
-            | ToServer::SendHistory { .. } => None,
+            | ToServer::SendHistory { .. }
+            | ToServer::StatusSeen { .. } => None,
             // Asked by a supervisor finding its workers again: this session.
             ToServer::ListSessions => Some(ToApp::Sessions(vec![self.info()])),
             ToServer::Create { .. } => Some(ToApp::Refused {
@@ -358,6 +359,26 @@ impl Worker {
         Some(self.info())
     }
 
+    /// The user has looked at the session: finished and failed records, kept
+    /// to be seen, go. What changed comes out of the next
+    /// [`Worker::status_changes`].
+    pub fn status_seen(&self) {
+        self.status_change(crate::status::Records::seen);
+    }
+
+    /// Change the records outside a report, and leave what changed to be
+    /// sent.
+    fn status_change(&self, change: impl FnOnce(&mut crate::status::Records) -> bool) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let before = status.records.to_wire();
+        if change(&mut status.records) {
+            let changed = changes(&before, &status.records.to_wire());
+            status.unsent.extend(changed);
+            drop(status);
+            self.status_wake.notify_one();
+        }
+    }
+
     /// The terminal going back to the shell means the program that had it
     /// exited: its records of something under way go, as the protocol asks,
     /// also for a shell that marks no prompts.
@@ -366,15 +387,9 @@ impl Worker {
         let before = status.foreground.replace(pid);
         let back_at_the_shell =
             before.is_some_and(|was| was != pid) && self.pty.local_pid() == Some(pid);
-        if !back_at_the_shell {
-            return;
-        }
-        let records = status.records.to_wire();
-        if status.records.program_ended() {
-            let gone = changes(&records, &status.records.to_wire());
-            status.unsent.extend(gone);
-            drop(status);
-            self.status_wake.notify_one();
+        drop(status);
+        if back_at_the_shell {
+            self.status_change(crate::status::Records::program_ended);
         }
     }
 
@@ -783,11 +798,35 @@ mod tests {
             ("tests", v1::StatusState::Done)
         );
 
-        // A full reset clears the rest.
-        type_in(&worker, "printf '\\033c'").await;
+        // Looked at: the finished one goes too.
+        worker.status_seen();
         let events = status_events(&worker, 1).await;
         assert_eq!(events, [v1::Event::StatusGone(vec!["tests".into()])]);
         assert_eq!(worker.info().status, None);
+
+        // A full reset clears whatever there is.
+        type_in(&worker, "printf '\\033]7501;state=error:id=e\\033\\\\'").await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        type_in(&worker, "printf '\\033c'").await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events, [v1::Event::StatusGone(vec!["e".into()])]);
+        assert!(worker.statuses().is_empty());
+    }
+
+    /// Ending a session ends its worker's output, which is what lets the
+    /// worker's process go: nothing the worker holds may keep the pty open.
+    #[tokio::test]
+    async fn ending_a_session_ends_its_output() {
+        let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
+        type_in(&worker, "echo up_$((1+1))").await;
+        until(&mut rx, "up_2").await;
+        worker.handle(ToServer::Kill { session: 1 }).await;
+        let ended = timeout(Duration::from_secs(5), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the worker's output never ended");
     }
 
     /// A report that breaks the protocol's rules changes nothing.

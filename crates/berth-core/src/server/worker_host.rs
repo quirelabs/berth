@@ -290,6 +290,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                         flow.confirmed(seq, std::time::Instant::now());
                     }
                     ToServer::SendHistory { .. } => flow.history_wanted(),
+                    ToServer::StatusSeen { .. } => worker.status_seen(),
                     ToServer::Visible { visible } => {
                         if let Some(kind) = flow.visible(visible) {
                             send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;

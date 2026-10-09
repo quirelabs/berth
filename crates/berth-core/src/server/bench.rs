@@ -519,9 +519,34 @@ pub async fn measure(
             .zip(after)
             .filter_map(|((role, before), (_, after))| Some((role, after?.since(before?))))
             .collect();
+        // The worker's pid, before it goes and takes its file with it.
+        let pid_file = places.worker_pid(session);
+        let worker = (servers == Servers::Processes)
+            .then(|| paths::read_pid(&pid_file))
+            .flatten();
         let _ = app.to_server.send(ToServer::Kill { session }).await;
-        // Give the worker the moment it needs to go before its supervisor.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The worker goes before its supervisor does. A detached worker that
+        // outlived the run would stay on the host for good, so it is waited
+        // for, and stopped if it will not go by itself. It removes its pid
+        // file as it exits; the process table would still list it until its
+        // supervisor is gone.
+        match worker {
+            Some(pid) => {
+                for _ in 0..60 {
+                    if !pid_file.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if pid_file.exists() {
+                    println!("  the worker ({pid}) outlived its session: stopped");
+                    let _ = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status();
+                }
+            }
+            None => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
         Ok(Report {
             rate: Rate {
                 kind,

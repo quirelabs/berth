@@ -57,7 +57,7 @@ enum Event {
     ClientGone(ClientId),
     WorkerUp {
         info: SessionInfo,
-        to_worker: mpsc::Sender<ToServer>,
+        to_worker: ToWorker,
         build: String,
         reply_to: Option<ClientId>,
     },
@@ -72,9 +72,37 @@ enum Event {
     CaughtUp(ClientId),
 }
 
+/// The way to a worker. The table never waits on it: a worker busy sending
+/// output may not be reading, and the table waiting on it would stop taking
+/// that very output, so neither would ever move again (found 2026-10-02 for
+/// confirmations, and 2026-10-10 for everything else: a key typed into a
+/// flooded session froze it for good).
+///
+/// What must arrive (input, attach, kill and the rest) queues without limit;
+/// it comes at the pace of a user, a few bytes at a time. Confirmations are
+/// cumulative, so one that finds its queue full is dropped and carried by
+/// the next.
+#[derive(Clone)]
+struct ToWorker {
+    must: mpsc::UnboundedSender<ToServer>,
+    confirmations: mpsc::Sender<ToServer>,
+}
+
+impl ToWorker {
+    /// Queue a message that must arrive. False if the worker is gone.
+    fn send(&self, message: ToServer) -> bool {
+        self.must.send(message).is_ok()
+    }
+
+    /// Hand over a confirmation if there is room.
+    fn confirm(&self, message: ToServer) {
+        let _ = self.confirmations.try_send(message);
+    }
+}
+
 struct Session {
     info: SessionInfo,
-    to_worker: mpsc::Sender<ToServer>,
+    to_worker: ToWorker,
     attached: HashSet<ClientId>,
     build: String,
 }
@@ -310,7 +338,7 @@ impl State {
 
     async fn to_worker(&self, session: SessionId, message: ToServer) -> bool {
         match self.sessions.get(&session) {
-            Some(entry) => entry.to_worker.send(message).await.is_ok(),
+            Some(entry) => entry.to_worker.send(message),
             None => false,
         }
     }
@@ -515,17 +543,15 @@ impl State {
             ToServer::Input { session, .. } | ToServer::Kill { session } => {
                 self.forward(client, session, message).await;
             }
-            // Never waited on: a worker busy sending output may not be
-            // reading, and waiting here would wait on the output this table
-            // is the one to take (found 2026-10-02). Confirmations are
-            // cumulative, so one dropped is carried by the next, and a worker
-            // does not wait on a lost one for long.
+            // Dropped rather than queued when the worker is not reading:
+            // confirmations are cumulative, so the next carries it, and a
+            // worker does not wait on a lost one for long.
             ToServer::Confirmed { session, .. } => {
                 if let Some(entry) = self.sessions.get(&session) {
-                    let _ = entry.to_worker.try_send(message);
+                    entry.to_worker.confirm(message);
                 }
             }
-            ToServer::SendHistory { session } => {
+            ToServer::SendHistory { session } | ToServer::StatusSeen { session } => {
                 self.forward(client, session, message).await;
             }
             ToServer::Visible { .. } => {
@@ -630,10 +656,23 @@ impl State {
                     return;
                 }
             };
-            let (to_worker, mut outbox) = mpsc::channel::<ToServer>(QUEUE);
+            let (must, mut must_go) = mpsc::unbounded_channel::<ToServer>();
+            let (confirmations, mut confirmed) = mpsc::channel::<ToServer>(QUEUE);
+            let to_worker = ToWorker {
+                must,
+                confirmations,
+            };
             let mut write = opened.write;
             tokio::spawn(async move {
-                while let Some(message) = outbox.recv().await {
+                loop {
+                    // What must arrive first: a key typed is not kept behind
+                    // a backlog of confirmations.
+                    let message = tokio::select! {
+                        biased;
+                        message = must_go.recv() => message,
+                        message = confirmed.recv() => message,
+                    };
+                    let Some(message) = message else { break };
                     let Ok(payload) = message.encode() else {
                         continue;
                     };

@@ -253,7 +253,12 @@ impl Workspace {
             row = row.bg(hsla(theme.border));
         }
         if agent {
-            row = row.child(ghost(("folder-agent", index), theme));
+            row = row.child(otter(
+                ("folder-agent", index),
+                theme,
+                &OtterLook::presence(),
+                0,
+            ));
         }
 
         if let Some(status) = status {
@@ -365,20 +370,17 @@ impl Workspace {
         }
         // What the session's programs report of themselves comes first
         // (OSC 7501, D53); Claude's hooks are the fallback for a Claude too
-        // old to report that way.
-        let status = match pane {
-            Some(id) => self.pane_status(id),
-            None => local_session.and_then(|session| self.session_status(session)),
+        // old to report that way; an agent that says nothing is asleep.
+        let (key, look) = match pane {
+            Some(id) => (OtterKey::Pane(id), self.pane_otter(id)),
+            None => match local_session {
+                Some(session) => (OtterKey::Session(session), self.session_otter(session)),
+                None => (OtterKey::Session(u64::MAX), None),
+            },
         };
-        match (status, pane.and_then(|id| self.claude_state(id))) {
-            (Some(status), _) => {
-                row = row.child(status_ghost(("session-agent", index), theme, status))
-            }
-            (None, Some(state)) => {
-                row = row.child(claude_ghost(("session-agent", index), theme, state))
-            }
-            (None, None) if agent => row = row.child(ghost(("session-agent", index), theme)),
-            (None, None) => {}
+        if let Some(look) = look.or_else(|| agent.then(OtterLook::presence)) {
+            let frame = self.otter_frame(key, look.pose);
+            row = row.child(otter(("session-agent", index), theme, &look, frame));
         }
         if detached {
             row = row.tooltip(move |_, cx| {
@@ -495,15 +497,12 @@ impl Workspace {
 
             // After the name and before the state, because it is about what is
             // inside the session rather than about the connection.
-            match (self.pane_status(id), self.claude_state(id)) {
-                (Some(status), _) => {
-                    row = row.child(status_ghost(("agent", tab_id as usize), theme, status))
-                }
-                (None, Some(state)) => {
-                    row = row.child(claude_ghost(("agent", tab_id as usize), theme, state))
-                }
-                (None, None) if agent => row = row.child(ghost(("agent", tab_id as usize), theme)),
-                (None, None) => {}
+            if let Some(look) = self
+                .pane_otter(id)
+                .or_else(|| agent.then(OtterLook::presence))
+            {
+                let frame = self.otter_frame(OtterKey::Pane(id), look.pose);
+                row = row.child(otter(("agent", tab_id as usize), theme, &look, frame));
             }
 
             // Split tabs say how many panes they hold, since only one of them
@@ -1015,6 +1014,7 @@ impl Render for Workspace {
         // Light and dark follow the OS.
         self.theme = Theme::for_appearance(window.appearance().into());
         let theme = self.theme;
+        self.tend_otters(cx);
 
         // A modal takes the keyboard, so Escape and Enter reach it rather than
         // the terminal underneath.
@@ -1157,35 +1157,53 @@ pub(super) fn local_label() -> String {
     }
 }
 
-/// The agent ghost, with the tooltip that says presence and nothing more.
-fn ghost(id: (&'static str, usize), theme: Theme) -> gpui::Stateful<gpui::Div> {
-    ghost_as(id, theme, theme.accent, strings::AGENT_TOOLTIP.into())
-}
-
-/// The ghost for a session whose program reports its own status (OSC 7501,
-/// D53): the colour says whether it needs you, the tooltip gives the
-/// program's own words.
-fn status_ghost(
+/// The status icon (D53): the otter in its pose with its stone, and the
+/// tooltip that says in words what it shows. Should the sprite sheet ever
+/// fail to load, the ghost it replaced stands in, coloured by what the pose
+/// asks of you.
+fn otter(
     id: (&'static str, usize),
     theme: Theme,
-    status: &berth_proto::v1::Status,
+    look: &OtterLook,
+    frame: usize,
 ) -> gpui::Stateful<gpui::Div> {
-    let colour = match status_tone(status.state) {
-        Tone::Working => theme.accent,
-        Tone::NeedsYou => theme.warning,
-        Tone::Done => theme.text_muted,
+    let text = look.text.clone();
+    let icon = match crate::otter::icon(look.pose, frame, look.stone, theme) {
+        Some(icon) => icon,
+        None => {
+            let colour = match pose_tone(look.pose) {
+                Tone::Working => theme.accent,
+                Tone::NeedsYou => theme.warning,
+                Tone::Done => theme.text_muted,
+            };
+            div().child(
+                svg()
+                    .path(crate::icons::GHOST)
+                    .size(px(12.0))
+                    .text_color(hsla(colour)),
+            )
+        }
     };
-    ghost_as(id, theme, colour, status_text(status))
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .child(icon)
+        .tooltip(move |_, cx| {
+            cx.new(|_| Note {
+                text: text.clone().into(),
+                theme,
+            })
+            .into()
+        })
 }
 
-/// How a reported state reads at a glance: blocked, failed and finished with
-/// something to see all ask for a look; idle does not.
-fn status_tone(state: berth_proto::v1::StatusState) -> Tone {
-    use berth_proto::v1::StatusState;
-    match state {
-        StatusState::Working => Tone::Working,
-        StatusState::Blocked | StatusState::Error | StatusState::Done => Tone::NeedsYou,
-        StatusState::Idle => Tone::Done,
+/// What a pose asks of you, for the fallback's colour.
+fn pose_tone(pose: crate::otter::Pose) -> Tone {
+    use crate::otter::Pose;
+    match pose {
+        Pose::Working => Tone::Working,
+        Pose::NeedsYou | Pose::Done | Pose::Error => Tone::NeedsYou,
+        Pose::Idle => Tone::Done,
     }
 }
 
@@ -1194,7 +1212,7 @@ const STATUS_MSG_SHOWN: usize = 160;
 
 /// A record in words: who (its title, else the program's name), what it
 /// reported, and its message, cut to a line.
-fn status_text(status: &berth_proto::v1::Status) -> String {
+pub(super) fn status_text(status: &berth_proto::v1::Status) -> String {
     let who = status
         .title
         .as_deref()
@@ -1217,44 +1235,9 @@ fn status_text(status: &berth_proto::v1::Status) -> String {
     )
 }
 
-/// The ghost for a Claude whose hooks report its state (D48): the colour says
-/// whether it needs you, the tooltip says which state.
-fn claude_ghost(
-    id: (&'static str, usize),
-    theme: Theme,
-    state: berth_core::claude::State,
-) -> gpui::Stateful<gpui::Div> {
-    let (tone, text) = claude_look(state);
-    let colour = match tone {
-        Tone::Working => theme.accent,
-        Tone::NeedsYou => theme.warning,
-        Tone::Done => theme.text_muted,
-    };
-    ghost_as(id, theme, colour, text.into())
-}
-
-fn ghost_as(
-    id: (&'static str, usize),
-    theme: Theme,
-    colour: gpui::Rgba,
-    text: String,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex_shrink_0()
-        .child(
-            svg()
-                .path(crate::icons::GHOST)
-                .size(px(12.0))
-                .text_color(hsla(colour)),
-        )
-        .tooltip(move |_, cx| {
-            cx.new(|_| Note {
-                text: text.clone().into(),
-                theme,
-            })
-            .into()
-        })
+/// What Claude's hooks said, in words (D48).
+pub(super) fn claude_text(state: berth_core::claude::State) -> &'static str {
+    claude_look(state).1
 }
 
 /// How a Claude state reads at a glance.
@@ -1319,16 +1302,16 @@ mod tests {
         }
     }
 
-    /// A reported state asks for a look when the program is stuck, failed or
-    /// has something to show; working and idle do not.
+    /// A pose asks for a look when the program is stuck, failed or has
+    /// something to show; working and idle do not.
     #[test]
-    fn reported_states_that_need_you() {
-        use berth_proto::v1::StatusState;
-        for state in [StatusState::Blocked, StatusState::Error, StatusState::Done] {
-            assert_eq!(status_tone(state), Tone::NeedsYou, "{state:?}");
+    fn poses_that_need_you() {
+        use crate::otter::Pose;
+        for pose in [Pose::NeedsYou, Pose::Error, Pose::Done] {
+            assert_eq!(pose_tone(pose), Tone::NeedsYou, "{pose:?}");
         }
-        assert_eq!(status_tone(StatusState::Working), Tone::Working);
-        assert_eq!(status_tone(StatusState::Idle), Tone::Done);
+        assert_eq!(pose_tone(Pose::Working), Tone::Working);
+        assert_eq!(pose_tone(Pose::Idle), Tone::Done);
     }
 
     /// The tooltip gives the program's own words, as a report, named by its

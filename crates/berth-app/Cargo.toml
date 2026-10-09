@@ -21,6 +21,11 @@ tokio.workspace = true
 futures = "0.3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Reading the otter sprite sheet (assets/icons/otter.json). Both are in the
+# tree already through berth-core and gpui, so these are direct references
+# rather than new code.
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Decoding the screenshot the pixel check takes. Already in the tree via gpui,

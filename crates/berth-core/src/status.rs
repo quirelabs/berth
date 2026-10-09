@@ -281,6 +281,16 @@ impl Records {
         self.records.len() != before
     }
 
+    /// The user has looked at the session: what was kept to be seen, `done`
+    /// and `error`, goes.
+    pub fn seen(&mut self) -> bool {
+        let before = self.records.len();
+        self.records.retain(|_, (record, _)| {
+            !matches!(record.state, v1::StatusState::Done | v1::StatusState::Error)
+        });
+        self.records.len() != before
+    }
+
     /// A full reset of the terminal: every record goes.
     pub fn reset(&mut self) -> bool {
         self.clear("")
@@ -542,6 +552,11 @@ mod tests {
         assert!(records.program_ended());
         assert_eq!(ids(&records), ["d", "e"]);
         assert!(!records.program_ended());
+        // Looked at: the two left to see go, and nothing else would have.
+        records.apply(parse("state=working:id=w2").unwrap());
+        assert!(records.seen());
+        assert_eq!(ids(&records), ["w2"]);
+        assert!(!records.seen());
         assert!(records.reset());
         assert!(records.is_empty());
     }

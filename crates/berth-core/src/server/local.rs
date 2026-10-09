@@ -248,6 +248,12 @@ impl LocalServer {
         self.send(ToServer::Visible { visible }).await
     }
 
+    /// The user has looked at a session: its pane was focused for about a
+    /// second. Its finished and failed status records go (D53).
+    pub async fn status_seen(&self, session: SessionId) -> Result<()> {
+        self.send(ToServer::StatusSeen { session }).await
+    }
+
     /// End a session for good. The app asks the user first (D32).
     pub async fn kill(&self, session: SessionId) -> Result<()> {
         self.send(ToServer::Kill { session }).await
