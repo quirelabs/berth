@@ -65,6 +65,12 @@ pub const MAX_AGENT_PARAM: usize = 1100;
 /// What every agent signal's parameter string starts with.
 const AGENT_PREFIX: &[u8] = b"7717;berth;";
 const SHELL_PREFIX: &[u8] = b"133;";
+/// OSC 7501, the Program Status Protocol: a program saying what it is doing.
+const STATUS_PREFIX: &[u8] = b"7501;";
+
+/// Longest program status report kept: the protocol caps the whole sequence
+/// at 4096 bytes, and anything longer is discarded.
+pub const MAX_STATUS_PARAM: usize = 4096;
 
 /// Splits a byte stream into runs of ordinary output and OSC 133 markers.
 #[derive(Debug, Clone)]
@@ -86,12 +92,30 @@ pub enum Piece<'a> {
     /// An agent signal's payload, everything after `7717;berth;`. Untrusted:
     /// any program in the pane can print one. Passed through as `Bytes` too.
     Agent(String),
+    /// An OSC 7501 body, everything after `7501;`: `?` for the support
+    /// query, otherwise a report's `key=value` pairs, unparsed and untrusted.
+    /// Passed through as `Bytes` too.
+    Status(String),
+    /// A full reset (RIS, `ESC c`), which also clears every program status
+    /// record. Passed through as `Bytes` too.
+    Reset,
 }
 
 /// What a completed OSC turned out to be.
 enum Found {
     Shell(ShellEventKind),
     Agent(String),
+    Status(String),
+}
+
+impl Found {
+    fn piece<'a>(self) -> Piece<'a> {
+        match self {
+            Found::Shell(kind) => Piece::Marker(kind),
+            Found::Agent(payload) => Piece::Agent(payload),
+            Found::Status(body) => Piece::Status(body),
+        }
+    }
 }
 
 impl Default for Scanner {
@@ -150,6 +174,11 @@ impl Scanner {
                     } else if *byte == 0x1b {
                         // Another ESC restarts the sequence.
                     } else {
+                        if *byte == b'c' {
+                            pieces.push(Piece::Bytes(&input[run_start..=index]));
+                            run_start = index + 1;
+                            pieces.push(Piece::Reset);
+                        }
                         self.state = State::Text;
                     }
                 }
@@ -159,10 +188,7 @@ impl Scanner {
                         if let Some(kind) = self.finish() {
                             pieces.push(Piece::Bytes(&input[run_start..=index]));
                             run_start = index + 1;
-                            pieces.push(match kind {
-                                Found::Shell(kind) => Piece::Marker(kind),
-                                Found::Agent(payload) => Piece::Agent(payload),
-                            });
+                            pieces.push(kind.piece());
                         }
                         self.state = State::Text;
                     }
@@ -183,10 +209,7 @@ impl Scanner {
                         if let Some(kind) = self.finish() {
                             pieces.push(Piece::Bytes(&input[run_start..=index]));
                             run_start = index + 1;
-                            pieces.push(match kind {
-                                Found::Shell(kind) => Piece::Marker(kind),
-                                Found::Agent(payload) => Piece::Agent(payload),
-                            });
+                            pieces.push(kind.piece());
                         }
                         self.state = State::Text;
                     } else {
@@ -210,10 +233,12 @@ impl Scanner {
     /// Whether the parameter so far can still be an OSC 133 marker or an agent
     /// signal. Lets a long unrelated OSC, such as a title, be discarded early.
     fn could_be_ours(&self) -> bool {
-        [SHELL_PREFIX, AGENT_PREFIX].iter().any(|prefix| {
-            let n = self.param.len().min(prefix.len());
-            self.param[..n] == prefix[..n]
-        })
+        [SHELL_PREFIX, AGENT_PREFIX, STATUS_PREFIX]
+            .iter()
+            .any(|prefix| {
+                let n = self.param.len().min(prefix.len());
+                self.param[..n] == prefix[..n]
+            })
     }
 
     /// How long this parameter may grow: an agent signal carries a directory,
@@ -221,6 +246,8 @@ impl Scanner {
     fn limit(&self) -> usize {
         if self.param.starts_with(AGENT_PREFIX) {
             MAX_AGENT_PARAM
+        } else if self.param.starts_with(STATUS_PREFIX) {
+            MAX_STATUS_PARAM
         } else {
             MAX_PARAM
         }
@@ -236,6 +263,9 @@ impl Scanner {
         let text = std::str::from_utf8(&param).ok()?;
         if let Some(payload) = text.strip_prefix("7717;berth;") {
             return Some(Found::Agent(payload.to_string()));
+        }
+        if let Some(body) = text.strip_prefix("7501;") {
+            return Some(Found::Status(body.to_string()));
         }
         let rest = text.strip_prefix("133;")?;
         let mut parts = rest.split(';');
@@ -289,7 +319,7 @@ mod tests {
                 match piece {
                     Piece::Bytes(b) => passed.extend_from_slice(b),
                     Piece::Marker(kind) => found.push(kind),
-                    Piece::Agent(_) => {}
+                    Piece::Agent(_) | Piece::Status(_) | Piece::Reset => {}
                 }
             }
         }
@@ -468,7 +498,7 @@ mod tests {
                 match piece {
                     Piece::Bytes(b) => passed.extend_from_slice(b),
                     Piece::Agent(payload) => found.push(payload),
-                    Piece::Marker(_) => {}
+                    Piece::Marker(_) | Piece::Status(_) | Piece::Reset => {}
                 }
             }
         }

@@ -46,6 +46,53 @@ const CATCH_UP_LIMIT: Duration = Duration::from_secs(5);
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Where a terminal that owns a session writes what it answers a program:
+/// called on the engine thread with bytes for the pty, in stream order.
+pub type Reply = Box<dyn Fn(&[u8]) + Send>;
+
+/// What a terminal says to `CSI c` and its relatives: a VT220-class terminal
+/// with ANSI colour, as most emulators answer. A program waiting on this
+/// reply to learn that an earlier query went unanswered gets it at once.
+fn device_attributes() -> libghostty_vt::terminal::DeviceAttributes {
+    use libghostty_vt::terminal::{
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+        PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
+    };
+    const PRIMARY: PrimaryDeviceAttributes = PrimaryDeviceAttributes::new(
+        ConformanceLevel::LEVEL_2,
+        &[DeviceAttributeFeature::ANSI_COLOR],
+    );
+    DeviceAttributes {
+        primary: PRIMARY,
+        secondary: SecondaryDeviceAttributes {
+            device_type: DeviceType::VT220,
+            firmware_version: 0,
+            rom_cartridge: 0,
+        },
+        tertiary: TertiaryDeviceAttributes::default(),
+    }
+}
+
+/// What a terminal answers XTVERSION: Berth, by name and version.
+const XTVERSION: &str = concat!("Berth ", env!("CARGO_PKG_VERSION"));
+
+/// The reply to the OSC 7501 support query: the query's own body.
+const STATUS_SUPPORTED: &[u8] = b"\x1b]7501;?\x1b\\";
+
+/// Something about program status (OSC 7501), in stream order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusEvent {
+    /// A report's `key=value` pairs, unparsed and untrusted.
+    Report(String),
+    /// A new shell prompt began (OSC 133 A).
+    PromptStart,
+    /// A full reset: every record goes.
+    Reset,
+}
+
+/// The most status events kept for a holder that does not take them.
+const MAX_QUEUED_STATUS: usize = 1024;
+
 enum Command {
     Write(Vec<u8>),
     Resize(TermSize, CellSize),
@@ -129,6 +176,7 @@ struct Published {
     revision: u64,
     shell_events: Vec<ShellEvent>,
     agent_signals: Vec<String>,
+    status_events: Vec<StatusEvent>,
     seen_shell_marker: bool,
 }
 
@@ -171,7 +219,7 @@ impl Terminal {
     }
 
     pub fn with_scrollback(size: TermSize, cell_size: CellSize, scrollback: Scrollback) -> Self {
-        Self::start(size, cell_size, scrollback, false)
+        Self::start(size, cell_size, scrollback, false, None)
     }
 
     /// A terminal nobody draws: a server's (D50). It parses, and builds a
@@ -181,10 +229,33 @@ impl Terminal {
     /// full-screen program up" without the engine copying the screen for a
     /// renderer every few milliseconds.
     pub fn headless(size: TermSize, scrollback: Scrollback) -> Self {
-        Self::start(size, CellSize::new(8.0, 16.0), scrollback, true)
+        Self::start(size, CellSize::new(8.0, 16.0), scrollback, true, None)
     }
 
-    fn start(size: TermSize, cell_size: CellSize, scrollback: Scrollback, headless: bool) -> Self {
+    /// A session's own terminal, the one a server keeps (D50): headless, and
+    /// the only terminal that answers what programs ask (device attributes,
+    /// the cursor position, XTVERSION, the OSC 7501 support query), through
+    /// `reply`, in the order the questions came. Every other terminal is a
+    /// copy of a session someone else owns and stays silent, or programs
+    /// would get each answer twice. It also keeps program status events
+    /// ([`Terminal::drain_status_events`]).
+    pub fn server(size: TermSize, scrollback: Scrollback, reply: Reply) -> Self {
+        Self::start(
+            size,
+            CellSize::new(8.0, 16.0),
+            scrollback,
+            true,
+            Some(reply),
+        )
+    }
+
+    fn start(
+        size: TermSize,
+        cell_size: CellSize,
+        scrollback: Scrollback,
+        headless: bool,
+        reply: Option<Reply>,
+    ) -> Self {
         let palette = Palette::default();
         let shared = Arc::new(Shared {
             published: Mutex::new(Published {
@@ -194,6 +265,7 @@ impl Terminal {
                 revision: 0,
                 shell_events: Vec::new(),
                 agent_signals: Vec::new(),
+                status_events: Vec::new(),
                 seen_shell_marker: false,
             }),
             progressed: Condvar::new(),
@@ -205,7 +277,14 @@ impl Terminal {
         let spawned = std::thread::Builder::new()
             .name("berth-terminal".into())
             .spawn(move || {
-                match Engine::new(size, cell_size, scrollback, headless, for_engine.clone()) {
+                match Engine::new(
+                    size,
+                    cell_size,
+                    scrollback,
+                    headless,
+                    reply,
+                    for_engine.clone(),
+                ) {
                     Some(engine) => engine.run(rx),
                     None => tracing::warn!("libghostty could not create a terminal"),
                 }
@@ -348,6 +427,12 @@ impl Terminal {
     /// against the pane's token before believing it.
     pub fn drain_agent_signals(&self) -> Vec<String> {
         std::mem::take(&mut self.caught_up().agent_signals)
+    }
+
+    /// Program status events since the last call, in stream order, without
+    /// waiting for the engine. Only a [`Terminal::server`] keeps them.
+    pub fn drain_status_events(&self) -> Vec<StatusEvent> {
+        std::mem::take(&mut self.shared.lock().status_events)
     }
 
     /// As [`Terminal::drain_agent_signals`], without waiting: whatever the
@@ -677,7 +762,10 @@ struct Engine {
     moved: bool,
     shell_events: Vec<ShellEvent>,
     agent_signals: Vec<String>,
+    status_events: Vec<StatusEvent>,
     seen_shell_marker: bool,
+    /// Set for a session's own terminal: where its answers go.
+    reply: Option<std::rc::Rc<Reply>>,
     numbering: Numbering,
     /// The most bytes parsed between two numbering updates.
     slice: usize,
@@ -768,9 +856,20 @@ impl Engine {
         cell_size: CellSize,
         scrollback: Scrollback,
         headless: bool,
+        reply: Option<Reply>,
         shared: Arc<Shared>,
     ) -> Option<Self> {
-        let term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
+        let mut term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
+        let reply = reply.map(std::rc::Rc::new);
+        if let Some(reply) = &reply {
+            // What libghostty answers by itself (the cursor position, mode
+            // reports) and what it asks the embedder for.
+            let to_pty = reply.clone();
+            term.on_pty_write(move |_, bytes| to_pty(bytes)).ok()?;
+            term.on_device_attributes(|_| Some(device_attributes()))
+                .ok()?;
+            term.on_xtversion(|_| Some(XTVERSION)).ok()?;
+        }
         let mut engine = Self {
             term,
             screen: Screen::new()?,
@@ -783,7 +882,9 @@ impl Engine {
             moved: false,
             shell_events: Vec::new(),
             agent_signals: Vec::new(),
+            status_events: Vec::new(),
             seen_shell_marker: false,
+            reply,
             numbering: Numbering::default(),
             slice: scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096),
             shadow: None,
@@ -880,6 +981,9 @@ impl Engine {
                     }
                 }
                 Piece::Marker(kind) => {
+                    if kind == crate::shell::ShellEventKind::PromptStart && self.reply.is_some() {
+                        self.status_events.push(StatusEvent::PromptStart);
+                    }
                     self.seen_shell_marker = true;
                     self.shell_events.push(ShellEvent {
                         kind,
@@ -887,6 +991,23 @@ impl Engine {
                     });
                 }
                 Piece::Agent(payload) => self.agent_signals.push(payload),
+                // Only a session's own terminal speaks OSC 7501. Answered
+                // here, at the query's place in the stream, so the answer is
+                // out before libghostty's to a `CSI c` that follows it.
+                Piece::Status(body) => {
+                    if let Some(reply) = &self.reply {
+                        if body == "?" {
+                            reply(STATUS_SUPPORTED);
+                        } else {
+                            self.status_events.push(StatusEvent::Report(body));
+                        }
+                    }
+                }
+                Piece::Reset => {
+                    if self.reply.is_some() {
+                        self.status_events.push(StatusEvent::Reset);
+                    }
+                }
             }
         }
         self.scanner = scanner;
@@ -1032,7 +1153,9 @@ impl Engine {
         };
 
         let mut published = self.shared.lock();
-        let mut news = !self.shell_events.is_empty() || !self.agent_signals.is_empty();
+        let mut news = !self.shell_events.is_empty()
+            || !self.agent_signals.is_empty()
+            || !self.status_events.is_empty();
         if let Some((mut snapshot, cells_changed)) = built {
             snapshot.seq = self.seq;
             let before = &published.snapshot;
@@ -1050,6 +1173,12 @@ impl Engine {
         }
         published.done = self.seq;
         published.shell_events.append(&mut self.shell_events);
+        let status = &mut published.status_events;
+        status.append(&mut self.status_events);
+        if status.len() > MAX_QUEUED_STATUS {
+            let excess = status.len() - MAX_QUEUED_STATUS;
+            status.drain(..excess);
+        }
         let signals = &mut published.agent_signals;
         signals.append(&mut self.agent_signals);
         // Bounded, so a pane nobody drains, or a program printing the sequence
@@ -1374,6 +1503,74 @@ mod tests {
 
         term.advance(b"\x1b[?1049h");
         assert!(term.snapshot().modes.alternate_screen);
+    }
+
+    /// What a server terminal wrote back after `input`.
+    fn answers(input: &[u8]) -> String {
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let sink = replies.clone();
+        let term = Terminal::server(
+            TermSize::new(20, 5),
+            Scrollback::VIEW,
+            Box::new(move |bytes| sink.lock().unwrap().extend_from_slice(bytes)),
+        );
+        term.advance(input);
+        let _ = term.snapshot();
+        let replies = replies.lock().unwrap().clone();
+        String::from_utf8(replies).unwrap()
+    }
+
+    #[test]
+    fn a_server_terminal_answers_what_programs_ask() {
+        // Primary device attributes: VT220 class, ANSI colour.
+        assert_eq!(answers(b"\x1b[c"), "\x1b[?62;22c");
+        // The cursor position, after moving it.
+        assert_eq!(answers(b"ab\r\ncd\x1b[6n"), "\x1b[2;3R");
+        // XTVERSION, as Berth.
+        let version = answers(b"\x1b[>q");
+        assert!(version.contains(XTVERSION), "{version:?}");
+    }
+
+    /// A program asks about OSC 7501 and then for device attributes, taking
+    /// the attributes arriving first to mean no support: the 7501 answer must
+    /// lead, even with both in one write.
+    #[test]
+    fn the_status_query_is_answered_before_the_attributes_after_it() {
+        assert_eq!(
+            answers(b"\x1b]7501;?\x1b\\\x1b[c"),
+            "\x1b]7501;?\x1b\\\x1b[?62;22c"
+        );
+        assert_eq!(
+            answers(b"\x1b]7501;?\x07\x1b[c"),
+            "\x1b]7501;?\x1b\\\x1b[?62;22c"
+        );
+    }
+
+    #[test]
+    fn a_server_terminal_keeps_status_events_in_order() {
+        let term = Terminal::server(TermSize::new(20, 5), Scrollback::VIEW, Box::new(|_| {}));
+        term.advance(b"\x1b]7501;state=working\x1b\\\x1b]133;A\x07\x1bc\x1b]7501;state=idle\x07");
+        let _ = term.snapshot();
+        assert_eq!(
+            term.drain_status_events(),
+            [
+                StatusEvent::Report("state=working".into()),
+                StatusEvent::PromptStart,
+                StatusEvent::Reset,
+                StatusEvent::Report("state=idle".into()),
+            ]
+        );
+        assert!(term.drain_status_events().is_empty());
+    }
+
+    /// A copy of a session someone else owns keeps nothing of OSC 7501 and
+    /// has nowhere to answer to.
+    #[test]
+    fn other_terminals_keep_no_status_events() {
+        let term = Terminal::new(TermSize::new(20, 5), CellSize::new(8.0, 16.0));
+        term.advance(b"\x1b]7501;state=working\x1b\\\x1b]7501;?\x07\x1b[c\x1bc");
+        let _ = term.snapshot();
+        assert!(term.drain_status_events().is_empty());
     }
 
     #[test]

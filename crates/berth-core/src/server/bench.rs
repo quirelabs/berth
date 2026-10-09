@@ -210,6 +210,8 @@ pub struct Report {
 /// while the client fell behind (D50's sync).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Delivered {
+    /// From the command to the client having the last of the output.
+    pub seconds: f64,
     pub output: usize,
     pub screens: usize,
     /// How raw output ran up to the first screen, if one came.
@@ -351,7 +353,64 @@ impl Running {
     }
 }
 
-/// One kind's rate through a supervisor and a worker.
+/// How long the worker took to drain the run: from `started` until it has
+/// parsed everything, the way the tmux baseline was timed (`time cat` in a
+/// session: until tmux has taken it all, whatever a client has shown, D49).
+///
+/// A second connection, which gets none of the output, waits for `cat` to be
+/// through and then attaches. The screen it is sent is built by the engine
+/// after everything handed over before it, so a screen showing the end mark
+/// means all of it is parsed.
+async fn drained(
+    mut probe: client::Client,
+    session: SessionId,
+    marker: PathBuf,
+    started: Instant,
+) -> Result<Duration> {
+    let deadline = started + Duration::from_secs(120);
+    while !marker.exists() {
+        if Instant::now() > deadline {
+            return Err(Error::Server("the run never finished".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    loop {
+        // The pump may still be handing over the tail (its gathering waits
+        // up to 2 ms): asked too early, the screen lacks the mark, and the
+        // question is put again.
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        probe
+            .to_server
+            .send(ToServer::Attach {
+                session,
+                cols: 100,
+                rows: 30,
+            })
+            .await
+            .map_err(|_| Error::Server("closed".into()))?;
+        loop {
+            // Taken without confirming: the worker has one flow per session,
+            // and the client under measure is the one that confirms.
+            let message = tokio::time::timeout(Duration::from_secs(60), probe.from_server.recv())
+                .await
+                .map_err(|_| Error::Server("the server went quiet".into()))?
+                .ok_or_else(|| Error::Server("the server closed".into()))?;
+            if matches!(message, ToApp::Screen { .. }) {
+                let at = started.elapsed();
+                if shows(&message, "BENCH_DONE", &mut Vec::new()) {
+                    return Ok(at);
+                }
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(Error::Server("the worker never showed the end".into()));
+        }
+    }
+}
+
+/// One kind's rate through a supervisor and a worker: the worker's drain
+/// rate, with what reached the client and when beside it.
 pub async fn measure(
     kind: Kind,
     megabytes: usize,
@@ -405,8 +464,17 @@ pub async fn measure(
         tokio::time::sleep(Duration::from_millis(500)).await;
         let roles = roles(&places, session, servers);
         let before = snapshot(&roles);
-        let command = format!("cat '{}'; echo BENCH_DO\"\"NE\n", file.display());
+        // The marker file says `cat` is through: everything is in the pty.
+        let marker = scratch.join(format!("{}.done", kind.name()));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!(
+            "cat '{}'; echo BENCH_DO\"\"NE; : > '{}'\n",
+            file.display(),
+            marker.display()
+        );
+        let probe = client::connect(&places).await?;
         let started = Instant::now();
+        let draining = tokio::spawn(drained(probe, session, marker.clone(), started));
         app.to_server
             .send(ToServer::Input {
                 session,
@@ -439,7 +507,12 @@ pub async fn measure(
                 break;
             }
         }
-        let seconds = started.elapsed().as_secs_f64();
+        delivered.seconds = started.elapsed().as_secs_f64();
+        let seconds = draining
+            .await
+            .map_err(|_| Error::Server("the drain probe stopped".into()))??
+            .as_secs_f64();
+        let _ = std::fs::remove_file(&marker);
         let after = snapshot(&roles);
         let usage = before
             .into_iter()
@@ -467,7 +540,10 @@ pub async fn measure(
 
 /// `--bench-throughput [kind ...] [--mb N] [--in-process] [--write DIR]`:
 /// each kind's rate, against its floor, and on Linux each process's CPU time
-/// and page faults. Fails if any rate is under its floor. The server runs as
+/// and page faults. The rate is the worker's drain rate: until the worker
+/// has parsed everything, as the tmux baseline it is held against was timed
+/// (D49, D50). What reached the client, how and how fast is printed beside
+/// it. Fails if any rate is under its floor. The server runs as
 /// processes, as it ships, unless `--in-process`. With `--write`, only writes
 /// the streams into DIR instead, so tmux can be timed on the same bytes.
 pub async fn run_process(args: &[String]) -> Result<bool> {
@@ -534,7 +610,9 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                     rate.seconds
                 );
                 println!(
-                    "  delivered  {:.1} MB as output, {} screens",
+                    "  client     {:.1} MB/s ({:.2} s); {:.1} MB as output, {} screens",
+                    rate.bytes as f64 / MB as f64 / delivered.seconds,
+                    delivered.seconds,
                     delivered.output as f64 / MB as f64,
                     delivered.screens
                 );

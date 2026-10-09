@@ -126,10 +126,24 @@ impl Worker {
         )
         .await?;
         // Nobody draws a worker's terminal: it parses, and builds a screen or
-        // history only when one is asked for.
-        let terminal = Arc::new(Terminal::headless(
+        // history only when one is asked for. It is the session's own, so it
+        // is the one terminal that answers what programs ask (device
+        // attributes, the cursor position, XTVERSION, the OSC 7501 query):
+        // the app's copy never does, or programs would get every answer
+        // twice (D50). Never blocks the engine: a reply that finds the pty's
+        // queue full is dropped, as a real terminal's would be on a hung tty.
+        let to_pty = pty.input.clone();
+        let terminal = Arc::new(Terminal::server(
             TermSize::new(spec.cols, spec.rows),
             SCROLLBACK,
+            Box::new(move |bytes| {
+                if to_pty
+                    .try_send(crate::pty::PtyInput::Data(bytes.to_vec()))
+                    .is_err()
+                {
+                    tracing::warn!("a terminal reply did not fit the pty's queue");
+                }
+            }),
         ));
         let seq = Arc::new(Mutex::new(0));
         let (tx, rx) = mpsc::channel(QUEUE);
@@ -551,6 +565,42 @@ mod tests {
 
     /// Nothing from whatever started the worker leaks into the shell, and
     /// Berth's own terminal identity is set (D51).
+    /// A program that asks for device attributes and blocks until they come,
+    /// as programs do at startup to learn what the terminal is: the worker
+    /// answers, so it does not sit out a deadline.
+    #[tokio::test]
+    async fn a_program_blocked_on_device_attributes_gets_its_answer() {
+        let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
+        // Raw and silent, ask, read the nine bytes of the answer, show them
+        // without the escape.
+        let script = "stty raw -echo; printf '\\033[c'; r=$(dd bs=1 count=9 2>/dev/null); \
+                      stty sane; echo \"got_$(printf '%s' \"$r\" | tr -d '\\033')\"\n";
+        worker
+            .handle(ToServer::Input {
+                session: 1,
+                bytes: script.as_bytes().to_vec(),
+            })
+            .await;
+        until(&mut rx, "got_[?62;22c").await;
+    }
+
+    /// The OSC 7501 query, then device attributes: the 7501 answer reaches
+    /// the program first, so it reads the terminal as supporting it.
+    #[tokio::test]
+    async fn the_status_query_is_answered_first_on_a_real_pty() {
+        let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
+        let script = "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; \
+                      r=$(dd bs=1 count=19 2>/dev/null); stty sane; \
+                      echo \"got_$(printf '%s' \"$r\" | tr -d '\\033')\"\n";
+        worker
+            .handle(ToServer::Input {
+                session: 1,
+                bytes: script.as_bytes().to_vec(),
+            })
+            .await;
+        until(&mut rx, "got_]7501;?\\[?62;22c").await;
+    }
+
     #[tokio::test]
     async fn the_shell_gets_a_clean_environment() {
         // SAFETY: set before the shell is started, and read only by it.
