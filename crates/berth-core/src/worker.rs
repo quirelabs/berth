@@ -115,9 +115,10 @@ impl Worker {
             Environment::Clean,
         )
         .await?;
-        let terminal = Arc::new(Terminal::with_scrollback(
+        // Nobody draws a worker's terminal: it parses, and builds a screen or
+        // history only when one is asked for.
+        let terminal = Arc::new(Terminal::headless(
             TermSize::new(spec.cols, spec.rows),
-            CellSize::new(8.0, 16.0),
             SCROLLBACK,
         ));
         let seq = Arc::new(Mutex::new(0));

@@ -12,7 +12,10 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         super::hook::run_process(args);
         return Some(ExitCode::SUCCESS);
     }
-    if !matches!(mode, "--supervisor" | "--worker" | "--bench-throughput") {
+    if !matches!(
+        mode,
+        "--supervisor" | "--worker" | "--bench-throughput" | "--bench-engine"
+    ) {
         return None;
     }
     let runtime = match tokio::runtime::Runtime::new() {
@@ -26,6 +29,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         match mode {
             "--supervisor" => super::supervisor::run_process().await.map(|()| true),
             "--worker" => super::worker_host::run_process(args).await.map(|()| true),
+            "--bench-engine" => super::bench::run_engine(args),
             _ => super::bench::run_process(args).await,
         }
     });

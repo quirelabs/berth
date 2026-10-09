@@ -171,6 +171,20 @@ impl Terminal {
     }
 
     pub fn with_scrollback(size: TermSize, cell_size: CellSize, scrollback: Scrollback) -> Self {
+        Self::start(size, cell_size, scrollback, false)
+    }
+
+    /// A terminal nobody draws: a server's (D50). It parses, and builds a
+    /// screen or history only when asked ([`Terminal::wire_screen`],
+    /// [`Terminal::wire_history`]). What it publishes carries the modes and
+    /// the cursor but no cells, so [`Terminal::latest`] answers "is a
+    /// full-screen program up" without the engine copying the screen for a
+    /// renderer every few milliseconds.
+    pub fn headless(size: TermSize, scrollback: Scrollback) -> Self {
+        Self::start(size, CellSize::new(8.0, 16.0), scrollback, true)
+    }
+
+    fn start(size: TermSize, cell_size: CellSize, scrollback: Scrollback, headless: bool) -> Self {
         let palette = Palette::default();
         let shared = Arc::new(Shared {
             published: Mutex::new(Published {
@@ -191,7 +205,7 @@ impl Terminal {
         let spawned = std::thread::Builder::new()
             .name("berth-terminal".into())
             .spawn(move || {
-                match Engine::new(size, cell_size, scrollback, for_engine.clone()) {
+                match Engine::new(size, cell_size, scrollback, headless, for_engine.clone()) {
                     Some(engine) => engine.run(rx),
                     None => tracing::warn!("libghostty could not create a terminal"),
                 }
@@ -558,6 +572,19 @@ fn ghostty_rgb(c: Rgb) -> RgbColor {
 
 pub(crate) type Ghostty = libghostty_vt::Terminal<'static, 'static>;
 
+/// How long libghostty alone takes to parse `bytes`, fed in 8 KB writes to a
+/// fresh terminal, with no thread, scanner, numbering or screen around it:
+/// the D49 spike's measure, so a server's engine can be held against it on
+/// the same host.
+pub fn time_parse_alone(bytes: &[u8], size: TermSize, scrollback: Scrollback) -> Option<Duration> {
+    let mut term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
+    let started = Instant::now();
+    for chunk in bytes.chunks(8192) {
+        term.vt_write(chunk);
+    }
+    Some(started.elapsed())
+}
+
 /// A libghostty terminal with Berth's limits and colours.
 fn new_ghostty(cols: u16, rows: u16, scrollback: Scrollback, palette: &Palette) -> Option<Ghostty> {
     let mut term = libghostty_vt::Terminal::new(cols.max(1), rows.max(1)).ok()?;
@@ -614,6 +641,8 @@ struct Engine {
     /// it.
     shadow: Option<Ghostty>,
     scrollback: Scrollback,
+    /// Nobody draws this terminal: publish modes and progress, not cells.
+    headless: bool,
 }
 
 /// Numbers history lines so that a line keeps its number for as long as it
@@ -694,6 +723,7 @@ impl Engine {
         size: TermSize,
         cell_size: CellSize,
         scrollback: Scrollback,
+        headless: bool,
         shared: Arc<Shared>,
     ) -> Option<Self> {
         let term = new_ghostty(size.cols, size.rows, scrollback, &Palette::default())?;
@@ -714,6 +744,7 @@ impl Engine {
             slice: scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096),
             shadow: None,
             scrollback,
+            headless,
         };
         engine.numbering.update(&engine.term);
         engine.apply_palette(Palette::default());
@@ -949,9 +980,12 @@ impl Engine {
     fn publish(&mut self) {
         let rebuild = std::mem::take(&mut self.rebuild);
         let moved = std::mem::take(&mut self.moved);
-        let built = self
-            .screen
-            .build(&self.term, &self.palette, self.cell_size, rebuild);
+        let built = if self.headless {
+            self.bare()
+        } else {
+            self.screen
+                .build(&self.term, &self.palette, self.cell_size, rebuild)
+        };
 
         let mut published = self.shared.lock();
         let mut news = !self.shell_events.is_empty() || !self.agent_signals.is_empty();
@@ -990,6 +1024,30 @@ impl Engine {
                 wake();
             }
         }
+    }
+}
+
+impl Engine {
+    /// What a headless terminal publishes: everything but the cells.
+    fn bare(&self) -> Option<(Snapshot, bool)> {
+        let cols = self.term.cols().ok()?;
+        let rows = self.term.rows().ok()?;
+        Some((
+            Snapshot {
+                rows: Vec::new(),
+                cursor: Cursor {
+                    line: self.term.cursor_y().unwrap_or(0),
+                    column: self.term.cursor_x().unwrap_or(0),
+                    visible: true,
+                },
+                size: TermSize::new(cols, rows),
+                cell_size: self.cell_size,
+                modes: modes_of(&self.term),
+                display_offset: 0,
+                seq: self.seq,
+            },
+            false,
+        ))
     }
 }
 
@@ -1248,6 +1306,30 @@ mod tests {
         });
         term.advance(b"x");
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn a_headless_terminal_publishes_modes_and_builds_screens_on_request() {
+        let term = Terminal::headless(TermSize::new(20, 5), Scrollback::VIEW);
+        let mut lines = String::new();
+        for n in 0..20 {
+            lines.push_str(&format!("line {n}\r\n"));
+        }
+        term.advance(lines.as_bytes());
+        let published = term.snapshot();
+        assert!(published.rows.is_empty());
+        assert!(!published.modes.alternate_screen);
+        let screen = term.wire_screen().expect("a screen on request");
+        let text: String = screen
+            .lines
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(text.contains("line 19"), "{text}");
+        assert!(!term.wire_history(None, 100).lines.is_empty());
+
+        term.advance(b"\x1b[?1049h");
+        assert!(term.snapshot().modes.alternate_screen);
     }
 
     #[test]

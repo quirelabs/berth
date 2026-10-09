@@ -501,6 +501,114 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
     Ok(all)
 }
 
+/// One rung of the engine ladder: a rate, and what this process spent on it.
+pub struct Rung {
+    pub name: &'static str,
+    pub seconds: f64,
+    pub usage: Option<Usage>,
+}
+
+/// The same bytes through each layer between the spike's measure and the
+/// worker's terminal, in this process: libghostty alone with the spike's
+/// limits, alone with the worker's, then berth-term's terminal headless (as
+/// the worker runs it) and drawn (as the app does). The output as the pty
+/// hands it over, with `\r\n` line ends.
+pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
+    use berth_term::{Scrollback, TermSize, Terminal, engine};
+    let mut bytes = Vec::new();
+    let mut plain = Vec::new();
+    let block = kind.block();
+    while plain.len() < megabytes * MB {
+        plain.extend_from_slice(&block);
+    }
+    for &b in &plain {
+        if b == b'\n' {
+            bytes.push(b'\r');
+        }
+        bytes.push(b);
+    }
+    let size = TermSize::new(100, 30);
+    let spike = Scrollback {
+        lines: Some(10_000),
+        bytes: None,
+    };
+    let worker = crate::worker::SCROLLBACK;
+    let timed = |name: &'static str, run: &dyn Fn() -> Option<Duration>| {
+        let before = Usage::of("self");
+        let seconds = run().map(|d| d.as_secs_f64()).unwrap_or(f64::NAN);
+        let usage = Usage::of("self").zip(before).map(|(a, b)| a.since(b));
+        Rung {
+            name,
+            seconds,
+            usage,
+        }
+    };
+    let through = |terminal: Terminal| {
+        let started = Instant::now();
+        let mut last = 0;
+        for chunk in bytes.chunks(8192) {
+            last = terminal.advance(chunk);
+            terminal.wait_for_room(512 * 1024);
+        }
+        while terminal.snapshot().seq < last {}
+        Some(started.elapsed())
+    };
+    vec![
+        timed("alone, spike limits", &|| {
+            engine::time_parse_alone(&bytes, size, spike)
+        }),
+        timed("alone, worker limits", &|| {
+            engine::time_parse_alone(&bytes, size, worker)
+        }),
+        timed("headless terminal", &|| {
+            through(Terminal::headless(size, worker))
+        }),
+        timed("drawn terminal", &|| {
+            through(Terminal::with_scrollback(
+                size,
+                berth_term::CellSize::new(8.0, 16.0),
+                worker,
+            ))
+        }),
+    ]
+}
+
+/// `--bench-engine [kind ...] [--mb N]`: [`ladder`] for each kind.
+pub fn run_engine(args: &[String]) -> Result<bool> {
+    let mut kinds = Vec::new();
+    let mut megabytes = 64;
+    let mut it = args.iter().skip(1);
+    while let Some(arg) = it.next() {
+        if arg == "--mb" {
+            megabytes = it
+                .next()
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| Error::Server("--mb needs a number".into()))?;
+        } else {
+            kinds.push(
+                Kind::parse(arg).ok_or_else(|| Error::Server(format!("unknown kind {arg}")))?,
+            );
+        }
+    }
+    if kinds.is_empty() {
+        kinds = Kind::ALL.to_vec();
+    }
+    for kind in kinds {
+        println!("{}", kind.name());
+        for rung in ladder(kind, megabytes) {
+            let rate = megabytes as f64 / rung.seconds;
+            match rung.usage {
+                Some(used) => println!(
+                    "  {:<21} {rate:>6.1} MB/s  user {:>5.2} s  sys {:>5.2} s  faults {:>8}",
+                    rung.name, used.user, used.system, used.minor_faults
+                ),
+                None => println!("  {:<21} {rate:>6.1} MB/s", rung.name),
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -526,6 +634,17 @@ mod tests {
             .unwrap();
         assert!(report.rate.mb_per_s() > 0.0);
         assert!(report.rate.bytes >= 2 * MB);
+    }
+
+    #[test]
+    fn every_rung_of_the_ladder_parses() {
+        for rung in ladder(Kind::Coloured, 1) {
+            assert!(
+                rung.seconds.is_finite() && rung.seconds > 0.0,
+                "{}",
+                rung.name
+            );
+        }
     }
 
     #[test]
