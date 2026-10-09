@@ -38,6 +38,16 @@ pub const SCROLLBACK: Scrollback = Scrollback {
 /// reading the pty, as the app's pump does.
 const MAX_BACKLOG: usize = 512 * 1024;
 
+/// While output streams, the pump gathers the pty's reads into one handoff to
+/// the engine and one message, up to this much or this long after the first
+/// read, whichever comes first. A pty reads about a kilobyte at a time, half
+/// of them 256 bytes or less (measured on `berth-test`, D50), and every
+/// handoff wakes the engine thread and publishes once.
+const BATCH_AT_MOST: usize = 64 * 1024;
+const BATCH_WITHIN: std::time::Duration = std::time::Duration::from_millis(2);
+/// How often the pump looks for more reads while it gathers.
+const BATCH_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+
 /// Messages queued for the app before the pty is no longer read. Holding the
 /// shell back is right when nobody is taking its output; the supervisor
 /// drains this as fast as the socket takes it.
@@ -342,15 +352,23 @@ fn pump(
     mut events: mpsc::Receiver<PtyEvent>,
     tx: mpsc::Sender<ToApp>,
 ) {
-    while let Some(event) = events.blocking_recv() {
+    let mut last_handoff: Option<std::time::Instant> = None;
+    let mut pending: Option<PtyEvent> = None;
+    while let Some(event) = pending.take().or_else(|| events.blocking_recv()) {
         let message = match event {
-            PtyEvent::Output(bytes) => {
+            PtyEvent::Output(first) => {
+                // Streaming if the last handoff was moments ago: then gather.
+                // A keystroke's echo after a pause goes on at once.
+                let streaming = last_handoff.is_some_and(|at| at.elapsed() < BATCH_WITHIN);
+                let (bytes, after) = gather(first, &mut events, streaming);
+                pending = after;
                 let mut total = lock(&seq);
                 terminal.advance(&bytes);
                 *total += bytes.len() as u64;
                 let at = *total;
                 drop(total);
                 terminal.wait_for_room(MAX_BACKLOG);
+                last_handoff = Some(std::time::Instant::now());
                 ToApp::Output {
                     session,
                     seq: at,
@@ -372,6 +390,31 @@ fn pump(
             break;
         }
     }
+}
+
+/// The reads already waiting after `first`, and while `streaming` those that
+/// come within [`BATCH_WITHIN`], up to [`BATCH_AT_MOST`]. Anything else that
+/// arrives meanwhile, such as the exit, is handed back to go next.
+fn gather(
+    first: Vec<u8>,
+    events: &mut mpsc::Receiver<PtyEvent>,
+    streaming: bool,
+) -> (Vec<u8>, Option<PtyEvent>) {
+    let started = std::time::Instant::now();
+    let mut bytes = first;
+    while bytes.len() < BATCH_AT_MOST {
+        match events.try_recv() {
+            Ok(PtyEvent::Output(more)) => bytes.extend_from_slice(&more),
+            Ok(other) => return (bytes, Some(other)),
+            Err(mpsc::error::TryRecvError::Empty)
+                if streaming && started.elapsed() < BATCH_WITHIN =>
+            {
+                std::thread::sleep(BATCH_POLL);
+            }
+            Err(_) => break,
+        }
+    }
+    (bytes, None)
 }
 
 #[cfg(all(test, unix))]
@@ -438,6 +481,50 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (*seq, text)
+    }
+
+    #[test]
+    fn gathering_takes_what_is_waiting_and_hands_back_the_rest() {
+        let (tx, mut rx) = mpsc::channel(16);
+        for chunk in [b"b".to_vec(), b"c".to_vec()] {
+            tx.try_send(PtyEvent::Output(chunk)).unwrap();
+        }
+        tx.try_send(PtyEvent::Exit(0)).unwrap();
+        tx.try_send(PtyEvent::Output(b"d".to_vec())).unwrap();
+        let (bytes, after) = gather(b"a".to_vec(), &mut rx, false);
+        assert_eq!(bytes, b"abc");
+        assert_eq!(after, Some(PtyEvent::Exit(0)));
+    }
+
+    /// A keystroke's echo after a pause is not held back waiting for more.
+    #[test]
+    fn not_streaming_gathering_never_waits() {
+        let (_tx, mut rx) = mpsc::channel::<PtyEvent>(16);
+        let started = std::time::Instant::now();
+        let (bytes, after) = gather(b"x".to_vec(), &mut rx, false);
+        assert_eq!((bytes, after), (b"x".to_vec(), None));
+        assert!(started.elapsed() < BATCH_WITHIN);
+    }
+
+    /// Streaming, reads that come within the batch's time join it, up to
+    /// its size.
+    #[test]
+    fn streaming_gathering_waits_for_more_up_to_the_cap() {
+        let (tx, mut rx) = mpsc::channel(64);
+        std::thread::spawn(move || {
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_micros(20));
+                if tx
+                    .blocking_send(PtyEvent::Output(vec![b'x'; 4096]))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let (bytes, _) = gather(vec![b'x'; 4096], &mut rx, true);
+        assert!(bytes.len() > 4096, "nothing joined: {}", bytes.len());
+        assert!(bytes.len() <= BATCH_AT_MOST + 4096, "{}", bytes.len());
     }
 
     #[tokio::test]

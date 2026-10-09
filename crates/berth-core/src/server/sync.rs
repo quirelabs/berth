@@ -3,15 +3,20 @@
 //! Raw output while the app keeps up: every byte, so both ends agree and
 //! nothing on screen waits for the server. The app is behind when more output
 //! is unconfirmed than the window, which is sized from what is measured:
-//! twice the recent output rate times the recent round trip of a
-//! confirmation, never under [`MIN_WINDOW`] nor over [`MAX_WINDOW`]. A client
-//! that keeps up, on a fast link or a slow one, so stays on the raw stream.
+//! twice the recent output rate times the round trip of a confirmation,
+//! never under [`MIN_WINDOW`] nor over [`MAX_WINDOW`]. The round trip is the
+//! recent one, or the age of the oldest output still unconfirmed if that is
+//! longer: a round trip under way is at least that long, so the window
+//! widens while one is slow, before its sample is back. A client that keeps
+//! up at the output rates of normal work, a fast build log for one, so stays
+//! on the raw stream. A flood that outruns the client falls back to screens,
+//! as it should.
 //!
 //! Behind, raw output stops and a screen goes instead, at most
 //! [`SCREENS_PER_SECOND`] a second and only once the app has confirmed the
-//! one before, so screens never pile up either. When less than the window was
-//! dropped in [`CALM_INTERVALS`] screen intervals in a row, a last screen
-//! resumes the raw stream. The history the app missed is not sent then: it
+//! one before, so screens never pile up either. When [`RESUME_AFTER`]
+//! screens in a row were each confirmed within a round trip the window could
+//! carry at the current rate, a last screen resumes the raw stream. The history the app missed is not sent then: it
 //! goes once output has been calm for [`CALM_FOR`], or at once when the app
 //! asks for it (its user scrolled up into lines it does not have), so a flood
 //! never sets off one history rebuild after another.
@@ -46,9 +51,9 @@ pub const SCREENS_PER_SECOND: u32 = 30;
 
 const SCREEN_EVERY: Duration = Duration::from_millis(1000 / SCREENS_PER_SECOND as u64);
 
-/// Screen intervals in a row with less than the window dropped before raw
-/// output resumes.
-pub const CALM_INTERVALS: u32 = 3;
+/// Screens in a row confirmed within a round trip the window can carry
+/// before raw output resumes.
+pub const RESUME_AFTER: u32 = 3;
 
 /// How long output must stay calm before the history an app missed is sent.
 pub const CALM_FOR: Duration = Duration::from_secs(1);
@@ -104,16 +109,16 @@ pub struct Flow {
     /// The last screen's number and when it went.
     screen_seq: u64,
     screen_at: Option<Instant>,
-    /// Output dropped since the last screen, in bytes.
-    dropped: u64,
     /// History lines went unsent: the app's scrollback has a gap.
     gap: bool,
     /// The app asked for the history it is missing.
     history_wanted: bool,
     /// A program left the alternate screen.
     alt_left: bool,
-    /// Screen intervals in a row with less than the window dropped.
-    calm_intervals: u32,
+    /// Screens in a row confirmed within a round trip the window can carry.
+    quick_screens: u32,
+    /// The last screen sent is not confirmed yet.
+    screen_unconfirmed: bool,
     /// The output rate, in bytes a second, smoothed over recent spans.
     rate: f64,
     /// The span being measured: when it began and the output in it.
@@ -144,11 +149,11 @@ impl Flow {
             confirmed: 0,
             screen_seq: 0,
             screen_at: None,
-            dropped: 0,
             gap: false,
             history_wanted: false,
             alt_left: false,
-            calm_intervals: 0,
+            quick_screens: 0,
+            screen_unconfirmed: false,
             rate: 0.0,
             span_start: None,
             span_bytes: 0,
@@ -169,14 +174,14 @@ impl Flow {
         self.span_bytes += len;
         self.last_output = Some(now);
         if !self.visible || self.mode == Mode::Screens {
-            self.drop_chunk(len);
+            self.drop_chunk();
             return Output::Drop;
         }
         let unconfirmed = self.sent.saturating_sub(self.confirmed);
         if unconfirmed > self.window(now) || self.timed.len() >= MAX_IN_FLIGHT {
             self.mode = Mode::Screens;
-            self.calm_intervals = 0;
-            self.drop_chunk(len);
+            self.quick_screens = 0;
+            self.drop_chunk();
             return Output::Drop;
         }
         self.sent = seq;
@@ -184,14 +189,25 @@ impl Flow {
         Output::Send
     }
 
-    fn drop_chunk(&mut self, len: u64) {
-        self.dropped += len;
+    fn drop_chunk(&mut self) {
         self.gap = true;
     }
 
     /// The app has everything up to `seq`.
     pub fn confirmed(&mut self, seq: u64, now: Instant) {
         self.confirmed = self.confirmed.max(seq);
+        if self.screen_unconfirmed
+            && seq >= self.screen_seq
+            && let Some(at) = self.screen_at
+        {
+            self.screen_unconfirmed = false;
+            let took = now.saturating_duration_since(at).as_secs_f64();
+            if 2.0 * self.rate(now) * took <= MAX_WINDOW as f64 {
+                self.quick_screens += 1;
+            } else {
+                self.quick_screens = 0;
+            }
+        }
         let mut newest = None;
         while let Some(&(sent, at)) = self.timed.front() {
             if sent > seq {
@@ -214,17 +230,27 @@ impl Flow {
     /// How much output may be unconfirmed before the app is behind: twice
     /// what one round trip carries at the recent rate, within the bounds.
     pub fn window(&self, now: Instant) -> u64 {
-        // The span under way counts as soon as it says anything, so a flood
-        // that starts now is not judged by the quiet before it.
+        // A round trip under way is at least as old as the oldest output
+        // still unconfirmed.
+        let under_way = self
+            .timed
+            .front()
+            .map_or(Duration::ZERO, |&(_, at)| now.saturating_duration_since(at));
+        let round_trip = self.round_trip.unwrap_or_default().max(under_way);
+        ((2.0 * self.rate(now) * round_trip.as_secs_f64()) as u64).clamp(MIN_WINDOW, MAX_WINDOW)
+    }
+
+    /// The output rate, in bytes a second. The span under way counts as soon
+    /// as it says anything, so a flood that starts now is not judged by the
+    /// quiet before it.
+    fn rate(&self, now: Instant) -> f64 {
         let partial = self.span_start.map_or(0.0, |start| {
             let elapsed = now
                 .saturating_duration_since(start)
                 .max(Duration::from_millis(10));
             self.span_bytes as f64 / elapsed.as_secs_f64()
         });
-        let rate = self.rate.max(partial);
-        let round_trip = self.round_trip.unwrap_or_default().as_secs_f64();
-        ((2.0 * rate * round_trip) as u64).clamp(MIN_WINDOW, MAX_WINDOW)
+        self.rate.max(partial)
     }
 
     /// The smoothed round trip, if one has been measured.
@@ -277,7 +303,7 @@ impl Flow {
     pub fn attached(&mut self) -> Screen {
         self.mode = Mode::Raw;
         self.visible = true;
-        self.calm_intervals = 0;
+        self.quick_screens = 0;
         Screen::WithHistory
     }
 
@@ -323,12 +349,11 @@ impl Flow {
                 if self.confirmed < self.screen_seq && !overdue {
                     return None;
                 }
-                if self.dropped < self.window(now) {
-                    self.calm_intervals += 1;
-                } else {
-                    self.calm_intervals = 0;
+                if self.screen_unconfirmed {
+                    // Overdue: a slow confirmation is no sign of keeping up.
+                    self.quick_screens = 0;
                 }
-                if self.calm_intervals >= CALM_INTERVALS {
+                if self.quick_screens >= RESUME_AFTER {
                     Some(Screen::Resume)
                 } else {
                     Some(Screen::Plain)
@@ -342,11 +367,11 @@ impl Flow {
         self.sent = self.sent.max(seq);
         self.screen_seq = seq;
         self.screen_at = Some(now);
-        self.dropped = 0;
+        self.screen_unconfirmed = true;
         self.timed_out(seq, now);
         if kind != Screen::Plain {
             self.mode = Mode::Raw;
-            self.calm_intervals = 0;
+            self.quick_screens = 0;
             // The app is taken to have what it was just sent; confirmations
             // from before it say nothing about the gap it closed.
             self.confirmed = self.confirmed.max(seq);
@@ -525,36 +550,94 @@ mod tests {
         assert_eq!(flow.tick(now + CONFIRM_WITHIN), Some(Screen::Plain));
     }
 
-    /// One quiet interval is not the end of a flood: raw output resumes only
-    /// after three in a row, and with a plain screen, not the history.
+    /// Raw output resumes once three screens in a row were confirmed within
+    /// a round trip the window can carry, and with a plain screen, not the
+    /// history. A slow confirmation starts the count again.
     #[test]
-    fn raw_resumes_after_three_calm_intervals_without_the_history() {
+    fn raw_resumes_after_three_quick_screens_without_the_history() {
         let mut flow = Flow::new();
         let (mut seq, mut now) = behind(&mut flow, Instant::now());
         let mut screens = Vec::new();
-        for interval in 0..7 {
+        // Confirmation times: quick, quick, one too slow to carry at this
+        // rate, then quick three times.
+        for took in [1, 1, 2000, 1, 1, 1, 1] {
             now += SCREEN_EVERY;
-            // A flood in the first and fourth intervals, a trickle otherwise.
-            let size = if interval == 0 || interval == 3 {
-                MB
-            } else {
-                KB
-            };
-            seq += size;
-            flow.output(seq, size, now);
+            seq += 64 * KB;
+            flow.output(seq, 64 * KB, now);
             let screen = flow.tick(now);
             if let Some(kind) = screen {
                 flow.screen_sent(seq, kind, now);
+                now += Duration::from_millis(took);
                 flow.confirmed(seq, now);
             }
             screens.push(screen);
         }
-        // Calm, calm, then a flood: the count starts again.
         let mut expected = vec![Some(Screen::Plain); 6];
         expected.push(Some(Screen::Resume));
         assert_eq!(screens, expected);
         assert!(!flow.is_behind());
         assert_eq!(flow.output(seq + 10, 10, now), Output::Send);
+    }
+
+    /// The case the measured window alone missed: before a flood the only
+    /// round trips measured were idle ones, a fraction of a millisecond. The
+    /// age of the oldest unconfirmed output widens the window as the round
+    /// trip under load turns out slower.
+    #[test]
+    fn a_slow_round_trip_widens_the_window_before_its_sample_is_back() {
+        let start = Instant::now();
+        let mut flow = Flow::new();
+        flow.attached();
+        flow.screen_sent(1, Screen::WithHistory, start);
+        flow.confirmed(1, start + Duration::from_micros(300));
+        let round_trip = Duration::from_millis(12);
+        let every = Duration::from_micros(64 * 1000 / 28); // 64 KB at 28 MB/s
+        let (mut seq, mut now) = (1, start + Duration::from_millis(1));
+        let mut sent = VecDeque::new();
+        for _ in 0..2000 {
+            seq += 64 * KB;
+            now += every;
+            assert_eq!(flow.output(seq, 64 * KB, now), Output::Send, "at {seq}");
+            sent.push_back((seq, now));
+            while let Some(&(s, at)) = sent.front() {
+                if now.duration_since(at) < round_trip {
+                    break;
+                }
+                flow.confirmed(s, at + round_trip);
+                sent.pop_front();
+            }
+        }
+    }
+
+    /// A fast build log: a few MB/s in bursts, the round trip jumping between
+    /// 1 and 30 ms as the machine is busy. It stays raw throughout.
+    #[test]
+    fn a_build_log_stays_raw() {
+        let start = Instant::now();
+        let mut flow = Flow::new();
+        let (mut seq, mut now) = (0, start);
+        let mut sent: VecDeque<(u64, Instant, Duration)> = VecDeque::new();
+        for i in 0u64..20_000 {
+            // 4 KB chunks, bursts of ten 1 ms apart, then a 9 ms pause:
+            // about 2 MB/s on average, 4 MB/s within a burst.
+            now += if i % 10 == 9 {
+                Duration::from_millis(9)
+            } else {
+                Duration::from_millis(1)
+            };
+            seq += 4 * KB;
+            let round_trip = Duration::from_millis(1 + (i * 7919) % 30);
+            assert_eq!(flow.output(seq, 4 * KB, now), Output::Send, "at chunk {i}");
+            sent.push_back((seq, now, round_trip));
+            while let Some(&(s, at, rt)) = sent.front() {
+                if now.duration_since(at) < rt {
+                    break;
+                }
+                flow.confirmed(s, at + rt);
+                sent.pop_front();
+            }
+        }
+        assert!(!flow.is_behind());
     }
 
     /// After a flood the missed history waits for a second of calm, and a

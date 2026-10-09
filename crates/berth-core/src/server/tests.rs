@@ -424,6 +424,43 @@ async fn a_client_that_fell_behind_catches_up() {
     until_output(&mut slow, "back_6").await;
 }
 
+/// A client that keeps up at the rates of normal work, a fast build log at a
+/// few MB/s in bursts, stays on the raw stream: no screen at all (D50).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_log_stays_raw() {
+    let server = server().await;
+    let mut app = client::connect(&server.places).await.unwrap();
+    let session = create(&mut app).await;
+    attach(&mut app, session).await;
+    type_line(
+        &app,
+        session,
+        "i=0; while [ $i -lt 60 ]; do seq 1 12000; sleep 0.01; i=$((i+1)); done; echo log_do\"\"ne",
+    )
+    .await;
+    let mut screens = 0;
+    let mut text = Vec::new();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match next(&mut app).await {
+                ToApp::Screen { .. } => screens += 1,
+                ToApp::Output { bytes, .. } => {
+                    text.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&text).contains("log_done") {
+                        return;
+                    }
+                    keep_tail(&mut text);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the log never finished");
+    assert_eq!(screens, 0, "fell back to screens on a build log");
+    let _ = app.to_server.send(ToServer::Kill { session }).await;
+}
+
 /// A client that fell behind is never left frozen while the flood goes on:
 /// screens, or raw output once it keeps up again, arrive every quarter of a
 /// second, not only once the flood ends (D50). The flood here never ends, so
@@ -713,12 +750,15 @@ mod sync_under_load {
         ));
         let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (done_tx, done) = tokio::sync::oneshot::channel::<()>();
+        let (rebuilt_tx, rebuilt) = tokio::sync::oneshot::channel::<()>();
         // Keeps feeding to the end: the screen and history that close the
-        // flood come after its last line is first seen.
+        // flood come after its last line is first seen, once output has been
+        // calm for a second (D50).
         let _feeding = {
             let terminal = terminal.clone();
             let pause = pause.clone();
             let mut done_tx = Some(done_tx);
+            let mut rebuilt_tx = Some(rebuilt_tx);
             tokio::spawn(async move {
                 let mut tail = Vec::new();
                 loop {
@@ -739,7 +779,16 @@ mod sync_under_load {
                             }
                         }
                         // As the app's pump does: in order with the output.
-                        Some(PtyEvent::Rebuild(step)) => terminal.shadow(step),
+                        Some(PtyEvent::Rebuild(step)) => {
+                            let commit = step == berth_term::Shadow::Commit;
+                            terminal.shadow(step);
+                            if commit
+                                && done_tx.is_none()
+                                && let Some(tx) = rebuilt_tx.take()
+                            {
+                                let _ = tx.send(());
+                            }
+                        }
                         Some(_) => {}
                         None => return,
                     }
@@ -747,7 +796,9 @@ mod sync_under_load {
             })
         };
 
-        pty.write(b"seq 1 200000; echo flood_do\"\"ne\n".to_vec())
+        // Past the window's ceiling (8 MB), so the pause below makes the
+        // app fall behind however wide the window has grown.
+        pty.write(b"seq 1 2000000; echo flood_do\"\"ne\n".to_vec())
             .await;
         // Fall behind for a while in the middle of it.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -758,8 +809,13 @@ mod sync_under_load {
             .await
             .expect("the flood reached the app")
             .unwrap();
-        // Let the last screen and its history land, and the terminal parse.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // The history the app missed, once output is calm, and the terminal
+        // caught up with it.
+        timeout(Duration::from_secs(20), rebuilt)
+            .await
+            .expect("the missed history never came")
+            .unwrap();
+        let _ = terminal.snapshot();
 
         let (worker_history, worker_screen) = worker_view(&server.places, session).await;
         let app_screen = terminal.wire_screen().unwrap();

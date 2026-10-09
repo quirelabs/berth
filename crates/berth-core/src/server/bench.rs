@@ -570,12 +570,13 @@ pub struct Rung {
     pub name: &'static str,
     pub seconds: f64,
     pub usage: Option<Usage>,
-    /// For a rung with a pty: the reads it took.
+    /// For a rung with a pty: the handoffs from the pump to the engine.
     pub reads: Option<Reads>,
 }
 
-/// The pty's reads during a run: how many, and how big. Each is one chunk
-/// the pump hands to the engine.
+/// The pump's handoffs to the engine during a run, each one output message:
+/// how many, and how big. One per pty read before the pump gathered reads,
+/// one per batch since.
 #[derive(Debug, Clone, Default)]
 pub struct Reads {
     pub count: u64,
@@ -849,7 +850,7 @@ pub async fn run_engine(args: &[String]) -> Result<bool> {
             }
             if let Some(reads) = rung.reads.filter(|r| r.count > 0) {
                 println!(
-                    "  {:<21} {} reads, {:.0} B each; <=256 B {}, <=1 KB {}, <=4 KB {}, more {}",
+                    "  {:<21} {} handoffs, {:.0} B each; <=256 B {}, <=1 KB {}, <=4 KB {}, more {}",
                     "",
                     reads.count,
                     reads.bytes as f64 / reads.count as f64,
