@@ -171,7 +171,8 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// `/proc/<pid>/stat`, where the kernel has one.
+    /// `/proc/<pid>/stat`, where the kernel has one; `<pid>/task/<tid>` for
+    /// one thread.
     fn of(pid: &str) -> Option<Self> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // The command name may hold spaces; the fields after it do not.
@@ -202,6 +203,15 @@ impl Usage {
 pub struct Report {
     pub rate: Rate,
     pub usage: Vec<(&'static str, Usage)>,
+    pub delivered: Delivered,
+}
+
+/// What reached the client: the output as it came, and screens in its place
+/// while the client fell behind (D50's sync).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Delivered {
+    pub output: usize,
+    pub screens: usize,
 }
 
 /// The processes worth accounting for, by role, as pids.
@@ -213,9 +223,30 @@ fn roles(places: &Places, session: SessionId, servers: Servers) -> Vec<(&'static
         }
         if let Some(pid) = paths::read_pid(&places.worker_pid(session)) {
             roles.push(("worker", pid.to_string()));
+            // Its two named threads: the pty's reader and the engine. The
+            // rest of the worker's time is its runtime's threads.
+            for (thread, role) in [
+                ("berth-worker", "  pty read"),
+                ("berth-terminal", "  engine"),
+            ] {
+                if let Some(tid) = thread_named(&pid.to_string(), thread) {
+                    roles.push((role, format!("{pid}/task/{tid}")));
+                }
+            }
         }
     }
     roles
+}
+
+/// The thread of a process with this name, from `/proc` (Linux only).
+fn thread_named(pid: &str, name: &str) -> Option<String> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+        .find(|task| {
+            std::fs::read_to_string(task.path().join("comm")).is_ok_and(|comm| comm.trim() == name)
+        })
+        .map(|task| task.file_name().to_string_lossy().to_string())
 }
 
 fn snapshot(roles: &[(&'static str, String)]) -> Vec<(&'static str, Option<Usage>)> {
@@ -341,8 +372,14 @@ pub async fn measure(
             .await
             .map_err(|_| Error::Server("closed".into()))?;
         let mut tail = Vec::new();
+        let mut delivered = Delivered::default();
         loop {
             let message = next(&mut app).await?;
+            match &message {
+                ToApp::Output { bytes, .. } => delivered.output += bytes.len(),
+                ToApp::Screen { .. } => delivered.screens += 1,
+                _ => {}
+            }
             if shows(&message, "BENCH_DONE", &mut tail) {
                 break;
             }
@@ -364,6 +401,7 @@ pub async fn measure(
                 seconds,
             },
             usage,
+            delivered,
         })
     }
     .await;
@@ -423,7 +461,11 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
     let mut all = true;
     for kind in kinds {
         match measure(kind, megabytes, &scratch, servers).await {
-            Ok(Report { rate, usage }) => {
+            Ok(Report {
+                rate,
+                usage,
+                delivered,
+            }) => {
                 let verdict = match kind.floor() {
                     Some(floor) if rate.passes() => format!("PASS (floor {floor:.0})"),
                     Some(floor) => format!("FAIL (floor {floor:.0})"),
@@ -435,6 +477,11 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                     rate.mb_per_s(),
                     rate.bytes / MB,
                     rate.seconds
+                );
+                println!(
+                    "  delivered  {:.1} MB as output, {} screens",
+                    delivered.output as f64 / MB as f64,
+                    delivered.screens
                 );
                 for (role, used) in usage {
                     println!(
