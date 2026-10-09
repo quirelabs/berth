@@ -38,7 +38,7 @@ impl Places {
         Some(places)
     }
 
-    fn under(base: &Path) -> Self {
+    pub(crate) fn under(base: &Path) -> Self {
         Self {
             run: base.join("run"),
             bin: base.join("bin"),
