@@ -115,6 +115,46 @@ pub const CLAUDE_YOUR_MOVE: &str = "Claude finished its turn. Your move.";
 pub const CLAUDE_FINISHED: &str = "Claude has exited.";
 pub const CLAUDE_INTERRUPTED: &str = "Claude exited in the middle of a turn.";
 
+/// What a program says of itself through the Program Status Protocol (OSC
+/// 7501, D53). The program's own words, shown as it reported them: `who` is
+/// the name it gave, and its message follows. Any program in the session can
+/// report anything, so this says "reports", never that it is so.
+pub const STATUS_ANONYMOUS: &str = "A program";
+
+pub fn status_tooltip(
+    who: &str,
+    state: berth_proto::v1::StatusState,
+    kind: Option<berth_proto::v1::StatusKind>,
+    progress: Option<u8>,
+    msg: Option<&str>,
+) -> String {
+    use berth_proto::v1::{StatusKind, StatusState};
+    let mut text = match (state, kind) {
+        (StatusState::Working, _) => match progress {
+            Some(progress) => format!("{who} reports it is working ({progress}%)."),
+            None => format!("{who} reports it is working."),
+        },
+        (StatusState::Blocked, Some(StatusKind::Permission)) => {
+            format!("{who} reports it needs your permission.")
+        }
+        (StatusState::Blocked, Some(StatusKind::Question)) => {
+            format!("{who} reports it has a question for you.")
+        }
+        (StatusState::Blocked, Some(StatusKind::Auth)) => {
+            format!("{who} reports it needs you to sign in.")
+        }
+        (StatusState::Blocked, None) => format!("{who} reports it is waiting on you."),
+        (StatusState::Done, _) => format!("{who} reports it has finished."),
+        (StatusState::Error, _) => format!("{who} reports it has failed."),
+        (StatusState::Idle, _) => format!("{who} reports it is waiting for input."),
+    };
+    if let Some(msg) = msg {
+        text.push(' ');
+        text.push_str(msg);
+    }
+    text
+}
+
 pub const RENAME_TITLE: &str = "Name this session";
 pub const RENAME_ACCEPT: &str = "Rename";
 pub const RENAME_REJECT: &str = "Cancel";

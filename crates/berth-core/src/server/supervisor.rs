@@ -398,10 +398,13 @@ impl State {
                 if let ToApp::Sessions(list) = message {
                     if let (Some(entry), Some(info)) =
                         (self.sessions.get_mut(&session), list.into_iter().next())
-                        && (entry.info.program != info.program || entry.info.cwd != info.cwd)
+                        && (entry.info.program != info.program
+                            || entry.info.cwd != info.cwd
+                            || entry.info.status != info.status)
                     {
                         entry.info.program = info.program;
                         entry.info.cwd = info.cwd;
+                        entry.info.status = info.status;
                         self.push_sessions();
                     }
                     return;

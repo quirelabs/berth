@@ -156,8 +156,9 @@ fn to_app() -> Vec<(ToApp, &'static str)> {
                 rows: 24,
                 claude: Some(claude.clone()),
                 pid: Some(4242),
+                status: Some(status()),
             }]),
-            "00010704776f726b000106636c6175646550180101012430623963356635652d376233392d346135352d386135332d326238663064316339653131010f2f686f6d652f752f70726f6a656374019221",
+            "00010704776f726b000106636c6175646550180101012430623963356635652d376233392d346135352d386135332d326238663064316339653131010f2f686f6d652f752f70726f6a656374019221010a6275696c642f74657374030101012801046d616b6501057465737473010a4f76657277726974653f",
         ),
         (ToApp::Created { session: 8 }, "0108"),
         (
@@ -237,6 +238,19 @@ fn print_goldens() {
     );
 }
 
+/// A program status record with every field set.
+fn status() -> v1::Status {
+    v1::Status {
+        id: "build/test".into(),
+        state: v1::StatusState::Blocked,
+        kind: Some(v1::StatusKind::Question),
+        progress: Some(40),
+        app: Some("make".into()),
+        title: Some("tests".into()),
+        msg: Some("Overwrite?".into()),
+    }
+}
+
 fn events() -> Vec<Event> {
     vec![
         Event::Title("vim".into()),
@@ -247,6 +261,8 @@ fn events() -> Vec<Event> {
             session_id: None,
             cwd: None,
         }),
+        Event::Status(status()),
+        Event::StatusGone(vec!["build".into(), String::new()]),
     ]
 }
 
@@ -257,7 +273,14 @@ fn every_variant_is_covered() {
 }
 
 const SCREEN: &str = "ac020402010201000100010002040124010200010103e697a50201020300000200000000000365cc810001041401010401200000000101200000000101200000000101200000000100";
-const EVENTS: [&str; 4] = ["000376696d", "01", "0200", "03050000"];
+const EVENTS: [&str; 6] = [
+    "000376696d",
+    "01",
+    "0200",
+    "03050000",
+    "040a6275696c642f74657374030101012801046d616b6501057465737473010a4f76657277726974653f",
+    "0502056275696c6400",
+];
 const HELLO: &str = "4252544801010106636c6175646505302e312e30";
 
 #[test]

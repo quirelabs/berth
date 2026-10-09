@@ -363,10 +363,22 @@ impl Workspace {
         if focused {
             row = row.bg(hsla(theme.border));
         }
-        match pane.and_then(|id| self.claude_state(id)) {
-            Some(state) => row = row.child(claude_ghost(("session-agent", index), theme, state)),
-            None if agent => row = row.child(ghost(("session-agent", index), theme)),
-            None => {}
+        // What the session's programs report of themselves comes first
+        // (OSC 7501, D53); Claude's hooks are the fallback for a Claude too
+        // old to report that way.
+        let status = match pane {
+            Some(id) => self.pane_status(id),
+            None => local_session.and_then(|session| self.session_status(session)),
+        };
+        match (status, pane.and_then(|id| self.claude_state(id))) {
+            (Some(status), _) => {
+                row = row.child(status_ghost(("session-agent", index), theme, status))
+            }
+            (None, Some(state)) => {
+                row = row.child(claude_ghost(("session-agent", index), theme, state))
+            }
+            (None, None) if agent => row = row.child(ghost(("session-agent", index), theme)),
+            (None, None) => {}
         }
         if detached {
             row = row.tooltip(move |_, cx| {
@@ -483,12 +495,15 @@ impl Workspace {
 
             // After the name and before the state, because it is about what is
             // inside the session rather than about the connection.
-            match self.claude_state(id) {
-                Some(state) => {
+            match (self.pane_status(id), self.claude_state(id)) {
+                (Some(status), _) => {
+                    row = row.child(status_ghost(("agent", tab_id as usize), theme, status))
+                }
+                (None, Some(state)) => {
                     row = row.child(claude_ghost(("agent", tab_id as usize), theme, state))
                 }
-                None if agent => row = row.child(ghost(("agent", tab_id as usize), theme)),
-                None => {}
+                (None, None) if agent => row = row.child(ghost(("agent", tab_id as usize), theme)),
+                (None, None) => {}
             }
 
             // Split tabs say how many panes they hold, since only one of them
@@ -1144,7 +1159,62 @@ pub(super) fn local_label() -> String {
 
 /// The agent ghost, with the tooltip that says presence and nothing more.
 fn ghost(id: (&'static str, usize), theme: Theme) -> gpui::Stateful<gpui::Div> {
-    ghost_as(id, theme, theme.accent, strings::AGENT_TOOLTIP)
+    ghost_as(id, theme, theme.accent, strings::AGENT_TOOLTIP.into())
+}
+
+/// The ghost for a session whose program reports its own status (OSC 7501,
+/// D53): the colour says whether it needs you, the tooltip gives the
+/// program's own words.
+fn status_ghost(
+    id: (&'static str, usize),
+    theme: Theme,
+    status: &berth_proto::v1::Status,
+) -> gpui::Stateful<gpui::Div> {
+    let colour = match status_tone(status.state) {
+        Tone::Working => theme.accent,
+        Tone::NeedsYou => theme.warning,
+        Tone::Done => theme.text_muted,
+    };
+    ghost_as(id, theme, colour, status_text(status))
+}
+
+/// How a reported state reads at a glance: blocked, failed and finished with
+/// something to see all ask for a look; idle does not.
+fn status_tone(state: berth_proto::v1::StatusState) -> Tone {
+    use berth_proto::v1::StatusState;
+    match state {
+        StatusState::Working => Tone::Working,
+        StatusState::Blocked | StatusState::Error | StatusState::Done => Tone::NeedsYou,
+        StatusState::Idle => Tone::Done,
+    }
+}
+
+/// The longest message shown in a tooltip; a record's may run to 2 KB.
+const STATUS_MSG_SHOWN: usize = 160;
+
+/// A record in words: who (its title, else the program's name), what it
+/// reported, and its message, cut to a line.
+fn status_text(status: &berth_proto::v1::Status) -> String {
+    let who = status
+        .title
+        .as_deref()
+        .or(status.app.as_deref())
+        .unwrap_or(strings::STATUS_ANONYMOUS);
+    let msg = status.msg.as_deref().map(|msg| {
+        if msg.chars().count() > STATUS_MSG_SHOWN {
+            let cut: String = msg.chars().take(STATUS_MSG_SHOWN).collect();
+            format!("{cut}\u{2026}")
+        } else {
+            msg.to_string()
+        }
+    });
+    strings::status_tooltip(
+        who,
+        status.state,
+        status.kind,
+        status.progress,
+        msg.as_deref(),
+    )
 }
 
 /// The ghost for a Claude whose hooks report its state (D48): the colour says
@@ -1160,14 +1230,14 @@ fn claude_ghost(
         Tone::NeedsYou => theme.warning,
         Tone::Done => theme.text_muted,
     };
-    ghost_as(id, theme, colour, text)
+    ghost_as(id, theme, colour, text.into())
 }
 
 fn ghost_as(
     id: (&'static str, usize),
     theme: Theme,
     colour: gpui::Rgba,
-    text: &'static str,
+    text: String,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1180,7 +1250,7 @@ fn ghost_as(
         )
         .tooltip(move |_, cx| {
             cx.new(|_| Note {
-                text: text.into(),
+                text: text.clone().into(),
                 theme,
             })
             .into()
@@ -1235,5 +1305,58 @@ mod tests {
         assert_eq!(claude_look(State::Working).0, Tone::Working);
         assert_eq!(claude_look(State::Finished).0, Tone::Done);
         assert_eq!(claude_look(State::Interrupted).0, Tone::Done);
+    }
+
+    fn status(state: berth_proto::v1::StatusState) -> berth_proto::v1::Status {
+        berth_proto::v1::Status {
+            id: String::new(),
+            state,
+            kind: None,
+            progress: None,
+            app: None,
+            title: None,
+            msg: None,
+        }
+    }
+
+    /// A reported state asks for a look when the program is stuck, failed or
+    /// has something to show; working and idle do not.
+    #[test]
+    fn reported_states_that_need_you() {
+        use berth_proto::v1::StatusState;
+        for state in [StatusState::Blocked, StatusState::Error, StatusState::Done] {
+            assert_eq!(status_tone(state), Tone::NeedsYou, "{state:?}");
+        }
+        assert_eq!(status_tone(StatusState::Working), Tone::Working);
+        assert_eq!(status_tone(StatusState::Idle), Tone::Done);
+    }
+
+    /// The tooltip gives the program's own words, as a report, named by its
+    /// title before its app, and never more than a line of its message.
+    #[test]
+    fn a_status_reads_as_what_the_program_reported() {
+        use berth_proto::v1::{StatusKind, StatusState};
+        let mut record = status(StatusState::Working);
+        assert_eq!(status_text(&record), "A program reports it is working.");
+        record.app = Some("make".into());
+        record.progress = Some(40);
+        record.msg = Some("Building tests".into());
+        assert_eq!(
+            status_text(&record),
+            "make reports it is working (40%). Building tests"
+        );
+        record.title = Some("Tests".into());
+        record.state = StatusState::Blocked;
+        record.kind = Some(StatusKind::Permission);
+        record.msg = None;
+        assert_eq!(
+            status_text(&record),
+            "Tests reports it needs your permission."
+        );
+
+        record.msg = Some("x".repeat(500));
+        let text = status_text(&record);
+        assert!(text.ends_with('\u{2026}'), "{text}");
+        assert!(text.chars().count() < 220, "{}", text.chars().count());
     }
 }

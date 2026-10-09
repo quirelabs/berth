@@ -100,6 +100,22 @@ pub struct Worker {
     /// Bytes of output so far. Locked while a chunk is fed to the terminal
     /// and counted, and while a screen is taken, so the two always agree.
     seq: Arc<Mutex<u64>>,
+    /// What the session's programs say they are doing (OSC 7501, D53), kept
+    /// here so it outlives any app.
+    status: Mutex<Status>,
+    /// Told whenever the terminal has published something new, which is
+    /// when there may be status reports to take.
+    status_wake: Arc<tokio::sync::Notify>,
+}
+
+/// A session's program status, and what is still to be told about it.
+#[derive(Default)]
+struct Status {
+    records: crate::status::Records,
+    /// Changes made outside [`Worker::status_changes`], waiting to be sent.
+    unsent: Vec<v1::Event>,
+    /// What had the terminal when last looked at, to see a program end.
+    foreground: Option<u32>,
 }
 
 fn lock(seq: &Mutex<u64>) -> MutexGuard<'_, u64> {
@@ -145,6 +161,9 @@ impl Worker {
                 }
             }),
         ));
+        let status_wake = Arc::new(tokio::sync::Notify::new());
+        let wake = status_wake.clone();
+        terminal.on_publish(move || wake.notify_one());
         let seq = Arc::new(Mutex::new(0));
         let (tx, rx) = mpsc::channel(QUEUE);
         let pumped = (spec.session, terminal.clone(), seq.clone());
@@ -169,6 +188,8 @@ impl Worker {
                 pty,
                 terminal,
                 seq,
+                status: Mutex::new(Status::default()),
+                status_wake,
             },
             rx,
         ))
@@ -220,6 +241,56 @@ impl Worker {
         }
     }
 
+    /// Wakes whoever sends this session's events when there may be program
+    /// status changes to send ([`Worker::status_changes`]).
+    pub fn status_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.status_wake.clone()
+    }
+
+    /// Take what the session's programs reported since the last call (OSC
+    /// 7501), apply it to the records, and return what changed as events:
+    /// each record set or replaced, and the ids of those gone. A burst of
+    /// reports to one record comes out as its last state only.
+    ///
+    /// Display only (D53): the caller sends these on and does nothing else
+    /// with them.
+    pub fn status_changes(&self) -> Vec<v1::Event> {
+        let reported = self.terminal.drain_status_events();
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let mut events = std::mem::take(&mut status.unsent);
+        if reported.is_empty() {
+            return events;
+        }
+        let before = status.records.to_wire();
+        for event in reported {
+            match event {
+                berth_term::StatusEvent::Report(pairs) => {
+                    if let Some(report) = crate::status::parse(&pairs) {
+                        status.records.apply(report);
+                    }
+                }
+                berth_term::StatusEvent::PromptStart => {
+                    status.records.program_ended();
+                }
+                berth_term::StatusEvent::Reset => {
+                    status.records.reset();
+                }
+            }
+        }
+        events.extend(changes(&before, &status.records.to_wire()));
+        events
+    }
+
+    /// Every program status record the session holds now, for an app that
+    /// was not here when they were reported.
+    pub fn statuses(&self) -> Vec<v1::Status> {
+        self.status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .records
+            .to_wire()
+    }
+
     /// What Claude is doing in this session, as its hook last said.
     pub fn claude(&self) -> Option<v1::Claude> {
         crate::claude::to_wire(&self.claude.lock().unwrap_or_else(|p| p.into_inner()))
@@ -259,6 +330,7 @@ impl Worker {
             rows,
             claude: self.claude(),
             pid: self.pty.local_pid(),
+            status: crate::status::foremost(&self.statuses()).cloned(),
         }
     }
 
@@ -267,6 +339,7 @@ impl Worker {
     /// asks `ps` and `lsof`.
     pub fn refresh(&self) -> Option<v1::SessionInfo> {
         let pid = self.pty.foreground_pid()?;
+        self.note_foreground(pid);
         let now = Live {
             program: crate::local::program_of(pid),
             cwd: crate::local::cwd_of(pid).map(|d| d.to_string_lossy().to_string()),
@@ -283,6 +356,26 @@ impl Worker {
         *live = merged;
         drop(live);
         Some(self.info())
+    }
+
+    /// The terminal going back to the shell means the program that had it
+    /// exited: its records of something under way go, as the protocol asks,
+    /// also for a shell that marks no prompts.
+    fn note_foreground(&self, pid: u32) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let before = status.foreground.replace(pid);
+        let back_at_the_shell =
+            before.is_some_and(|was| was != pid) && self.pty.local_pid() == Some(pid);
+        if !back_at_the_shell {
+            return;
+        }
+        let records = status.records.to_wire();
+        if status.records.program_ended() {
+            let gone = changes(&records, &status.records.to_wire());
+            status.unsent.extend(gone);
+            drop(status);
+            self.status_wake.notify_one();
+        }
     }
 
     async fn resize(&self, cols: u16, rows: u16) {
@@ -355,6 +448,26 @@ impl Worker {
             why,
         }
     }
+}
+
+/// What turned `before` into `after`, as events: records set or replaced,
+/// then the ids of records gone.
+fn changes(before: &[v1::Status], after: &[v1::Status]) -> Vec<v1::Event> {
+    let mut events: Vec<v1::Event> = after
+        .iter()
+        .filter(|record| !before.contains(record))
+        .cloned()
+        .map(v1::Event::Status)
+        .collect();
+    let gone: Vec<String> = before
+        .iter()
+        .filter(|was| !after.iter().any(|now| now.id == was.id))
+        .map(|was| was.id.clone())
+        .collect();
+    if !gone.is_empty() {
+        events.push(v1::Event::StatusGone(gone));
+    }
+    events
 }
 
 /// Read the pty until the shell is gone: feed each chunk to the terminal,
@@ -599,6 +712,98 @@ mod tests {
             })
             .await;
         until(&mut rx, "got_]7501;?\\[?62;22c").await;
+    }
+
+    /// Status changes until `wanted` of them have come, or time runs out.
+    async fn status_events(worker: &Worker, wanted: usize) -> Vec<v1::Event> {
+        let wake = worker.status_wake();
+        let mut events = Vec::new();
+        let _ = timeout(Duration::from_secs(10), async {
+            while events.len() < wanted {
+                events.extend(worker.status_changes());
+                if events.len() < wanted {
+                    wake.notified().await;
+                }
+            }
+        })
+        .await;
+        events
+    }
+
+    async fn type_in(worker: &Worker, line: &str) {
+        worker
+            .handle(ToServer::Input {
+                session: 1,
+                bytes: format!("{line}\n").into_bytes(),
+            })
+            .await;
+    }
+
+    /// A program reports what it is doing (OSC 7501): the worker keeps the
+    /// record, shows the session by it, and drops it at the next prompt
+    /// unless it is something left to see.
+    #[tokio::test]
+    async fn program_status_is_kept_and_dropped_as_the_protocol_says() {
+        let (worker, _rx) = Worker::start(spec(None)).await.unwrap();
+        // "Building" in base64.
+        type_in(
+            &worker,
+            "printf '\\033]7501;state=working:app=make:progress=40:msg=QnVpbGRpbmc=\\033\\\\'",
+        )
+        .await;
+        let events = status_events(&worker, 1).await;
+        let expected = v1::Status {
+            id: String::new(),
+            state: v1::StatusState::Working,
+            kind: None,
+            progress: Some(40),
+            app: Some("make".into()),
+            title: None,
+            msg: Some("Building".into()),
+        };
+        assert_eq!(events, [v1::Event::Status(expected.clone())]);
+        assert_eq!(worker.info().status, Some(expected));
+
+        // A finished record beside it, then a new prompt: the working one
+        // goes, the finished one stays to be seen.
+        type_in(
+            &worker,
+            "printf '\\033]7501;state=done:id=tests\\033\\\\\\033]133;A\\007'",
+        )
+        .await;
+        let events = status_events(&worker, 2).await;
+        assert!(
+            events.contains(&v1::Event::StatusGone(vec![String::new()])),
+            "{events:?}"
+        );
+        let left = worker.statuses();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(
+            (left[0].id.as_str(), left[0].state),
+            ("tests", v1::StatusState::Done)
+        );
+
+        // A full reset clears the rest.
+        type_in(&worker, "printf '\\033c'").await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events, [v1::Event::StatusGone(vec!["tests".into()])]);
+        assert_eq!(worker.info().status, None);
+    }
+
+    /// A report that breaks the protocol's rules changes nothing.
+    #[tokio::test]
+    async fn a_bad_status_report_is_ignored() {
+        let (worker, _rx) = Worker::start(spec(None)).await.unwrap();
+        // A control character in the message ("a\nb"), then a good report.
+        type_in(
+            &worker,
+            "printf '\\033]7501;state=working:msg=YQpi\\033\\\\\\033]7501;state=idle:id=ok\\007'",
+        )
+        .await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(worker.statuses().len(), 1);
+        assert_eq!(worker.statuses()[0].id, "ok");
     }
 
     #[tokio::test]

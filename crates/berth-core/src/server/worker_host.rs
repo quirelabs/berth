@@ -171,6 +171,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     screen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let (hook_tx, mut hook_lines) = mpsc::channel::<String>(16);
+    let status_wake = worker.status_wake();
 
     loop {
         tokio::select! {
@@ -182,6 +183,27 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                         let _ = tx.send(line).await;
                     }
                 });
+            }
+            // What the session's programs report of themselves (OSC 7501,
+            // D53): sent on for display and kept in the session list, and
+            // nothing else is done with it.
+            () = status_wake.notified() => {
+                let events = worker.status_changes();
+                if events.is_empty() {
+                    continue;
+                }
+                for event in events {
+                    send(
+                        &mut to_supervisor,
+                        &ToApp::Event {
+                            session: launch.session,
+                            event,
+                        },
+                    )
+                    .await;
+                }
+                // The record the session list shows the session by.
+                send(&mut to_supervisor, &ToApp::Sessions(vec![worker.info()])).await;
             }
             Some(line) = hook_lines.recv() => {
                 if let Some(claude) = worker.hook_line(&line) {
@@ -277,6 +299,18 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                         let _ = worker.handle(message).await;
                         let kind = flow.attached();
                         send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
+                        // What the session's programs last reported, for an
+                        // app that was not here when they did.
+                        for status in worker.statuses() {
+                            send(
+                                &mut to_supervisor,
+                                &ToApp::Event {
+                                    session: launch.session,
+                                    event: v1::Event::Status(status),
+                                },
+                            )
+                            .await;
+                        }
                         // What Claude is doing, for an app that was not here
                         // when it last said.
                         if let Some(claude) = worker.claude() {

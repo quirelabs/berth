@@ -424,6 +424,101 @@ async fn a_client_that_fell_behind_catches_up() {
     until_output(&mut slow, "back_6").await;
 }
 
+/// A program's status report (OSC 7501, D53) reaches the attached app as an
+/// event and the session list as the record the session is shown by, is kept
+/// while no app is attached, and reaches an app that attaches later.
+#[tokio::test(flavor = "multi_thread")]
+async fn program_status_reaches_the_app_and_outlives_it() {
+    let server = server().await;
+    let mut app = client::connect(&server.places).await.unwrap();
+    let session = create(&mut app).await;
+    attach(&mut app, session).await;
+    // "Building" in base64.
+    type_line(
+        &app,
+        session,
+        "printf '\\033]7501;state=working:app=make:msg=QnVpbGRpbmc=\\033\\\\'",
+    )
+    .await;
+    let mut event = None;
+    let mut listed = None;
+    timeout(Duration::from_secs(10), async {
+        while event.is_none() || listed.is_none() {
+            match next(&mut app).await {
+                ToApp::Event {
+                    event: v1::Event::Status(status),
+                    ..
+                } => event = Some(status),
+                ToApp::Sessions(list) => {
+                    listed = list
+                        .into_iter()
+                        .find(|s| s.id == session)
+                        .and_then(|s| s.status)
+                        .or(listed.take());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the status never reached the app");
+    let status = event.unwrap();
+    assert_eq!(status.state, v1::StatusState::Working);
+    assert_eq!(status.app.as_deref(), Some("make"));
+    assert_eq!(status.msg.as_deref(), Some("Building"));
+    assert_eq!(listed, Some(status.clone()));
+
+    // A report made while nobody is attached: finished, a second from now.
+    type_line(
+        &app,
+        session,
+        "(sleep 1; printf '\\033]7501;state=done:app=make\\033\\\\') &",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(app);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut later = client::connect(&server.places).await.unwrap();
+    later.to_server.send(ToServer::ListSessions).await.unwrap();
+    let listed = timeout(Duration::from_secs(10), async {
+        loop {
+            if let ToApp::Sessions(list) = next(&mut later).await
+                && let Some(info) = list.into_iter().find(|s| s.id == session)
+            {
+                return info.status;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(listed.map(|s| s.state), Some(v1::StatusState::Done));
+    later
+        .to_server
+        .send(ToServer::Attach {
+            session,
+            cols: 40,
+            rows: 10,
+        })
+        .await
+        .unwrap();
+    let again = timeout(Duration::from_secs(10), async {
+        loop {
+            if let ToApp::Event {
+                event: v1::Event::Status(status),
+                ..
+            } = next(&mut later).await
+            {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("an app attaching later was not told the status");
+    assert_eq!(again.state, v1::StatusState::Done);
+    let _ = later.to_server.send(ToServer::Kill { session }).await;
+}
+
 /// A client that keeps up at the rates of normal work, a fast build log at a
 /// few MB/s in bursts, stays on the raw stream: no screen at all (D50).
 #[tokio::test(flavor = "multi_thread")]

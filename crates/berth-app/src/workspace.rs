@@ -855,6 +855,21 @@ impl Workspace {
         }
     }
 
+    /// What the programs in a local session report of themselves (OSC 7501,
+    /// D53): the record the session is shown by. For display only.
+    fn session_status(&self, session: u64) -> Option<&berth_proto::v1::Status> {
+        self.local_sessions
+            .iter()
+            .find(|info| info.id == session)?
+            .status
+            .as_ref()
+    }
+
+    /// The same for the session a pane shows.
+    fn pane_status(&self, id: u64) -> Option<&berth_proto::v1::Status> {
+        self.session_status(self.pane(id)?.session?)
+    }
+
     /// What a pane's Claude is doing, when its hooks have said.
     fn claude_state(&self, id: u64) -> Option<berth_core::claude::State> {
         self.pane(id)?.claude.as_ref()?.tracker.state

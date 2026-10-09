@@ -137,6 +137,9 @@ pub struct SessionInfo {
     /// The shell's process, on the machine it runs on: how the app reads its
     /// working directory to save a session (D46).
     pub pid: Option<u32>,
+    /// The program status record the session is shown by, if any program in
+    /// it reports one (OSC 7501, D53): the one that most needs the user.
+    pub status: Option<Status>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +151,52 @@ pub enum Event {
         code: Option<i32>,
     },
     Claude(Claude),
+    /// A program set or replaced one of its status records (OSC 7501, D53).
+    /// For display only: nothing may be done because of one.
+    Status(Status),
+    /// These status records are gone, by id: cleared, or dropped when their
+    /// program exited or a new prompt began.
+    StatusGone(Vec<String>),
+}
+
+/// One program status record (OSC 7501, the Program Status Protocol), as
+/// the worker keeps it: checked against the protocol's limits, its text
+/// decoded and free of control characters. Untrusted all the same: any
+/// program in the session can report anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    /// The record's path, such as `build/test`; empty for the root record.
+    pub id: String,
+    pub state: StatusState,
+    /// What a blocked program waits for.
+    pub kind: Option<StatusKind>,
+    /// 0 to 100, where the program says how far it is.
+    pub progress: Option<u8>,
+    /// The program's own name, inherited from an ancestor record if this one
+    /// has none.
+    pub app: Option<String>,
+    pub title: Option<String>,
+    pub msg: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusState {
+    /// At rest, waiting for input.
+    Idle,
+    Working,
+    /// Finished, with results the user has not seen.
+    Done,
+    /// Needs the user.
+    Blocked,
+    /// Failed and stopped.
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatusKind {
+    Permission,
+    Question,
+    Auth,
 }
 
 /// A session's Claude, as its hook reported it (D48).
