@@ -649,7 +649,7 @@ pub fn ladder(kind: Kind, megabytes: usize) -> Vec<Rung> {
 /// headless engine, as a worker runs them, with its output read and dropped
 /// here instead of going to a supervisor. Between the ladder's headless
 /// terminal and the whole server path: what the pty and `cat` add.
-pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path) -> Result<Rung> {
+pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path, pin: bool) -> Result<Rung> {
     let file = scratch.join(format!("{}.txt", kind.name()));
     write_stream(kind, &file, megabytes)?;
     let (worker, mut output) = crate::worker::Worker::start(crate::worker::Spec {
@@ -667,6 +667,9 @@ pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path) -> Resul
     .await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
     while output.try_recv().is_ok() {}
+    if pin {
+        pin_apart()?;
+    }
     let engine = thread_named("self", "berth-terminal").map(|tid| format!("self/task/{tid}"));
     let before = engine.as_deref().and_then(Usage::of);
     let started = Instant::now();
@@ -693,21 +696,88 @@ pub async fn worker_alone(kind: Kind, megabytes: usize, scratch: &Path) -> Resul
         .zip(before)
         .map(|(a, b)| a.since(b));
     let _ = std::fs::remove_file(&file);
+    if pin {
+        // Back to every core for whatever runs next.
+        let _ = taskset(&["-a", "-p", "-c", "0-1023", &std::process::id().to_string()]);
+    }
     Ok(Rung {
-        name: "worker, no server",
+        name: if pin {
+            "worker, pinned apart"
+        } else {
+            "worker, no server"
+        },
         seconds,
         usage,
     })
 }
 
-/// `--bench-engine [kind ...] [--mb N]`: [`ladder`] for each kind, then
-/// [`worker_alone`].
+/// `taskset` with these arguments (Linux, util-linux).
+fn taskset(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("taskset")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Server(format!("taskset {args:?} failed")))
+    }
+}
+
+/// Give each part of a running worker a core of its own: this process's
+/// threads (the reading side) core 0, the engine thread 1, the pump 2, and
+/// the shell, whose `cat` inherits it, 3.
+fn pin_apart() -> Result<()> {
+    let me = std::process::id().to_string();
+    taskset(&["-a", "-p", "-c", "0", &me])?;
+    for (thread, core) in [("berth-terminal", "1"), ("berth-worker", "2")] {
+        let tid = thread_named("self", thread)
+            .ok_or_else(|| Error::Server(format!("no {thread} thread to pin")))?;
+        taskset(&["-p", "-c", core, &tid])?;
+    }
+    // The worker's shell is the one `sh` among this process's children.
+    let shell = children(&me)
+        .into_iter()
+        .find(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "sh")
+        })
+        .ok_or_else(|| Error::Server("no shell to pin".into()))?;
+    taskset(&["-a", "-p", "-c", "3", &shell])
+}
+
+/// The processes whose parent is `pid`, from `/proc`.
+fn children(pid: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let parent = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .to_string();
+            (parent == pid).then_some(name)
+        })
+        .collect()
+}
+
+/// `--bench-engine [kind ...] [--mb N] [--pin]`: [`ladder`] for each kind, then
+/// [`worker_alone`], and with `--pin` the worker alone again with its parts
+/// pinned to separate cores (Linux).
 pub async fn run_engine(args: &[String]) -> Result<bool> {
     let mut kinds = Vec::new();
     let mut megabytes = 64;
+    let mut pin = false;
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
-        if arg == "--mb" {
+        if arg == "--pin" {
+            pin = true;
+        } else if arg == "--mb" {
             megabytes = it
                 .next()
                 .and_then(|n| n.parse().ok())
@@ -726,9 +796,14 @@ pub async fn run_engine(args: &[String]) -> Result<bool> {
     for kind in kinds {
         println!("{}", kind.name());
         let mut rungs = ladder(kind, megabytes);
-        match worker_alone(kind, megabytes, &scratch).await {
-            Ok(rung) => rungs.push(rung),
-            Err(error) => println!("  worker, no server: did not finish: {error}"),
+        for pinned in [false, true] {
+            if pinned && !pin {
+                continue;
+            }
+            match worker_alone(kind, megabytes, &scratch, pinned).await {
+                Ok(rung) => rungs.push(rung),
+                Err(error) => println!("  worker (pinned {pinned}): did not finish: {error}"),
+            }
         }
         for rung in rungs {
             let rate = megabytes as f64 / rung.seconds;

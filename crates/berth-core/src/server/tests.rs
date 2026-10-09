@@ -424,6 +424,31 @@ async fn a_client_that_fell_behind_catches_up() {
     until_output(&mut slow, "back_6").await;
 }
 
+/// A client that fell behind gets screens while the flood goes on, not only
+/// once it ends: a pane must never freeze under heavy output (D50). The
+/// flood here never ends, so every screen counted came during it.
+#[tokio::test(flavor = "multi_thread")]
+async fn screens_keep_coming_during_a_flood() {
+    let server = server().await;
+    let mut slow = client::connect(&server.places).await.unwrap();
+    let session = create(&mut slow).await;
+    attach(&mut slow, session).await;
+    type_line(&slow, session, "yes berth_flood_line").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut screens = 0;
+    let _ = timeout(Duration::from_secs(3), async {
+        loop {
+            if let ToApp::Screen { .. } = next(&mut slow).await {
+                screens += 1;
+            }
+        }
+    })
+    .await;
+    assert!(screens >= 10, "only {screens} screens in 3 s of flood");
+    let _ = slow.to_server.send(ToServer::Kill { session }).await;
+}
+
 mod through_the_app {
     //! The app's side: sessions seen as ptys through `LocalServer`.
     use super::*;

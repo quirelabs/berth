@@ -162,6 +162,13 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
     // Raw output or screens, as the app keeps up (D49).
     let mut flow = sync::Flow::new();
     let mut in_alternate = false;
+    // A fixed-rate timer, not a sleep made afresh each time round the loop:
+    // during a flood output arrives more often than the tick, and a fresh
+    // sleep would never get to fire, leaving a pane that fell behind with no
+    // screens until the flood ended. Only polled while the flow wants it, so
+    // an idle session does not wake for it.
+    let mut screen_tick = tokio::time::interval(SCREEN_TICK);
+    screen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let (hook_tx, mut hook_lines) = mpsc::channel::<String>(16);
 
@@ -216,7 +223,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                 }
                 send(&mut to_supervisor, &message).await;
             }
-            _ = tokio::time::sleep(SCREEN_TICK), if flow.wants_tick() => {
+            _ = screen_tick.tick(), if flow.wants_tick() => {
                 if let Some(kind) = flow.tick(std::time::Instant::now()) {
                     send_screen(&worker, &mut flow, kind, &mut to_supervisor).await;
                 }
