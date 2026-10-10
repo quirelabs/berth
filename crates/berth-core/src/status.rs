@@ -177,15 +177,28 @@ fn text(encoded: &str, max_encoded: usize, max_decoded: usize) -> Option<String>
 }
 
 /// Text a program set that is about to be shown on one line, such as a
-/// terminal title: without control characters or anything that could reorder
-/// or hide text, trimmed, and at most `max` characters. `None` if nothing is
-/// left.
+/// terminal title. Any program can set it, so it is made safe to show and is
+/// never used for anything else: no control characters (C0 or C1, so no
+/// escape sequences), nothing that reorders or hides text (the bidirectional
+/// overrides, embeddings and isolates, zero-width and other invisible
+/// formatting characters), every run of whitespace one space, trimmed, and
+/// at most `max` characters. `None` if nothing is left.
 pub fn shown(text: &str, max: usize) -> Option<String> {
-    let clean: String = text
+    let spaced: String = text
         .chars()
+        // A tab or a line break separates words; it must not join them.
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|c| !c.is_control() && !invisible(*c))
         .collect();
-    let clean: String = clean.trim().chars().take(max).collect();
+    let clean: String = spaced
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect();
+    let clean = clean.trim_end().to_string();
     (!clean.is_empty()).then_some(clean)
 }
 
@@ -482,11 +495,53 @@ mod tests {
     fn a_title_is_cleaned_before_it_is_shown() {
         assert_eq!(shown("  vim  ", 10).as_deref(), Some("vim"));
         assert_eq!(
-            shown("a\u{1b}[31mb\u{202e}c\n", 10).as_deref(),
-            Some("a[31mbc")
+            shown(&"x".repeat(500), 256).map(|t| t.chars().count()),
+            Some(256)
         );
-        assert_eq!(shown(&"x".repeat(500), 80).map(|t| t.len()), Some(80));
         assert_eq!(shown(" \u{200b}\t", 10), None);
+        // Runs of whitespace of any kind are one space; a tab or a line
+        // break keeps words apart.
+        assert_eq!(
+            shown("a \t\n  b\u{a0}\u{a0}c\u{3000}d", 40).as_deref(),
+            Some("a b c d")
+        );
+        // The cap does not leave a space dangling at the end.
+        assert_eq!(shown("ab cd", 3).as_deref(), Some("ab"));
+    }
+
+    /// A hostile title: every trick to make a label read as something it is
+    /// not, or to reach the terminal that shows it, comes out as plain text.
+    #[test]
+    fn a_hostile_title_is_made_plain() {
+        // A right-to-left override, to show "claude" for a program that
+        // typed "edualc": the override goes, and the letters read as typed.
+        assert_eq!(
+            shown("vim \u{202e}edualc", 40).as_deref(),
+            Some("vim edualc")
+        );
+        // Every override, embedding and isolate, U+202A to U+202E and
+        // U+2066 to U+2069, and the marks and zero-width characters.
+        let tricks: String = ('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain([
+                '\u{200e}', '\u{200f}', '\u{200b}', '\u{2060}', '\u{feff}', '\u{61c}',
+            ])
+            .collect();
+        assert_eq!(shown(&format!("a{tricks}b"), 40).as_deref(), Some("ab"));
+        // Control characters: an escape sequence in C0 form and in C1 form
+        // (U+009B is CSI), a bell, a NUL, a delete.
+        assert_eq!(
+            shown("ok\u{1b}[31m\u{9b}31m\u{7}\u{0}\u{7f}\u{9d}0;x\u{9c}", 40).as_deref(),
+            Some("ok[31m31m0;x")
+        );
+        for c in ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}') {
+            let cleaned = shown(&format!("a{c}b"), 10).unwrap();
+            assert!(
+                cleaned == "ab" || cleaned == "a b",
+                "U+{:04X} came through as {cleaned:?}",
+                c as u32
+            );
+        }
     }
 
     #[test]

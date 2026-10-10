@@ -877,6 +877,27 @@ mod tests {
         assert_eq!(worker.info().title.as_deref(), Some("build api"));
     }
 
+    /// A hostile title on a real pty: a right-to-left override meant to make
+    /// the tab read "claude", and runs of spaces. What the session list
+    /// carries is plain text, and the program it names is still the one
+    /// that runs: a title never says what the program is.
+    #[tokio::test]
+    async fn a_hostile_title_is_made_plain_and_changes_nothing_else() {
+        let (worker, _rx) = Worker::start(spec(None)).await.unwrap();
+        let before = worker.info().program;
+        // U+202E is E2 80 AE in UTF-8.
+        type_in(
+            &worker,
+            "printf '\\033]2;vim    \\342\\200\\256edualc\\007'",
+        )
+        .await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events, [v1::Event::Title("vim edualc".into())]);
+        let info = worker.info();
+        assert_eq!(info.title.as_deref(), Some("vim edualc"));
+        assert_eq!(info.program, before, "a title is not a program name");
+    }
+
     /// A report that breaks the protocol's rules changes nothing.
     #[tokio::test]
     async fn a_bad_status_report_is_ignored() {

@@ -1,6 +1,13 @@
-//! The bytes of every frozen message. If one of these fails, an edit changed a
-//! released format: put the change in a new version instead, and leave this
-//! file alone.
+//! The bytes of every frozen message. If one of these fails, an edit changed
+//! the format.
+//!
+//! Until the first release v1 is a draft (D54): it may be amended on purpose,
+//! by changing the bytes here for the messages that changed and listing the
+//! change, with its reason, in D54 of `decisions.md`. Never by regenerating
+//! this file until it passes. From the first release on, or as soon as
+//! anything outside the repository could be speaking v1, a change goes in a
+//! new version instead, and this file is left alone. The handshake's own
+//! bytes are frozen for good already.
 //!
 //! Packed bodies are frozen as what they unpack to, not as compressed bytes,
 //! which another zstd build may produce differently.

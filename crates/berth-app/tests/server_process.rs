@@ -23,6 +23,36 @@ fn places(data: &Path) -> Places {
     }
 }
 
+/// Stops every worker still running from a scratch data directory when the
+/// test ends, however it ends. A worker is built to outlive its supervisor,
+/// so one a test leaves behind stays on the machine for good, with its
+/// shell: found 2026-10-10, 41 of them, one for every run of these tests.
+/// Declared before the supervisor, so it runs after the supervisor is gone.
+struct Workers(PathBuf);
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        let Ok(entries) = std::fs::read_dir(places(&self.0).run) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !(name.starts_with('w') && name.ends_with(".pid")) {
+                continue;
+            }
+            if let Some(pid) = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+            {
+                let _ = Command::new("kill")
+                    .arg(pid.to_string())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
 /// The supervisor, killed when the test ends however it ends.
 struct Supervisor(Child);
 
@@ -92,6 +122,7 @@ fn alive(pid: u32) -> bool {
 async fn sessions_run_in_worker_processes_that_outlive_the_supervisor() {
     let dir = tempfile::tempdir().unwrap();
     let data: PathBuf = dir.path().to_path_buf();
+    let _workers = Workers(data.clone());
     let supervisor = start(&data).await;
 
     let mut app = client::connect(&places(&data)).await.unwrap();
@@ -203,6 +234,7 @@ async fn the_hook_script_reports_through_the_worker() {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
     let dir = tempfile::tempdir().unwrap();
     let data: PathBuf = dir.path().to_path_buf();
+    let _workers = Workers(data.clone());
     let _supervisor = start(&data).await;
     let mut app = client::connect(&places(&data)).await.unwrap();
     app.to_server
@@ -262,8 +294,21 @@ async fn the_hook_script_reports_through_the_worker() {
     };
     assert_eq!(claude.state, v1::ClaudeState::Working);
     assert_eq!(claude.cwd.as_deref(), Some("/tmp"));
+    // End the session and see it gone before the supervisor is: a Kill
+    // still on its way when the supervisor dies never arrives.
+    let pid = worker_pid(&data, session).expect("the worker wrote its pid");
     app.to_server
         .send(ToServer::Kill { session })
         .await
         .unwrap();
+    for _ in 0..100 {
+        if worker_pid(&data, session).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        worker_pid(&data, session).is_none(),
+        "the worker ({pid}) did not end with its session"
+    );
 }

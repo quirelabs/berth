@@ -2204,6 +2204,17 @@ mod tests {
         assert_eq!(title(None, None, Some(" "), None), None);
     }
 
+    /// A title is words on a tab and nothing more. The icon and the stone
+    /// come from the process name alone, whatever a title claims.
+    #[test]
+    fn a_title_never_chooses_the_icon() {
+        let claimed = tab_title(None, Some("claude"), Some("vim"), None, None);
+        assert_eq!(claimed.as_deref(), Some("claude"), "shown as written");
+        let program = crate::programs::lookup("vim");
+        assert_eq!(program.icon, crate::icons::VIM);
+        assert_eq!(program.stone, crate::otter::Stone::Plain);
+    }
+
     #[test]
     fn a_directory_is_shortened_to_its_last_part() {
         assert_eq!(short_directory("/Users/j", Some("/Users/j")), "~");

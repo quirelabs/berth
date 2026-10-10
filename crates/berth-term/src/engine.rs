@@ -1352,7 +1352,14 @@ fn build_row(cells: &mut CellIteration<'_, '_>, line: u16, palette: &Palette) ->
     let mut graphemes = ['\0'; 16];
     while let Some(cell) = cells.next() {
         let wide = cell.raw_cell().ok().and_then(|c| c.wide().ok());
-        if !matches!(wide, Some(CellWide::SpacerTail | CellWide::SpacerHead)) {
+        // The second half of a wide glyph has no cell of its own. The
+        // placeholder libghostty leaves in a row's last column when a wide
+        // glyph did not fit and wrapped is drawn as the blank it looks like:
+        // libghostty turns it into an ordinary blank when the wrapped glyph
+        // is overwritten, without marking the row changed, so a row built
+        // before and one built after must not differ (found by the property
+        // test below, 2026-10-10).
+        if !matches!(wide, Some(CellWide::SpacerTail)) {
             let c = match cell.graphemes_len() {
                 Ok(0) | Err(_) => ' ',
                 Ok(len) if len <= graphemes.len() => cell
@@ -1451,6 +1458,32 @@ mod tests {
             Just(b"\x1b[r".to_vec()),
             Just("\u{65e5}".as_bytes().to_vec()),
         ]
+    }
+
+    /// The case the property test found: a wide glyph that wrapped leaves a
+    /// placeholder at the end of the row above, and overwriting the glyph
+    /// changes that placeholder without the row being marked changed.
+    #[test]
+    fn a_wrapped_wide_glyphs_placeholder_is_a_blank_cell() {
+        incremental_matches_full(
+            &[
+                b"a aaa  aa".to_vec(),
+                "\u{65e5}".as_bytes().to_vec(),
+                "\u{65e5}".as_bytes().to_vec(),
+                b"\x1b[2;3r\r\n".to_vec(),
+                b"a".to_vec(),
+            ],
+            0,
+        );
+        // And the row is as wide as the screen while the placeholder is
+        // there, with a blank in its last column.
+        let term = Terminal::new(TermSize::new(12, 4), CellSize::new(8.0, 16.0));
+        term.advance("a aaa  aa\u{65e5}\u{65e5}".as_bytes());
+        let row = term.snapshot().rows[0].clone();
+        assert_eq!(
+            row.last().map(|cell| (cell.column, cell.c)),
+            Some((11, ' '))
+        );
     }
 
     proptest! {
