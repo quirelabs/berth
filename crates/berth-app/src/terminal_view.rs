@@ -71,7 +71,13 @@ pub struct Intake {
     /// When output last arrived: with no frame since, the window is not being
     /// drawn (D50).
     last_output: Mutex<Option<Instant>>,
+    /// When the session last said input was dropped: its program is not
+    /// reading (D50).
+    input_dropped: Mutex<Option<Instant>>,
 }
+
+/// How long a pane says its input was not delivered.
+pub const INPUT_NOTICE_FOR: Duration = Duration::from_secs(5);
 
 /// The first output after a keystroke.
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +96,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Intake {
+    /// The session dropped input: its program is not reading.
+    pub fn note_input_dropped(&self) {
+        *lock(&self.input_dropped) = Some(Instant::now());
+    }
+
+    /// Whether to say so still.
+    pub fn input_dropped_recently(&self) -> bool {
+        lock(&self.input_dropped).is_some_and(|at| at.elapsed() < INPUT_NOTICE_FOR)
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }

@@ -929,6 +929,19 @@ impl Workspace {
                                 .child(strings::local_direct_notice(&reason)),
                         )
                     })
+                    // Input the program did not take is said, not swallowed
+                    // (D50).
+                    .when(pane.view.read(cx).intake.input_dropped_recently(), |this| {
+                        this.child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(3.0))
+                                .text_xs()
+                                .bg(hsla(theme.border))
+                                .text_color(hsla(theme.warning))
+                                .child(strings::INPUT_NOT_DELIVERED),
+                        )
+                    })
                     .child(div().flex().flex_1().min_h_0().child(pane.view.clone()))
                     .into_any_element()
             }

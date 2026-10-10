@@ -32,6 +32,25 @@ pub enum PtyEvent {
     /// A step in rebuilding the terminal beside the one on screen, from the
     /// local server's history (D50). Only the local server sends these.
     Rebuild(berth_term::Shadow),
+    /// Input was dropped: the program is not reading, and what was typed at
+    /// it filled the buffer to the pty (D50). The session carries on.
+    InputDropped,
+}
+
+/// The most input that waits to be written to a local pty, in bytes (D50).
+/// A megabyte is a long paste. Past it the program is not reading, and more
+/// is dropped, and said to be, rather than kept without limit.
+pub const INPUT_AT_MOST: usize = 1024 * 1024;
+
+/// What became of input offered to a pty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offered {
+    /// On its way to the program.
+    Queued,
+    /// Not delivered: the buffer to the pty is full.
+    Dropped,
+    /// The session is gone.
+    Closed,
 }
 
 /// Something the UI wants to do to the other side.
@@ -60,6 +79,10 @@ pub struct Pty {
     pub(crate) pid: Option<u32>,
     /// Asks a local pty which process has the terminal now.
     pub(crate) foreground: Option<Foreground>,
+    /// A local pty's input waiting to be written, in bytes: counted when
+    /// offered, taken off when written. `None` where the far side applies
+    /// its own back-pressure (ssh).
+    pub(crate) queued: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// A local pty's master, shared so the terminal's foreground process can be
@@ -98,8 +121,29 @@ impl Pty {
     }
 
     /// Send bytes as if typed. Returns false once the channel has closed.
+    /// Input a local program is not reading is dropped past
+    /// [`INPUT_AT_MOST`]; [`Pty::offer`] says when.
     pub async fn write(&self, data: impl Into<Vec<u8>>) -> bool {
-        self.input.send(PtyInput::Data(data.into())).await.is_ok()
+        self.offer(data).await != Offered::Closed
+    }
+
+    /// Send bytes as if typed, and say what became of them. Never waits on a
+    /// program that is not reading: a local pty takes input into a buffer of
+    /// at most [`INPUT_AT_MOST`] and drops what does not fit.
+    pub async fn offer(&self, data: impl Into<Vec<u8>>) -> Offered {
+        use std::sync::atomic::Ordering;
+        let data = data.into();
+        if let Some(queued) = &self.queued {
+            if queued.load(Ordering::Relaxed) + data.len() > INPUT_AT_MOST {
+                return Offered::Dropped;
+            }
+            queued.fetch_add(data.len(), Ordering::Relaxed);
+        }
+        if self.input.send(PtyInput::Data(data)).await.is_ok() {
+            Offered::Queued
+        } else {
+            Offered::Closed
+        }
     }
 
     /// Tell the remote the window changed. tmux repaints from its own state.
@@ -214,6 +258,7 @@ pub(crate) async fn open(
             input: input_tx,
             pid: None,
             foreground: None,
+            queued: None,
         },
         output_rx,
     ))
@@ -230,6 +275,7 @@ mod tests {
             input: tx,
             pid: None,
             foreground: None,
+            queued: None,
         };
         drop(rx);
         assert!(!pty.write("x").await);
@@ -243,6 +289,7 @@ mod tests {
             input: tx,
             pid: None,
             foreground: None,
+            queued: None,
         };
         assert!(pty.resize(0, 0).await);
         assert_eq!(rx.recv().await, Some(PtyInput::Resize { cols: 1, rows: 1 }));
@@ -255,6 +302,7 @@ mod tests {
             input: tx,
             pid: None,
             foreground: None,
+            queued: None,
         };
         pty.write("a").await;
         pty.write("b").await;

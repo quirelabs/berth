@@ -9,7 +9,8 @@ use berth_proto::v1::{self, SessionId, ToApp, ToServer};
 use tokio::time::timeout;
 
 use super::client::{self, Client};
-use super::paths::Places;
+use super::link;
+use super::paths::{self, Places};
 use super::supervisor::{self, Config, Launcher};
 use crate::worker::Shell;
 
@@ -657,22 +658,55 @@ async fn typing_and_resizing_at_a_busy_worker_never_freezes_the_session() {
     let _ = second.to_server.send(ToServer::Kill { session }).await;
 }
 
-/// A client that queues more for a worker than the worker takes, a megabyte
-/// of input at a program that is not reading, is disconnected: its own
-/// connection, never the worker. The session is still there for the next
-/// connection.
+/// A client that queues more for a worker than the worker takes is
+/// disconnected: its own connection, never the worker (D50). The worker here
+/// is a stand-in that greets the supervisor, says what it is and then reads
+/// nothing more, which a real worker no longer does; what the client sends
+/// piles up at the supervisor, a megabyte is the limit, and the session is
+/// still there for the next connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
-    let server = server().await;
-    let mut app = client::connect(&server.places).await.unwrap();
-    let session = create(&mut app).await;
-    attach(&mut app, session).await;
-    // Nothing reads the terminal's input for a while.
-    type_line(&app, session, "sleep 20").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    places.prepare().unwrap();
+    let session: SessionId = 7;
+    let mut listener = crate::server::Listener::bind(&places.worker(session))
+        .await
+        .unwrap();
+    paths::write_pid(&places.worker_pid(session)).unwrap();
+    let stand_in = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let mut opened = link::open(stream, &link::hello()).await.unwrap();
+        // Asked what it is, it answers; then it never reads again.
+        let _ = opened.read.recv().await;
+        let info = v1::SessionInfo {
+            id: session,
+            name: "stuck".into(),
+            cwd: None,
+            program: None,
+            cols: 40,
+            rows: 10,
+            claude: None,
+            pid: None,
+            status: None,
+        };
+        let payload = ToApp::Sessions(vec![info]).encode().unwrap();
+        opened.write.send(&payload).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let tasks = Tasks::default();
+    let supervisor = supervise(places.clone(), &tasks, Duration::from_secs(60)).await;
+
+    let mut app = client::connect(&places).await.unwrap();
+    app.to_server
+        .send(ToServer::Attach {
+            session,
+            cols: 40,
+            rows: 10,
+        })
+        .await
+        .unwrap();
     let to_server = app.to_server.clone();
-    // The worker's own queue to the pty holds 256 messages; past that it
-    // stops taking, and what the client sends piles up at the supervisor.
     let paste = tokio::spawn(async move {
         for _ in 0..1024 {
             let message = ToServer::Input {
@@ -691,7 +725,7 @@ async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
     assert!(closed.is_ok(), "the flooding client was not disconnected");
     paste.abort();
 
-    let mut next_app = client::connect(&server.places).await.unwrap();
+    let mut next_app = client::connect(&places).await.unwrap();
     next_app
         .to_server
         .send(ToServer::ListSessions)
@@ -707,15 +741,85 @@ async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
     .await
     .unwrap();
     assert!(listed, "the session went with its client");
+    assert!(!stand_in.is_finished(), "the worker was dropped");
+    supervisor.abort();
+    stand_in.abort();
+}
+
+/// "End session" always works (D50). A program that never reads its input,
+/// 64 MB typed at it, then Kill: the session ends within two seconds and
+/// its worker goes. The worker used to wait on its full queue to the pty,
+/// stop reading its supervisor, and never hear the Kill.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_whose_program_reads_nothing_can_still_be_ended() {
+    let server = server().await;
+    let mut app = client::connect(&server.places).await.unwrap();
+    let session = create(&mut app).await;
+    attach(&mut app, session).await;
+    // The shell says it is about to and then becomes `sleep`, so nothing
+    // reads the terminal from the moment the mark shows.
+    type_line(&app, session, "echo asleep_$((1+1)); exec sleep 600").await;
+    until_output_within(&mut app, "asleep_2", Duration::from_secs(20)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let to_server = app.to_server.clone();
+    let paste = tokio::spawn(async move {
+        for _ in 0..1024 {
+            let message = ToServer::Input {
+                session,
+                bytes: vec![b'x'; 64 * 1024],
+            };
+            if to_server.send(message).await.is_err() {
+                return;
+            }
+        }
+    });
+    // Reading meanwhile, as an app does, until it is told, which may be a
+    // moment after the last of the paste has gone.
+    let told = timeout(Duration::from_secs(30), async {
+        loop {
+            match app.from_server.recv().await {
+                Some(ToApp::Event {
+                    event: v1::Event::InputDropped,
+                    ..
+                }) => return true,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    let _ = paste.await;
+
+    // Whoever asks, on a connection with nothing queued behind it.
+    let ender = client::connect(&server.places).await.unwrap();
+    let asked = std::time::Instant::now();
+    ender
+        .to_server
+        .send(ToServer::Kill { session })
+        .await
+        .unwrap();
+    let gone = timeout(Duration::from_secs(2), async {
+        loop {
+            if !server
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&session)
+                .is_some_and(|task| !task.is_finished())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     assert!(
-        server
-            .tasks
-            .lock()
-            .unwrap()
-            .get(&session)
-            .is_some_and(|task| !task.is_finished()),
-        "the worker was stopped"
+        gone.is_ok(),
+        "the session did not end within two seconds of being told to"
     );
+    eprintln!("ended in {:?}", asked.elapsed());
+    assert!(told, "the app was never told its input was not delivered");
 }
 
 /// A client that keeps up at the rates of normal work, a fast build log at a

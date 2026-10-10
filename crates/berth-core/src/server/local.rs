@@ -225,6 +225,8 @@ impl LocalServer {
                 input,
                 pid,
                 foreground: None,
+                // The worker holds the buffer and says when it drops.
+                queued: None,
             },
             events,
         ))
@@ -407,6 +409,10 @@ async fn translate(
                 }
                 out.push(PtyEvent::Output(bytes));
             }
+            ToApp::Event {
+                event: v1::Event::InputDropped,
+                ..
+            } => out.push(PtyEvent::InputDropped),
             ToApp::Event {
                 event: v1::Event::Exited { code },
                 ..

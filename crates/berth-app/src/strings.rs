@@ -155,6 +155,9 @@ pub fn status_tooltip(
     text
 }
 
+/// Typed or pasted input the session's program did not take (D50).
+pub const INPUT_NOT_DELIVERED: &str = "Input not delivered: the program isn't reading.";
+
 pub const RENAME_TITLE: &str = "Name this session";
 pub const RENAME_ACCEPT: &str = "Rename";
 pub const RENAME_REJECT: &str = "Cancel";

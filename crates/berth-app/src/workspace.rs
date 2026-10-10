@@ -465,6 +465,15 @@ impl Workspace {
             self.set_window_seen(seen, server.clone(), cx);
         }
         self.check_status_seen(server, cx);
+        // A pane saying its input was not delivered is drawn again each
+        // look, so the notice comes and goes on time.
+        if self
+            .panes
+            .iter()
+            .any(|p| p.view.read(cx).intake.input_dropped_recently())
+        {
+            cx.notify();
+        }
     }
 
     /// A finished or failed program status stays on the icon until the user

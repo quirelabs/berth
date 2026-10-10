@@ -441,10 +441,26 @@ pub async fn open_shell(
         let _ = reads.blocking_send(PtyEvent::Closed);
     });
 
-    // Writes and resizes share a thread because both need the master, and
-    // because a write that blocks must not stall the reader. The master is
-    // shared so the terminal's foreground process can be asked for, and taken
-    // out when the pty closes, so holding a handle never keeps the shell up.
+    // Writing has a thread to itself, because a write blocks for as long as
+    // the program does not read. What waits for it is counted in bytes: the
+    // handle stops taking input past `INPUT_AT_MOST` (D50).
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (to_writer, from_dispatch) = std::sync::mpsc::channel::<Vec<u8>>();
+    let written = queued.clone();
+    std::thread::spawn(move || {
+        while let Ok(bytes) = from_dispatch.recv() {
+            let ok = writer.write_all(&bytes).is_ok() && writer.flush().is_ok();
+            written.fetch_sub(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+            if !ok {
+                break;
+            }
+        }
+    });
+
+    // Everything else, resizing and closing, never waits behind input: this
+    // thread only hands input on. The master is shared so the terminal's
+    // foreground process can be asked for, and taken out when the pty
+    // closes, so holding a handle never keeps the shell up.
     let foreground = crate::pty::Foreground(std::sync::Arc::new(std::sync::Mutex::new(Some(
         pair.master,
     ))));
@@ -453,7 +469,7 @@ pub async fn open_shell(
         while let Some(request) = input_rx.blocking_recv() {
             match request {
                 PtyInput::Data(bytes) => {
-                    if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
+                    if to_writer.send(bytes).is_err() {
                         break;
                     }
                 }
@@ -473,8 +489,19 @@ pub async fn open_shell(
                 PtyInput::Close => break,
             }
         }
-        // Dropping the master hangs up the shell, which ends the reader.
+        // Closed. Dropping the master hangs up the shell, which ends the
+        // reader, but not while a write to a program that is not reading
+        // still holds the pty open: so the session's processes are told
+        // directly, and then made to go (D50).
         let taken = master.lock().ok().and_then(|mut m| m.take());
+        #[cfg(unix)]
+        end_processes(
+            pid,
+            taken
+                .as_ref()
+                .and_then(|master| master.process_group_leader())
+                .and_then(|leader| u32::try_from(leader).ok()),
+        );
         drop(taken);
     });
 
@@ -483,9 +510,45 @@ pub async fn open_shell(
             input: input_tx,
             pid,
             foreground: Some(foreground),
+            queued: Some(queued),
         },
         output_rx,
     ))
+}
+
+/// How long a session's processes have to go after a hang-up before they are
+/// killed.
+#[cfg(unix)]
+const END_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// End a session's processes whether or not they are reading: a hang-up to
+/// the shell's process group and to the group that has the terminal, then,
+/// for any still there after [`END_GRACE`], a kill. Through `kill`, which
+/// needs no libc binding; a negative number names a process group.
+#[cfg(unix)]
+fn end_processes(shell: Option<u32>, foreground: Option<u32>) {
+    let mut groups: Vec<u32> = shell.into_iter().chain(foreground).collect();
+    groups.dedup();
+    let signal = |name: &str, group: u32| {
+        std::process::Command::new("kill")
+            .args([name, "--", &format!("-{group}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    for group in &groups {
+        signal("-HUP", *group);
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(END_GRACE);
+        for group in groups {
+            // Signal 0 only asks whether anything is left in the group.
+            if signal("-0", group) {
+                signal("-KILL", group);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -516,7 +579,7 @@ mod tests {
                     }
                 }
                 PtyEvent::Closed => return seen,
-                PtyEvent::Exit(_) | PtyEvent::Rebuild(_) => {}
+                PtyEvent::Exit(_) | PtyEvent::Rebuild(_) | PtyEvent::InputDropped => {}
             }
         }
         seen

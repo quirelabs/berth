@@ -106,6 +106,9 @@ pub struct Worker {
     /// Told whenever the terminal has published something new, which is
     /// when there may be status reports to take.
     status_wake: Arc<tokio::sync::Notify>,
+    /// Input is being dropped: the program is not reading. Set so the app
+    /// is told when it starts, not for every keystroke after.
+    dropping_input: std::sync::atomic::AtomicBool,
 }
 
 /// A session's program status, and what is still to be told about it.
@@ -190,6 +193,7 @@ impl Worker {
                 seq,
                 status: Mutex::new(Status::default()),
                 status_wake,
+                dropping_input: std::sync::atomic::AtomicBool::new(false),
             },
             rx,
         ))
@@ -209,9 +213,24 @@ impl Worker {
     /// refused here by name.
     pub async fn handle(&self, message: ToServer) -> Option<ToApp> {
         match message {
+            // Never waits on the program: input it is not reading fills a
+            // buffer of a megabyte and is then dropped, and the app is told
+            // once, when the dropping starts (D50).
             ToServer::Input { bytes, .. } => {
-                self.pty.write(bytes).await;
-                None
+                use std::sync::atomic::Ordering;
+                match self.pty.offer(bytes).await {
+                    crate::pty::Offered::Dropped => {
+                        let first = !self.dropping_input.swap(true, Ordering::Relaxed);
+                        first.then_some(ToApp::Event {
+                            session: self.session,
+                            event: v1::Event::InputDropped,
+                        })
+                    }
+                    _ => {
+                        self.dropping_input.store(false, Ordering::Relaxed);
+                        None
+                    }
+                }
             }
             ToServer::Resize { cols, rows, .. } => {
                 self.resize(cols, rows).await;
@@ -524,7 +543,7 @@ fn pump(
                 },
             },
             PtyEvent::Closed => break,
-            PtyEvent::Rebuild(_) => continue,
+            PtyEvent::Rebuild(_) | PtyEvent::InputDropped => continue,
         };
         if tx.blocking_send(message).is_err() {
             // Nobody is listening any more. The shell keeps running only as

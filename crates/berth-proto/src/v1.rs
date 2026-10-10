@@ -161,6 +161,10 @@ pub enum Event {
     /// These status records are gone, by id: cleared, or dropped when their
     /// program exited or a new prompt began.
     StatusGone(Vec<String>),
+    /// Input for the session was dropped: the program is not reading, and
+    /// what was typed at it has filled the worker's buffer (1 MB). The
+    /// session and its worker carry on; the app says so (D50).
+    InputDropped,
 }
 
 /// One program status record (OSC 7501, the Program Status Protocol), as
