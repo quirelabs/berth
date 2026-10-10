@@ -59,11 +59,11 @@ jobs:
           cat "$name.sha256"
 
       # The x86_64 build runs on the runner too: the modes start, and a small
-      # throughput run gets through the whole server path. CJK, which has no
-      # floor: a shared runner says nothing about the floor, berth-test does.
+      # throughput run gets through the whole server path. Not judged against
+      # tmux: a shared runner says nothing about the gate, berth-test does.
       - name: Runs
         if: startsWith(matrix.target, 'x86_64')
-        run: dist/berth-server-${{ matrix.target }} --bench-throughput cjk --mb 4
+        run: dist/berth-server-${{ matrix.target }} --bench-throughput cjk --mb 4 --no-tmux
 
       - uses: actions/upload-artifact@v4
         with:

@@ -2,9 +2,12 @@
 //! through the whole server path, a pty, a worker parsing it, the supervisor
 //! and a client confirming it, per kind of output.
 //!
-//! D49 set the floor at twice tmux's rate per kind of output, measured on
-//! `berth-test`: 28 MB/s plain, 32 MB/s coloured, 24 MB/s emoji. A run prints
-//! each kind's rate and fails if any is under its floor.
+//! The gate is relative (D49, D50): for each kind of output the worker must
+//! drain at least [`GATE`] times as fast as tmux does, measured in the same
+//! run on the same host and timed the same way, until the terminal has
+//! parsed everything. [`TARGET`] times tmux is the aim. A run prints each
+//! kind's rate and its multiple of tmux's, and fails if any is under the
+//! gate.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,6 +21,13 @@ use crate::error::{Error, Result};
 use crate::worker::Shell;
 
 const MB: usize = 1024 * 1024;
+
+/// The least a worker's drain rate may be, as a multiple of tmux's on the
+/// same stream in the same run.
+pub const GATE: f64 = 1.5;
+
+/// What the worker's drain rate is meant to reach, as a multiple of tmux's.
+pub const TARGET: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -41,16 +51,6 @@ impl Kind {
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.name() == name)
-    }
-
-    /// The floor in MB/s, where D49 set one.
-    pub fn floor(self) -> Option<f64> {
-        match self {
-            Kind::Plain => Some(28.0),
-            Kind::Coloured => Some(32.0),
-            Kind::Emoji => Some(24.0),
-            Kind::Cjk => None,
-        }
     }
 
     /// One block of lines, repeated to the size asked for. The same shapes
@@ -102,11 +102,66 @@ impl Rate {
         self.bytes as f64 / MB as f64 / self.seconds
     }
 
-    pub fn passes(&self) -> bool {
-        self.kind
-            .floor()
-            .is_none_or(|floor| self.mb_per_s() >= floor)
+    /// This rate as a multiple of tmux's on the same stream.
+    pub fn times(&self, tmux_mb_per_s: f64) -> f64 {
+        self.mb_per_s() / tmux_mb_per_s
     }
+}
+
+/// How fast tmux drains the same stream on this host, in MB/s, timed as the
+/// worker is: from the command until the terminal has parsed everything,
+/// which for tmux is its pane showing the end mark. `None` where there is no
+/// tmux, or it will not run.
+///
+/// Its own server on a socket inside `scratch`, so it touches no session of
+/// the user's and goes with the scratch directory.
+pub fn tmux_rate(kind: Kind, megabytes: usize, scratch: &Path) -> Option<f64> {
+    use std::process::{Command, Stdio};
+    let file = scratch.join(format!("{}.tmux.txt", kind.name()));
+    let bytes = write_stream(kind, &file, megabytes).ok()?;
+    let socket = scratch.join("tmux.sock");
+    let tmux = |args: &[&str]| {
+        Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+    };
+    let started = tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "bench",
+        "-x",
+        "100",
+        "-y",
+        "30",
+        "sh",
+    ]);
+    let rate = started.and_then(|_| {
+        std::thread::sleep(Duration::from_millis(500));
+        let command = format!("cat '{}'; echo BENCH_DO\"\"NE", file.display());
+        let begun = Instant::now();
+        tmux(&["send-keys", "-t", "bench", &command, "Enter"])?;
+        loop {
+            let pane = tmux(&["capture-pane", "-p", "-t", "bench"])?;
+            if String::from_utf8_lossy(&pane.stdout).contains("BENCH_DONE") {
+                break Some(bytes as f64 / MB as f64 / begun.elapsed().as_secs_f64());
+            }
+            if begun.elapsed() > Duration::from_secs(600) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let _ = tmux(&["kill-server"]);
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&file);
+    rate
 }
 
 /// The next message, confirmed as an app confirms it.
@@ -563,18 +618,22 @@ pub async fn measure(
     result
 }
 
-/// `--bench-throughput [kind ...] [--mb N] [--in-process] [--write DIR]`:
-/// each kind's rate, against its floor, and on Linux each process's CPU time
-/// and page faults. The rate is the worker's drain rate: until the worker
-/// has parsed everything, as the tmux baseline it is held against was timed
-/// (D49, D50). What reached the client, how and how fast is printed beside
-/// it. Fails if any rate is under its floor. The server runs as
+/// `--bench-throughput [kind ...] [--mb N] [--in-process] [--no-tmux]
+/// [--write DIR]`: each kind's rate, as a multiple of tmux's on the same
+/// stream just before it, and on Linux each process's CPU time and page
+/// faults. The rate is the worker's drain rate: until the worker has parsed
+/// everything, as tmux is timed (D49, D50). What reached the client, how
+/// and how fast is printed beside it. Fails if any rate is under [`GATE`]
+/// times tmux's. Without tmux, or with `--no-tmux`, the rates are printed
+/// and not judged: a shared CI runner says nothing about the gate. The
+/// server runs as
 /// processes, as it ships, unless `--in-process`. With `--write`, only writes
 /// the streams into DIR instead, so tmux can be timed on the same bytes.
 pub async fn run_process(args: &[String]) -> Result<bool> {
     let mut kinds = Vec::new();
     let mut megabytes = 64;
     let mut write = None;
+    let mut against_tmux = true;
     let mut servers = if cfg!(unix) {
         Servers::Processes
     } else {
@@ -589,6 +648,8 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                 .ok_or_else(|| Error::Server("--mb needs a number".into()))?;
         } else if arg == "--in-process" {
             servers = Servers::InProcess;
+        } else if arg == "--no-tmux" {
+            against_tmux = false;
         } else if arg == "--write" {
             write =
                 Some(PathBuf::from(it.next().ok_or_else(|| {
@@ -616,16 +677,39 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
     std::fs::create_dir_all(&scratch)?;
     let mut all = true;
     for kind in kinds {
+        // tmux first, on the same stream, moments before: same host, same
+        // load, same way of timing.
+        let tmux = if against_tmux {
+            let dir = scratch.clone();
+            tokio::task::spawn_blocking(move || tmux_rate(kind, megabytes, &dir))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         match measure(kind, megabytes, &scratch, servers).await {
             Ok(Report {
                 rate,
                 usage,
                 delivered,
             }) => {
-                let verdict = match kind.floor() {
-                    Some(floor) if rate.passes() => format!("PASS (floor {floor:.0})"),
-                    Some(floor) => format!("FAIL (floor {floor:.0})"),
-                    None => "no floor".to_string(),
+                let verdict = match tmux {
+                    Some(tmux) => {
+                        let times = rate.times(tmux);
+                        let word = if times >= TARGET {
+                            "PASS, at target"
+                        } else if times >= GATE {
+                            "PASS, under target"
+                        } else {
+                            all = false;
+                            "FAIL"
+                        };
+                        format!(
+                            "{times:.2}x tmux ({tmux:.1} MB/s)  {word} (gate {GATE}x, target {TARGET:.0}x)"
+                        )
+                    }
+                    None => "not judged: no tmux".to_string(),
                 };
                 println!(
                     "{:<9} {:>6.1} MB/s  {} MB in {:.2} s  {verdict}",
@@ -656,7 +740,6 @@ pub async fn run_process(args: &[String]) -> Result<bool> {
                         used.user, used.system, used.minor_faults, used.major_faults
                     );
                 }
-                all &= rate.passes();
             }
             Err(error) => {
                 println!("{:<9} did not finish: {error}", kind.name());

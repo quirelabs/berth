@@ -157,7 +157,9 @@ struct Sheet {
 
 #[derive(Deserialize)]
 struct Provider {
-    colors: HashMap<String, String>,
+    /// Per theme, like the palette: `light` and `dark`, each with `base`,
+    /// `hi` and `shade`.
+    colors: HashMap<String, HashMap<String, String>>,
     shape: Vec<String>,
 }
 
@@ -219,10 +221,11 @@ fn hex(colour: &str) -> Option<Rgba> {
 pub fn runs(pose: Pose, frame: usize, stone: Stone, appearance: Appearance) -> Option<Vec<Run>> {
     let sheet = sheet()?;
     let (width, height) = sheet.size;
-    let palette = sheet.palette.get(match appearance {
+    let theme = match appearance {
         Appearance::Dark => "dark",
         Appearance::Light => "light",
-    })?;
+    };
+    let palette = sheet.palette.get(theme)?;
     let frame = sheet.states.get(pose.key())?.frames.get(frame)?;
     let mut grid: Vec<Vec<Option<Rgba>>> = vec![vec![None; width as usize]; height as usize];
     for (y, row) in frame.pixels.iter().enumerate().take(height as usize) {
@@ -237,6 +240,7 @@ pub fn runs(pose: Pose, frame: usize, stone: Stone, appearance: Appearance) -> O
     // The stone goes on after the pixels. Sunk, it is all in its shade and
     // cut off at the bottom edge.
     let provider = sheet.providers.get(stone.key())?;
+    let stone_colours = provider.colors.get(theme)?;
     for (dy, row) in provider.shape.iter().enumerate() {
         for (dx, key) in row.chars().enumerate() {
             let name = match (key, frame.stone.sunk) {
@@ -247,7 +251,7 @@ pub fn runs(pose: Pose, frame: usize, stone: Stone, appearance: Appearance) -> O
             };
             let (x, y) = (frame.stone.col as usize + dx, frame.stone.row as usize + dy);
             if y < height as usize && x < width as usize {
-                grid[y][x] = Some(hex(provider.colors.get(name)?)?);
+                grid[y][x] = Some(hex(stone_colours.get(name)?)?);
             }
         }
     }

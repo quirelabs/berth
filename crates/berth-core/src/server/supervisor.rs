@@ -78,20 +78,50 @@ enum Event {
 /// confirmations, and 2026-10-10 for everything else: a key typed into a
 /// flooded session froze it for good).
 ///
-/// What must arrive (input, attach, kill and the rest) queues without limit;
-/// it comes at the pace of a user, a few bytes at a time. Confirmations are
+/// What must arrive (input, attach, kill and the rest) is queued, and what
+/// each client has queued and not yet written is counted against that
+/// client ([`MUST_AT_MOST`]): a freeze is not traded for memory without
+/// limit. A client over its limit is disconnected, never the worker; it
+/// connects again and attaches to a fresh screen. Confirmations are
 /// cumulative, so one that finds its queue full is dropped and carried by
 /// the next.
 #[derive(Clone)]
 struct ToWorker {
-    must: mpsc::UnboundedSender<ToServer>,
+    must: mpsc::UnboundedSender<(ToServer, Owed)>,
     confirmations: mpsc::Sender<ToServer>,
+}
+
+/// The most one client may have queued for workers and not yet written, in
+/// bytes. A megabyte is a long paste; past it the client is not typing, it
+/// is flooding a worker that is not reading.
+const MUST_AT_MOST: usize = 1024 * 1024;
+
+/// A queued message's weight on its client's count, taken off when the
+/// message is written to the worker or dropped with its queue.
+struct Owed {
+    by: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for Owed {
+    fn drop(&mut self) {
+        self.by
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// What a message weighs in a queue: its bytes, and a little for itself.
+fn weight(message: &ToServer) -> usize {
+    32 + match message {
+        ToServer::Input { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
 }
 
 impl ToWorker {
     /// Queue a message that must arrive. False if the worker is gone.
-    fn send(&self, message: ToServer) -> bool {
-        self.must.send(message).is_ok()
+    fn send(&self, message: ToServer, owed: Owed) -> bool {
+        self.must.send((message, owed)).is_ok()
     }
 
     /// Hand over a confirmation if there is room.
@@ -119,6 +149,8 @@ struct Session {
 /// keeps it from staying behind for good.
 struct ClientQueue {
     tx: mpsc::Sender<ToApp>,
+    /// Bytes this client has queued for workers that are not yet written.
+    owed: Arc<std::sync::atomic::AtomicUsize>,
     behind: bool,
     /// Sessions whose next screen this client must get before their output.
     awaiting: HashSet<SessionId>,
@@ -324,7 +356,8 @@ impl State {
         queue.awaiting = attached.iter().map(|(id, _, _)| *id).collect();
         tracing::info!(client, sessions = attached.len(), "a client caught up");
         for (session, cols, rows) in attached {
-            self.to_worker(
+            self.queue_for_worker(
+                client,
                 session,
                 ToServer::Attach {
                     session,
@@ -336,10 +369,46 @@ impl State {
         }
     }
 
-    async fn to_worker(&self, session: SessionId, message: ToServer) -> bool {
-        match self.sessions.get(&session) {
-            Some(entry) => entry.to_worker.send(message),
-            None => false,
+    /// Queue a client's message for a session's worker. False if there is
+    /// no such session. Never waits. A client whose queued messages pass
+    /// [`MUST_AT_MOST`] is disconnected here, and the message with it.
+    async fn queue_for_worker(
+        &mut self,
+        client: ClientId,
+        session: SessionId,
+        message: ToServer,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.sessions.contains_key(&session) {
+            return false;
+        }
+        let Some(owed) = self.clients.get(&client).map(|queue| queue.owed.clone()) else {
+            // The client is gone; so is what it asked.
+            return true;
+        };
+        let bytes = weight(&message);
+        if owed.load(Ordering::Relaxed) + bytes > MUST_AT_MOST {
+            tracing::warn!(
+                client,
+                session,
+                "a client queued more than a worker is taking: disconnected"
+            );
+            self.drop_client(client);
+            return true;
+        }
+        owed.fetch_add(bytes, Ordering::Relaxed);
+        let owed = Owed { by: owed, bytes };
+        self.sessions
+            .get(&session)
+            .is_some_and(|entry| entry.to_worker.send(message, owed))
+    }
+
+    /// Forget a client: its queue closes, which ends its connection, and no
+    /// session counts it as attached. The sessions themselves are untouched.
+    fn drop_client(&mut self, client: ClientId) {
+        self.clients.remove(&client);
+        for session in self.sessions.values_mut() {
+            session.attached.remove(&client);
         }
     }
 
@@ -350,17 +419,13 @@ impl State {
                     id,
                     ClientQueue {
                         tx,
+                        owed: Arc::default(),
                         behind: false,
                         awaiting: HashSet::new(),
                     },
                 );
             }
-            Event::ClientGone(id) => {
-                self.clients.remove(&id);
-                for session in self.sessions.values_mut() {
-                    session.attached.remove(&id);
-                }
-            }
+            Event::ClientGone(id) => self.drop_client(id),
             Event::ClientSaid(id, message) => self.client_said(id, message).await,
             Event::CaughtUp(id) => self.caught_up(id).await,
             Event::WorkerUp {
@@ -522,7 +587,7 @@ impl State {
                 entry.attached.insert(client);
                 entry.info.cols = cols;
                 entry.info.rows = rows;
-                self.to_worker(session, message).await;
+                self.queue_for_worker(client, session, message).await;
             }
             ToServer::Detach { session } => {
                 if let Some(entry) = self.sessions.get_mut(&session) {
@@ -562,14 +627,15 @@ impl State {
                     .map(|(id, _)| *id)
                     .collect();
                 for session in attached {
-                    self.to_worker(session, message.clone()).await;
+                    self.queue_for_worker(client, session, message.clone())
+                        .await;
                 }
             }
         }
     }
 
     async fn forward(&mut self, client: ClientId, session: SessionId, message: ToServer) {
-        if !self.to_worker(session, message).await {
+        if !self.queue_for_worker(client, session, message).await {
             self.refuse(client, format!("session {session}"), "no such session");
         }
     }
@@ -656,7 +722,7 @@ impl State {
                     return;
                 }
             };
-            let (must, mut must_go) = mpsc::unbounded_channel::<ToServer>();
+            let (must, mut must_go) = mpsc::unbounded_channel::<(ToServer, Owed)>();
             let (confirmations, mut confirmed) = mpsc::channel::<ToServer>(QUEUE);
             let to_worker = ToWorker {
                 must,
@@ -667,15 +733,17 @@ impl State {
                 loop {
                     // What must arrive first: a key typed is not kept behind
                     // a backlog of confirmations.
-                    let message = tokio::select! {
+                    let (message, _owed) = tokio::select! {
                         biased;
-                        message = must_go.recv() => message,
-                        message = confirmed.recv() => message,
+                        Some((message, owed)) = must_go.recv() => (message, Some(owed)),
+                        Some(message) = confirmed.recv() => (message, None),
+                        else => break,
                     };
-                    let Some(message) = message else { break };
                     let Ok(payload) = message.encode() else {
                         continue;
                     };
+                    // `_owed` is held until the message is written: only
+                    // then is it off its client's count.
                     if write.send(&payload).await.is_err() {
                         break;
                     }

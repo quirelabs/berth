@@ -150,6 +150,13 @@ async fn until_output(client: &mut Client, needle: &str) {
     }
 }
 
+/// As [`until_output`], failing if it takes longer than `within`.
+async fn until_output_within(client: &mut Client, needle: &str, within: Duration) {
+    timeout(within, until_output(client, needle))
+        .await
+        .unwrap_or_else(|_| panic!("{needle:?} did not come within {within:?}"));
+}
+
 async fn type_line(client: &Client, session: SessionId, line: &str) {
     client
         .to_server
@@ -571,6 +578,144 @@ async fn ending_a_session_two_apps_have_open_ends_it() {
     .await;
     assert!(gone.is_ok(), "the worker outlived its session");
     drop(second);
+}
+
+/// The supervisor must never wait on a worker (2026-10-10). While a worker
+/// is busy, here flooding and building its whole history for an attach on
+/// top, the client types, resizes and confirms without pause, and reads
+/// nothing. The session must stay responsive: the supervisor keeps taking
+/// what the client sends, and a command typed afterwards is answered.
+///
+/// This holds the behaviour; it is not a reproduction. The supervisor used
+/// to wait on a bounded queue to hand a worker anything but a confirmation,
+/// which by reading could leave both waiting on each other for good, but
+/// this test, and two other shapes of it, also pass on that code.
+#[tokio::test(flavor = "multi_thread")]
+async fn typing_and_resizing_at_a_busy_worker_never_freezes_the_session() {
+    let server = server().await;
+    let mut app = client::connect(&server.places).await.unwrap();
+    let session = create(&mut app).await;
+    attach(&mut app, session).await;
+    // A flood that outlasts the rounds below, so raw output is on its way
+    // to the supervisor the whole time and the worker holds a full history.
+    type_line(&app, session, "yes berth_flood_line_of_some_length").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Nobody reads from here on, as an app that is busy would not. Each
+    // round asks for the history again and sends, on its heels, far more
+    // than the worker can take while it builds it.
+    let to_server = app.to_server.clone();
+    let busy = tokio::spawn(async move {
+        for round in 0..10u64 {
+            let attach = ToServer::Attach {
+                session,
+                cols: 40,
+                rows: 10,
+            };
+            if to_server.send(attach).await.is_err() {
+                return;
+            }
+            for n in 0..4000u64 {
+                let message = match n % 100 {
+                    99 => ToServer::Input {
+                        session,
+                        bytes: Vec::new(),
+                    },
+                    98 => ToServer::Resize {
+                        session,
+                        cols: 40 + (round % 2) as u16,
+                        rows: 10,
+                    },
+                    _ => ToServer::Confirmed { session, seq: n },
+                };
+                if to_server.send(message).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    timeout(Duration::from_secs(60), busy)
+        .await
+        .expect("the supervisor stopped taking what the client sent")
+        .unwrap();
+
+    // A second connection, with nothing queued behind it, asks the session
+    // something: it answers.
+    let mut second = client::connect(&server.places).await.unwrap();
+    attach(&mut second, session).await;
+    // Ctrl-C ends the flood; then the shell answers.
+    second
+        .to_server
+        .send(ToServer::Input {
+            session,
+            bytes: vec![3],
+        })
+        .await
+        .unwrap();
+    type_line(&second, session, "echo alive_$((3+4))").await;
+    until_output_within(&mut second, "alive_7", Duration::from_secs(30)).await;
+    let _ = second.to_server.send(ToServer::Kill { session }).await;
+}
+
+/// A client that queues more for a worker than the worker takes, a megabyte
+/// of input at a program that is not reading, is disconnected: its own
+/// connection, never the worker. The session is still there for the next
+/// connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
+    let server = server().await;
+    let mut app = client::connect(&server.places).await.unwrap();
+    let session = create(&mut app).await;
+    attach(&mut app, session).await;
+    // Nothing reads the terminal's input for a while.
+    type_line(&app, session, "sleep 20").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let to_server = app.to_server.clone();
+    // The worker's own queue to the pty holds 256 messages; past that it
+    // stops taking, and what the client sends piles up at the supervisor.
+    let paste = tokio::spawn(async move {
+        for _ in 0..1024 {
+            let message = ToServer::Input {
+                session,
+                bytes: vec![b'x'; 64 * 1024],
+            };
+            if to_server.send(message).await.is_err() {
+                return;
+            }
+        }
+    });
+    let closed = timeout(Duration::from_secs(20), async {
+        while app.from_server.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "the flooding client was not disconnected");
+    paste.abort();
+
+    let mut next_app = client::connect(&server.places).await.unwrap();
+    next_app
+        .to_server
+        .send(ToServer::ListSessions)
+        .await
+        .unwrap();
+    let listed = timeout(Duration::from_secs(10), async {
+        loop {
+            if let ToApp::Sessions(list) = next(&mut next_app).await {
+                return list.iter().any(|s| s.id == session);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(listed, "the session went with its client");
+    assert!(
+        server
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&session)
+            .is_some_and(|task| !task.is_finished()),
+        "the worker was stopped"
+    );
 }
 
 /// A client that keeps up at the rates of normal work, a fast build log at a
