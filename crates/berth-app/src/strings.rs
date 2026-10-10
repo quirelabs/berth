@@ -155,6 +155,12 @@ pub fn status_tooltip(
     text
 }
 
+/// What the status mark on a tab means (D53).
+pub const STATUS_NEEDS_YOU: &str = "Needs you.";
+pub const STATUS_DONE: &str = "Finished.";
+pub const STATUS_ERROR: &str = "Failed.";
+pub const STATUS_WORKING: &str = "Working.";
+
 /// Typed or pasted input the session's program did not take (D50).
 pub const INPUT_NOT_DELIVERED: &str = "Input not delivered: the program isn't reading.";
 

@@ -255,8 +255,9 @@ impl Workspace {
                 };
                 reported = false;
 
-                let found =
-                    crate::sidebar::listing(&berth_core::agents::parse_scan(&output));
+                let scan = berth_core::agents::parse_scan(&output);
+                let found = crate::sidebar::listing(&scan);
+                let programs = crate::sidebar::programs(&scan);
 
                 let updated = this.update(cx, |this, cx| {
                     // Repaint only on a change, or this is a wakeup every five
@@ -264,6 +265,14 @@ impl Workspace {
                     // Nothing recorded and nothing found is not a change,
                     // or every host logs one at startup for a picture that was
                     // always empty.
+                    // What runs where is drawn too: an icon on a tab, a
+                    // stone in the sidebar.
+                    if this.programs.get(&alias) != Some(&programs)
+                        && !(programs.is_empty() && !this.programs.contains_key(&alias))
+                    {
+                        this.programs.insert(alias.clone(), programs);
+                        cx.notify();
+                    }
                     let changed = presence_changed(this.running.get(&alias), &found);
                     if changed {
                         let agents = found.values().filter(|a| **a).count();
@@ -278,17 +287,6 @@ impl Workspace {
             }
         })
         .detach();
-    }
-
-    /// Whether an agent is running in a pane's session.
-    pub(super) fn has_agent(&self, pane: &Pane) -> bool {
-        !pane.is_local()
-            && self
-                .running
-                .get(pane.alias())
-                .and_then(|sessions| sessions.get(&pane.slug))
-                .copied()
-                .unwrap_or(false)
     }
 
     /// A first RTT sample for the status bar.

@@ -112,6 +112,59 @@ impl Pose {
     }
 }
 
+/// The working arc on a tab: how often it turns, and through how many
+/// positions a full turn goes.
+pub const ARC_EVERY: Duration = Duration::from_millis(100);
+pub const ARC_POSITIONS: usize = 8;
+
+/// Where the working arc is `shown` after the clock began, and how long
+/// until it turns again. Still, it rests in its first position and asks for
+/// nothing.
+pub fn arc_at(shown: Duration, still: bool) -> (usize, Option<Duration>) {
+    if still {
+        return (0, None);
+    }
+    let every = ARC_EVERY.as_millis();
+    let at = shown.as_millis();
+    (
+        (at / every) as usize % ARC_POSITIONS,
+        Some(Duration::from_millis((every - at % every) as u64)),
+    )
+}
+
+/// How long until anything on screen has another frame: the one timer every
+/// icon shares is set for this, and not set at all for `None`. Otters are
+/// given by pose and how long each has been showing; `arcs` says a tab is
+/// showing the working arc, turning since `clock`. Nothing moves with motion
+/// reduced (`still`) or while the window is not drawn (`seen` false), so a
+/// window of idle sessions, or a hidden one, costs no wakeups.
+pub fn next_wake(
+    otters: &[(Pose, Duration)],
+    arcs: bool,
+    clock: Duration,
+    still: bool,
+    seen: bool,
+) -> Option<Duration> {
+    if !seen {
+        return None;
+    }
+    otters
+        .iter()
+        .filter_map(|(pose, shown)| pose.frame_at(*shown, still).1)
+        .chain(arcs.then(|| arc_at(clock, still).1).flatten())
+        .min()
+}
+
+/// A colour of the otter's palette by its token (`need`, `done`, `error`),
+/// for the status dot on a tab, which speaks in the otter's colours.
+pub fn colour(token: &str, appearance: Appearance) -> Option<Rgba> {
+    let theme = match appearance {
+        Appearance::Dark => "dark",
+        Appearance::Light => "light",
+    };
+    hex(sheet()?.palette.get(theme)?.get(token)?)
+}
+
 /// Whose stone the otter holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Stone {
@@ -133,16 +186,10 @@ impl Stone {
         }
     }
 
-    /// The stone for a program by the name it reports (`app` in OSC 7501).
+    /// The stone for a program by the name it reports (`app` in OSC 7501)
+    /// or runs under: the registry's ([`crate::programs`]).
     pub fn of_app(app: Option<&str>) -> Self {
-        let app = app.unwrap_or_default().to_ascii_lowercase();
-        if app.starts_with("claude") {
-            Stone::Claude
-        } else if app.starts_with("codex") {
-            Stone::Codex
-        } else {
-            Stone::Plain
-        }
+        crate::programs::lookup(app.unwrap_or_default()).stone
     }
 }
 
@@ -391,6 +438,52 @@ mod tests {
         }
     }
 
+    /// Only idle things on screen: no timer at all. Working wakes for its
+    /// next frame; hidden or with motion reduced, nothing wakes.
+    #[test]
+    fn idle_icons_and_hidden_windows_cost_no_wakeups() {
+        let ms = Duration::from_millis;
+        let idle = [
+            (Pose::Idle, ms(40)),
+            (Pose::Error, ms(40)),
+            (Pose::Done, ms(5000)),
+        ];
+        assert_eq!(next_wake(&idle, false, ms(40), false, true), None);
+        assert_eq!(next_wake(&[], false, ms(40), false, true), None);
+
+        let working = [(Pose::Idle, ms(40)), (Pose::Working, ms(40))];
+        assert_eq!(
+            next_wake(&working, false, ms(40), false, true),
+            Some(ms(210))
+        );
+        // A tab's arc turns sooner than the otter taps.
+        assert_eq!(next_wake(&working, true, ms(40), false, true), Some(ms(60)));
+        assert_eq!(next_wake(&[], true, ms(250), false, true), Some(ms(50)));
+
+        // The window hidden, or motion reduced: nothing moves, nothing wakes.
+        assert_eq!(next_wake(&working, true, ms(40), false, false), None);
+        assert_eq!(next_wake(&working, true, ms(40), true, true), None);
+    }
+
+    #[test]
+    fn the_arc_turns_and_rests() {
+        let ms = Duration::from_millis;
+        assert_eq!(arc_at(ms(0), false), (0, Some(ms(100))));
+        assert_eq!(arc_at(ms(250), false), (2, Some(ms(50))));
+        assert_eq!(arc_at(ms(800), false).0, 0, "a full turn");
+        assert_eq!(arc_at(ms(250), true), (0, None));
+    }
+
+    #[test]
+    fn the_dot_speaks_in_the_otters_colours() {
+        for token in ["need", "done", "error"] {
+            let light = colour(token, Appearance::Light).expect(token);
+            let dark = colour(token, Appearance::Dark).expect(token);
+            assert_ne!(light, dark, "{token}");
+        }
+        assert_eq!(colour("no-such", Appearance::Light), None);
+    }
+
     #[test]
     fn states_and_names_map_as_the_sheet_says() {
         use berth_core::claude::{State, Wait};
@@ -403,7 +496,7 @@ mod tests {
         );
         assert_eq!(Pose::of_claude(State::Waiting(Wait::YourMove)), Pose::Done);
         assert_eq!(Stone::of_app(Some("claude")), Stone::Claude);
-        assert_eq!(Stone::of_app(Some("Codex-CLI")), Stone::Codex);
+        assert_eq!(Stone::of_app(Some("/usr/local/bin/Codex")), Stone::Codex);
         assert_eq!(Stone::of_app(Some("make")), Stone::Plain);
         assert_eq!(Stone::of_app(None), Stone::Plain);
     }

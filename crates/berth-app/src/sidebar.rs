@@ -92,6 +92,28 @@ pub fn listing(scan: &[Running]) -> BTreeMap<String, bool> {
     out
 }
 
+/// What runs in each of Berth's sessions on one host, by slug: the foreground
+/// process's name, as tmux gives it. Of a session with several panes, the
+/// agent's if one runs there, else the first pane's.
+pub fn programs(scan: &[Running]) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for running in scan {
+        let Some(slug) = running.session.strip_prefix(SESSION_PREFIX) else {
+            continue;
+        };
+        if slug.is_empty() {
+            continue;
+        }
+        match out.get(slug) {
+            Some(_) if !running.is_agent() => {}
+            _ => {
+                out.insert(slug.to_string(), running.command.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Build the rows, headings and folders in ssh config order, this machine last.
 pub fn rows(input: &Input) -> Vec<Row> {
     let mut out = Vec::new();
@@ -286,6 +308,23 @@ mod tests {
                 command: command.to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_sessions_program_is_its_agent_or_its_first_pane() {
+        let scan = running(&[
+            ("berth/api", "zsh"),
+            ("berth/api", "claude"),
+            ("berth/api", "vim"),
+            ("berth/logs", "tail"),
+            ("berth/logs", "zsh"),
+            ("mine", "claude"),
+            ("berth/", "zsh"),
+        ]);
+        let programs = programs(&scan);
+        assert_eq!(programs.get("api").map(String::as_str), Some("claude"));
+        assert_eq!(programs.get("logs").map(String::as_str), Some("tail"));
+        assert_eq!(programs.len(), 2, "only Berth's own sessions");
     }
 
     fn host<'a>(alias: &'a str, group: Option<&'a str>) -> HostEntry<'a> {

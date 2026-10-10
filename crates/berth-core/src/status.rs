@@ -176,6 +176,19 @@ fn text(encoded: &str, max_encoded: usize, max_decoded: usize) -> Option<String>
     Some(text.chars().filter(|c| !invisible(*c)).collect())
 }
 
+/// Text a program set that is about to be shown on one line, such as a
+/// terminal title: without control characters or anything that could reorder
+/// or hide text, trimmed, and at most `max` characters. `None` if nothing is
+/// left.
+pub fn shown(text: &str, max: usize) -> Option<String> {
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control() && !invisible(*c))
+        .collect();
+    let clean: String = clean.trim().chars().take(max).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 /// Bidirectional overrides, embeddings and isolates, and invisible formatting
 /// characters: taken out of text before it is shown, so a report cannot make
 /// a label read as something else.
@@ -463,6 +476,17 @@ mod tests {
         // "a" RIGHT-TO-LEFT OVERRIDE "b" ZERO WIDTH SPACE "c".
         let (_, record) = set("state=idle:msg=YeKArmLigItj");
         assert_eq!(record.msg.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_title_is_cleaned_before_it_is_shown() {
+        assert_eq!(shown("  vim  ", 10).as_deref(), Some("vim"));
+        assert_eq!(
+            shown("a\u{1b}[31mb\u{202e}c\n", 10).as_deref(),
+            Some("a[31mbc")
+        );
+        assert_eq!(shown(&"x".repeat(500), 80).map(|t| t.len()), Some(80));
+        assert_eq!(shown(" \u{200b}\t", 10), None);
     }
 
     #[test]

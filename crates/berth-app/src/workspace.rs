@@ -292,7 +292,13 @@ pub struct Workspace {
     /// The session whose finished or failed status the focused pane was
     /// showing at the last look: still so at the next, the user has seen it
     /// (D53).
-    status_shown: Option<u64>,
+    status_shown: Looked<OtterKey>,
+    /// Panes whose Claude finished its turn, as its hooks said, and whose
+    /// user has since looked: their `done` is no longer shown (D53).
+    hook_done_seen: std::collections::HashSet<u64>,
+    /// What runs in each remote session, by alias and slug: the foreground
+    /// process's name from the same scan as `running`.
+    programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// The otter icons' clock (D53): when the looping poses began, when each
     /// pane's or session's `done` began (it plays for two seconds), whether
     /// motion is off, and the one timer every icon shares. The timer is only
@@ -305,6 +311,80 @@ pub struct Workspace {
     /// it is up.
     claude_reports: session::ClaudeReports,
     session_lists: session::SessionLists,
+}
+
+/// Seen means looked at twice running: whatever a look is showing is seen
+/// when the next look, a second later, is still showing it. Used for the
+/// finished and failed status a focused pane shows, which goes once its user
+/// has had the pane in front of them for about a second (D53).
+#[derive(Debug)]
+struct Looked<K> {
+    last: Option<K>,
+}
+
+impl<K> Default for Looked<K> {
+    fn default() -> Self {
+        Self { last: None }
+    }
+}
+
+impl<K: PartialEq + Copy> Looked<K> {
+    /// One look, showing `showing`. Returns what has now been seen.
+    fn look(&mut self, showing: Option<K>) -> Option<K> {
+        let seen = showing.filter(|key| self.last == Some(*key));
+        // Seen once is enough: it starts over if it shows again.
+        self.last = if seen.is_some() { None } else { showing };
+        seen
+    }
+}
+
+/// A tab's title, in order: what the program says it is doing (the message
+/// of its status record, OSC 7501), the title it gave the terminal, and
+/// failing both the program's name with the directory it is in, shortened.
+/// `None` when none of them is known, and the tab keeps the name it had.
+fn tab_title(
+    message: Option<&str>,
+    terminal_title: Option<&str>,
+    program: Option<&str>,
+    directory: Option<&str>,
+    home: Option<&str>,
+) -> Option<String> {
+    fn said(text: Option<&str>) -> Option<&str> {
+        text.map(str::trim).filter(|t| !t.is_empty())
+    }
+    if let Some(text) = said(message).or(said(terminal_title)) {
+        return Some(text.to_string());
+    }
+    let name = crate::programs::display_name(said(program)?);
+    if name.is_empty() {
+        return None;
+    }
+    Some(
+        match said(directory).map(|dir| short_directory(dir, home)) {
+            Some(dir) => format!("{name} {dir}"),
+            None => name,
+        },
+    )
+}
+
+/// The user's home directory, for writing it as `~`.
+fn dirs_home() -> Option<String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|home| !home.is_empty())
+}
+
+/// A directory as a tab has room for: `~` for home, else its last part.
+fn short_directory(directory: &str, home: Option<&str>) -> String {
+    let directory = directory.trim_end_matches('/');
+    if home.is_some_and(|home| home.trim_end_matches('/') == directory) {
+        return "~".to_string();
+    }
+    match directory.rsplit('/').next() {
+        Some(last) if !last.is_empty() => last.to_string(),
+        _ => "/".to_string(),
+    }
 }
 
 /// Whose otter: a pane's, or a local session's that no pane shows.
@@ -340,11 +420,11 @@ impl OtterLook {
     }
 
     /// An agent is there and has said nothing of what it is doing: asleep,
-    /// with a plain stone.
-    fn presence() -> Self {
+    /// with its own stone, by the name it runs under.
+    fn presence(program: Option<&str>) -> Self {
         Self {
             pose: crate::otter::Pose::Idle,
-            stone: crate::otter::Stone::Plain,
+            stone: crate::otter::Stone::of_app(program),
             text: strings::AGENT_TOOLTIP.into(),
         }
     }
@@ -397,7 +477,9 @@ impl Workspace {
             local_server: Default::default(),
             local_sessions: Vec::new(),
             window_seen: true,
-            status_shown: None,
+            status_shown: Looked::default(),
+            hook_done_seen: std::collections::HashSet::new(),
+            programs: std::collections::BTreeMap::new(),
             otter_epoch: std::time::Instant::now(),
             otter_done: std::collections::HashMap::new(),
             otter_still: false,
@@ -448,6 +530,7 @@ impl Workspace {
     }
 
     fn check_window_seen(&mut self, cx: &mut Context<Self>) {
+        self.check_status_seen(cx);
         let Some(Ok(server)) = self.local_server.get().cloned() else {
             return;
         };
@@ -464,7 +547,6 @@ impl Workspace {
         if seen != self.window_seen {
             self.set_window_seen(seen, server.clone(), cx);
         }
-        self.check_status_seen(server, cx);
         // A pane saying its input was not delivered is drawn again each
         // look, so the notice comes and goes on time.
         if self
@@ -476,33 +558,47 @@ impl Workspace {
         }
     }
 
-    /// A finished or failed program status stays on the icon until the user
+    /// A finished or failed status stays on a pane's icons until the user
     /// has seen it: the pane focused, in a window that is drawn, across two
-    /// looks, so for a second or more. Then the worker is told and drops the
-    /// record, for every app and the session list alike (D53).
-    fn check_status_seen(
-        &mut self,
-        server: berth_core::server::local::LocalServer,
-        cx: &mut Context<Self>,
-    ) {
+    /// looks, so for a second or more (D53). For a status a program reported
+    /// (OSC 7501) the worker is then told and drops the record, for every
+    /// app and the session list alike; for a turn Claude's hooks said is
+    /// finished, the pane is noted as looked at.
+    fn check_status_seen(&mut self, cx: &mut Context<Self>) {
+        use crate::otter::Pose;
         use berth_proto::v1::StatusState;
         let showing = self
             .focused()
-            .and_then(|pane| pane.session)
             .filter(|_| self.window_seen)
-            .filter(|session| {
-                self.session_status(*session)
-                    .is_some_and(|s| matches!(s.state, StatusState::Done | StatusState::Error))
+            .and_then(|pane| {
+                let reported = pane.session.filter(|session| {
+                    self.session_status(*session)
+                        .is_some_and(|s| matches!(s.state, StatusState::Done | StatusState::Error))
+                });
+                match reported {
+                    Some(session) => Some(OtterKey::Session(session)),
+                    None => (self.pane_status(pane.id).is_none()
+                        && self.pane_otter(pane.id).map(|look| look.pose) == Some(Pose::Done))
+                    .then_some(OtterKey::Pane(pane.id)),
+                }
             });
-        let seen = showing.filter(|session| self.status_shown == Some(*session));
-        self.status_shown = showing;
-        if let Some(session) = seen {
-            self.status_shown = None;
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = runtime::spawn(async move { server.status_seen(session).await }).await;
-                })
-                .detach();
+        match self.status_shown.look(showing) {
+            Some(OtterKey::Session(session)) => {
+                let Some(Ok(server)) = self.local_server.get().cloned() else {
+                    return;
+                };
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ =
+                            runtime::spawn(async move { server.status_seen(session).await }).await;
+                    })
+                    .detach();
+            }
+            Some(OtterKey::Pane(pane)) => {
+                self.hook_done_seen.insert(pane);
+                cx.notify();
+            }
+            None => {}
         }
     }
 
@@ -977,7 +1073,52 @@ impl Workspace {
         if let Some(status) = self.pane_status(id) {
             return Some(OtterLook::of_status(status));
         }
-        self.claude_state(id).map(OtterLook::of_claude)
+        let mut look = self.claude_state(id).map(OtterLook::of_claude)?;
+        // A finished turn the user has looked at since is no longer news.
+        if look.pose == crate::otter::Pose::Done && self.hook_done_seen.contains(&id) {
+            look.pose = crate::otter::Pose::Idle;
+        }
+        Some(look)
+    }
+
+    /// What runs in a pane's session, by its process name: the local
+    /// server's word for a session of its own, the host's scan for a remote
+    /// one. Unknown for a shell Berth runs directly.
+    fn pane_program(&self, pane: &Pane) -> Option<&str> {
+        match (&pane.host, pane.session) {
+            (None, Some(session)) => self.session_program(session),
+            (Some(host), _) => self.remote_program(&host.alias, &pane.slug),
+            (None, None) => None,
+        }
+    }
+
+    fn session_program(&self, session: u64) -> Option<&str> {
+        self.local_sessions
+            .iter()
+            .find(|info| info.id == session)?
+            .program
+            .as_deref()
+    }
+
+    fn remote_program(&self, alias: &str, slug: &str) -> Option<&str> {
+        self.programs.get(alias)?.get(slug).map(String::as_str)
+    }
+
+    /// A pane's title from what its program says (D53), if anything is
+    /// known: see [`tab_title`]. The directory is only known for a session
+    /// on the local server.
+    fn pane_title(&self, pane: &Pane) -> Option<String> {
+        let info = pane
+            .session
+            .and_then(|session| self.local_sessions.iter().find(|info| info.id == session));
+        let home = dirs_home();
+        tab_title(
+            self.pane_status(pane.id).and_then(|s| s.msg.as_deref()),
+            info.and_then(|info| info.title.as_deref()),
+            self.pane_program(pane),
+            info.and_then(|info| info.cwd.as_deref()),
+            home.as_deref(),
+        )
     }
 
     /// The same for a local session no pane shows.
@@ -1001,12 +1142,21 @@ impl Workspace {
         since.unwrap_or(self.otter_epoch).elapsed()
     }
 
-    /// Before drawing: note which otters have just become `done`, and set
-    /// the one timer for the next frame any of them needs. No icon moving,
-    /// motion reduced or the window not drawn: no timer, and no wakeups.
+    /// Before drawing: note which otters have just become `done`, forget
+    /// looks at panes that have moved on, and set the one timer for the next
+    /// frame anything on screen needs: an otter's in the sidebar, or the
+    /// working arc on a tab. Nothing moving, motion reduced or the window not
+    /// drawn: no timer, and no wakeups.
     fn tend_otters(&mut self, cx: &mut Context<Self>) {
         use crate::otter::Pose;
         self.otter_still = cx.reduce_motion();
+        let finished: std::collections::HashSet<u64> = self
+            .panes
+            .iter()
+            .filter(|pane| self.claude_state(pane.id).map(Pose::of_claude) == Some(Pose::Done))
+            .map(|pane| pane.id)
+            .collect();
+        self.hook_done_seen.retain(|pane| finished.contains(pane));
         let shown: Vec<(OtterKey, Pose)> = self
             .panes
             .iter()
@@ -1026,20 +1176,32 @@ impl Workspace {
                 self.otter_done.entry(*key).or_insert(now);
             }
         }
-        let next = shown
+        let otters: Vec<(Pose, std::time::Duration)> = shown
             .iter()
-            .filter_map(|(key, pose)| {
-                pose.frame_at(self.otter_shown(*key, *pose), self.otter_still)
-                    .1
-            })
-            .min()
-            .filter(|_| self.window_seen);
+            .map(|(key, pose)| (*pose, self.otter_shown(*key, *pose)))
+            .collect();
+        // A tab shows the arc for its focused pane while that works.
+        let arcs = shown
+            .iter()
+            .any(|(key, pose)| matches!(key, OtterKey::Pane(_)) && *pose == Pose::Working);
+        let next = crate::otter::next_wake(
+            &otters,
+            arcs,
+            self.otter_epoch.elapsed(),
+            self.otter_still,
+            self.window_seen,
+        );
         self.otter_timer = next.map(|wait| {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
                 let _ = this.update(cx, |_, cx| cx.notify());
             })
         });
+    }
+
+    /// Where a tab's working arc is now.
+    fn arc_position(&self) -> usize {
+        crate::otter::arc_at(self.otter_epoch.elapsed(), self.otter_still).0
     }
 
     /// What a pane's Claude is doing, when its hooks have said.
@@ -1992,6 +2154,103 @@ fn presence_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tab's title: the program's status message first, then the title it
+    /// gave the terminal, then its name and directory, then nothing.
+    #[test]
+    fn a_tab_title_falls_back_in_order() {
+        let home = Some("/Users/j");
+        let title = |message, terminal, program, directory| {
+            tab_title(message, terminal, program, directory, home)
+        };
+        assert_eq!(
+            title(
+                Some("Running tests"),
+                Some("vim"),
+                Some("claude"),
+                Some("/Users/j/work")
+            ),
+            Some("Running tests".into())
+        );
+        assert_eq!(
+            title(
+                None,
+                Some("vim: notes.md"),
+                Some("nvim"),
+                Some("/Users/j/work")
+            ),
+            Some("vim: notes.md".into())
+        );
+        assert_eq!(
+            title(
+                None,
+                None,
+                Some("/usr/bin/python3.12"),
+                Some("/Users/j/work/api")
+            ),
+            Some("python api".into())
+        );
+        assert_eq!(
+            title(None, None, Some("-zsh"), Some("/Users/j")),
+            Some("zsh ~".into())
+        );
+        assert_eq!(title(None, None, Some("htop"), None), Some("htop".into()));
+        // Empty or blank is the same as not set.
+        assert_eq!(
+            title(Some("  "), Some(""), Some("git"), Some("/")),
+            Some("git /".into())
+        );
+        assert_eq!(title(None, None, None, Some("/Users/j")), None);
+        assert_eq!(title(None, None, Some(" "), None), None);
+    }
+
+    #[test]
+    fn a_directory_is_shortened_to_its_last_part() {
+        assert_eq!(short_directory("/Users/j", Some("/Users/j")), "~");
+        assert_eq!(short_directory("/Users/j/", Some("/Users/j")), "~");
+        assert_eq!(
+            short_directory("/Users/j/work/api", Some("/Users/j")),
+            "api"
+        );
+        assert_eq!(short_directory("/", None), "/");
+        assert_eq!(short_directory("/tmp", None), "tmp");
+    }
+
+    /// The done dot clears once its pane has been in front of the user for
+    /// about a second: shown on two looks running. One look is not enough,
+    /// looking away starts over, and each showing is seen once.
+    #[test]
+    fn a_status_is_seen_after_two_looks_running() {
+        let mut looked = Looked::default();
+        let pane = OtterKey::Pane(3);
+        assert_eq!(looked.look(Some(pane)), None, "one look");
+        assert_eq!(
+            looked.look(Some(pane)),
+            Some(pane),
+            "still there a second on"
+        );
+        assert_eq!(
+            looked.look(Some(pane)),
+            None,
+            "seen once, not again at once"
+        );
+
+        // Focus moved away in between: the count starts over.
+        let mut looked = Looked::default();
+        assert_eq!(looked.look(Some(pane)), None);
+        assert_eq!(looked.look(None), None);
+        assert_eq!(looked.look(Some(pane)), None);
+        assert_eq!(looked.look(Some(pane)), Some(pane));
+
+        // A different pane in front is a different thing to see.
+        let mut looked = Looked::default();
+        assert_eq!(looked.look(Some(pane)), None);
+        assert_eq!(looked.look(Some(OtterKey::Session(3))), None);
+        assert_eq!(
+            looked.look(Some(OtterKey::Session(3))),
+            Some(OtterKey::Session(3))
+        );
+    }
 
     #[test]
     fn a_free_slug_is_used_as_it_is() {

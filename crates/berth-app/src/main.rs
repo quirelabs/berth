@@ -8,6 +8,7 @@ mod menu;
 mod metrics;
 mod otter;
 mod panes;
+mod programs;
 mod reconnect;
 mod render_probe;
 mod restore;

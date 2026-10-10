@@ -56,7 +56,7 @@ enum Event {
     ClientSaid(ClientId, ToServer),
     ClientGone(ClientId),
     WorkerUp {
-        info: SessionInfo,
+        info: Box<SessionInfo>,
         to_worker: ToWorker,
         build: String,
         reply_to: Option<ClientId>,
@@ -439,7 +439,7 @@ impl State {
                 self.sessions.insert(
                     session,
                     Session {
-                        info,
+                        info: *info,
                         to_worker,
                         attached: HashSet::new(),
                         build,
@@ -493,11 +493,13 @@ impl State {
                         (self.sessions.get_mut(&session), list.into_iter().next())
                         && (entry.info.program != info.program
                             || entry.info.cwd != info.cwd
-                            || entry.info.status != info.status)
+                            || entry.info.status != info.status
+                            || entry.info.title != info.title)
                     {
                         entry.info.program = info.program;
                         entry.info.cwd = info.cwd;
                         entry.info.status = info.status;
+                        entry.info.title = info.title;
                         self.push_sessions();
                     }
                     return;
@@ -752,7 +754,7 @@ impl State {
             let build = opened.theirs.build.clone();
             if events
                 .send(Event::WorkerUp {
-                    info,
+                    info: Box::new(info),
                     to_worker,
                     build,
                     reply_to,

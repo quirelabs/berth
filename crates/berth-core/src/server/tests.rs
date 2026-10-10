@@ -689,6 +689,7 @@ async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
             claude: None,
             pid: None,
             status: None,
+            title: None,
         };
         let payload = ToApp::Sessions(vec![info]).encode().unwrap();
         opened.write.send(&payload).await.unwrap();

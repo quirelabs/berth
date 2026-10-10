@@ -253,10 +253,24 @@ impl Workspace {
             row = row.bg(hsla(theme.border));
         }
         if agent {
+            // The stone of an agent inside the closed folder.
+            let program = match &folder {
+                Folder::Host(alias) => self.programs.get(alias).and_then(|sessions| {
+                    sessions
+                        .values()
+                        .find(|command| berth_core::agents::is_agent(command))
+                        .map(String::as_str)
+                }),
+                Folder::Local => self
+                    .local_sessions
+                    .iter()
+                    .filter_map(|info| info.program.as_deref())
+                    .find(|command| berth_core::agents::is_agent(command)),
+            };
             row = row.child(otter(
                 ("folder-agent", index),
                 theme,
-                &OtterLook::presence(),
+                &OtterLook::presence(program),
                 0,
             ));
         }
@@ -316,6 +330,15 @@ impl Workspace {
             .into_iter()
             .find(|(_, n)| *n == name)
             .map(|(id, _)| id);
+        // What runs in it, for the stone of an agent that says nothing.
+        let program: Option<String> = match (pane.and_then(|id| self.pane(id)), &folder) {
+            (Some(pane), _) => self.pane_program(pane),
+            (None, crate::sidebar::Folder::Host(alias)) => self.remote_program(alias, &name),
+            (None, crate::sidebar::Folder::Local) => {
+                local_session.and_then(|session| self.session_program(session))
+            }
+        }
+        .map(str::to_string);
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
             (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {
@@ -378,7 +401,8 @@ impl Workspace {
                 None => (OtterKey::Session(u64::MAX), None),
             },
         };
-        if let Some(look) = look.or_else(|| agent.then(OtterLook::presence)) {
+        if let Some(look) = look.or_else(|| agent.then(|| OtterLook::presence(program.as_deref())))
+        {
             let frame = self.otter_frame(key, look.pose);
             row = row.child(otter(("session-agent", index), theme, &look, frame));
         }
@@ -431,17 +455,27 @@ impl Workspace {
             let colour = theme.host_colour(pane.alias(), pane.is_prod());
             let split_count = tab.root.panes().len();
             let local = pane.is_local();
-            let agent = self.has_agent(pane);
             let state = self.state_of(id);
             // A named session says its name; an unnamed one is just its host,
             // because `web-1/main` on every tab is noise.
-            let label = if !local && pane.slug != berth_core::session::DEFAULT_SLUG {
+            let named = if !local && pane.slug != berth_core::session::DEFAULT_SLUG {
                 format!("{}/{}", self.host_label(pane.alias()), pane.slug)
             } else if local {
                 pane.alias().to_string()
             } else {
                 self.host_label(pane.alias())
             };
+            // What the program says of itself comes first (D53): its status
+            // message, its terminal title, its name and directory. A remote
+            // session says its host before it, since the tab is also how
+            // one tells hosts apart.
+            let label = match self.pane_title(pane) {
+                Some(title) if local => title,
+                Some(title) => format!("{named}: {title}"),
+                None => named,
+            };
+            let program = crate::programs::lookup(self.pane_program(pane).unwrap_or_default());
+            let status = self.pane_otter(id).map(|look| look.pose);
 
             // The cut name is still readable, on hover.
             let full: Option<gpui::SharedString> =
@@ -476,6 +510,9 @@ impl Workspace {
                         .rounded(px(2.0))
                         .bg(colour),
                 )
+                // What runs in it: one glyph in a small tile, in the text's
+                // colour whatever the program's own colours are.
+                .child(program_tile(program, theme, active))
                 .child(
                     div()
                         .id(("label", tab_id as usize))
@@ -495,14 +532,18 @@ impl Workspace {
                         .child(label),
                 );
 
-            // After the name and before the state, because it is about what is
-            // inside the session rather than about the connection.
-            if let Some(look) = self
-                .pane_otter(id)
-                .or_else(|| agent.then(OtterLook::presence))
-            {
-                let frame = self.otter_frame(OtterKey::Pane(id), look.pose);
-                row = row.child(otter(("agent", tab_id as usize), theme, &look, frame));
+            // After the name and before the connection's state: what the
+            // program in it is doing, as a dot in the otter's colours, or a
+            // turning arc while it works. The otter itself is in the sidebar.
+            if let Some(mark) = status.and_then(|pose| {
+                status_mark(
+                    ("status", tab_id as usize),
+                    pose,
+                    theme,
+                    self.arc_position(),
+                )
+            }) {
+                row = row.child(mark);
             }
 
             // Split tabs say how many panes they hold, since only one of them
@@ -916,6 +957,47 @@ impl Workspace {
                     .overflow_hidden()
                     .border_1()
                     .border_color(hsla(if focused { theme.accent } else { theme.border }))
+                    // In a split, each pane says what runs in it: the tab
+                    // can only speak for one of them.
+                    .when(
+                        self.tab_of(pane_id)
+                            .and_then(|index| self.tabs.get(index))
+                            .is_some_and(|tab| tab.root.panes().len() > 1),
+                        |this| {
+                            let program = crate::programs::lookup(
+                                self.pane_program(pane).unwrap_or_default(),
+                            );
+                            let title = self
+                                .pane_title(pane)
+                                .unwrap_or_else(|| pane.alias().to_string());
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .text_xs()
+                                    .bg(hsla(theme.surface))
+                                    .border_b(px(1.0))
+                                    .border_color(hsla(theme.border))
+                                    .text_color(hsla(if focused {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(program.icon)
+                                            .flex_shrink_0()
+                                            .size(px(PANE_ICON))
+                                            .text_color(hsla(theme.text_muted)),
+                                    )
+                                    .child(div().truncate().child(title)),
+                            )
+                        },
+                    )
                     // Never a silent fallback: a local tab running its shell
                     // outside the local server says so, and why (D50).
                     .when_some(pane.direct.clone(), |this, reason| {
@@ -1170,6 +1252,132 @@ pub(super) fn local_label() -> String {
     }
 }
 
+/// The size of a program's icon on a tab, and in a split pane's header.
+const TAB_ICON: f32 = 14.0;
+const PANE_ICON: f32 = 12.0;
+
+/// A program's icon on a tab: one glyph in a small rounded tile, tinted with
+/// the text colour. Never in a brand's own colours.
+fn program_tile(program: crate::programs::Program, theme: Theme, active: bool) -> gpui::Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(TAB_ICON + 4.0))
+        .h(px(TAB_ICON + 4.0))
+        .rounded(px(4.0))
+        .bg(hsla(if active { theme.surface } else { theme.border }))
+        .child(
+            svg()
+                .path(program.icon)
+                .size(px(TAB_ICON))
+                .text_color(hsla(if active { theme.text } else { theme.text_muted })),
+        )
+}
+
+/// The size of the status mark on a tab.
+const STATUS_DOT: f32 = 5.0;
+const STATUS_ARC: f32 = 7.0;
+
+/// What a tab's status mark is, for a pose: a dot in the otter's colour for
+/// what needs a look, the arc for work under way, nothing for idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Dot(&'static str),
+    Arc,
+}
+
+fn mark_for(pose: crate::otter::Pose) -> Option<Mark> {
+    use crate::otter::Pose;
+    match pose {
+        Pose::NeedsYou => Some(Mark::Dot("need")),
+        Pose::Done => Some(Mark::Dot("done")),
+        Pose::Error => Some(Mark::Dot("error")),
+        Pose::Working => Some(Mark::Arc),
+        Pose::Idle => None,
+    }
+}
+
+/// A tab's status mark (D53): amber for needs you, green for done, red for
+/// an error, each a 5 px dot in the otter's colours, and a thin arc that
+/// turns while the program works. `position` is where the arc is in its
+/// turn, from the timer every icon shares.
+fn status_mark(
+    id: (&'static str, usize),
+    pose: crate::otter::Pose,
+    theme: Theme,
+    position: usize,
+) -> Option<gpui::Stateful<gpui::Div>> {
+    let text = match pose {
+        crate::otter::Pose::NeedsYou => strings::STATUS_NEEDS_YOU,
+        crate::otter::Pose::Done => strings::STATUS_DONE,
+        crate::otter::Pose::Error => strings::STATUS_ERROR,
+        crate::otter::Pose::Working => strings::STATUS_WORKING,
+        crate::otter::Pose::Idle => return None,
+    };
+    let mark = match mark_for(pose)? {
+        Mark::Dot(token) => {
+            let colour = crate::otter::colour(token, theme.appearance).unwrap_or(theme.warning);
+            div()
+                .flex_shrink_0()
+                .w(px(STATUS_DOT))
+                .h(px(STATUS_DOT))
+                .rounded(px(STATUS_DOT / 2.0))
+                .bg(hsla(colour))
+        }
+        Mark::Arc => div()
+            .flex_shrink_0()
+            .w(px(STATUS_ARC))
+            .h(px(STATUS_ARC))
+            .child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |bounds, (), window, _| {
+                        // Three quarters of a circle, starting an eighth of a
+                        // turn further on for each position.
+                        let centre = bounds.center();
+                        let radius = f32::from(bounds.size.width) / 2.0 - 0.5;
+                        let at = |turn: f32| {
+                            let angle = turn * std::f32::consts::TAU;
+                            gpui::point(
+                                centre.x + px(radius * angle.cos()),
+                                centre.y + px(radius * angle.sin()),
+                            )
+                        };
+                        let start = position as f32 / crate::otter::ARC_POSITIONS as f32;
+                        let mut path = gpui::PathBuilder::stroke(px(1.0));
+                        path.move_to(at(start));
+                        path.arc_to(
+                            gpui::point(px(radius), px(radius)),
+                            px(0.0),
+                            true,
+                            true,
+                            at(start + 0.75),
+                        );
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, theme.text_muted);
+                        }
+                    },
+                )
+                .size_full(),
+            ),
+    };
+    Some(
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .child(mark)
+            .tooltip(move |_, cx| {
+                cx.new(|_| Note {
+                    text: text.into(),
+                    theme,
+                })
+                .into()
+            }),
+    )
+}
+
 /// The status icon (D53): the otter in its pose with its stone, and the
 /// tooltip that says in words what it shows. Should the sprite sheet ever
 /// fail to load, the ghost it replaced stands in, coloured by what the pose
@@ -1312,6 +1520,30 @@ mod tests {
             app: None,
             title: None,
             msg: None,
+        }
+    }
+
+    /// The tab's mark: amber for needs you, green for done, red for an
+    /// error, the arc for working, and nothing for idle.
+    #[test]
+    fn a_tabs_mark_follows_the_pose() {
+        use crate::otter::Pose;
+        assert_eq!(mark_for(Pose::NeedsYou), Some(Mark::Dot("need")));
+        assert_eq!(mark_for(Pose::Done), Some(Mark::Dot("done")));
+        assert_eq!(mark_for(Pose::Error), Some(Mark::Dot("error")));
+        assert_eq!(mark_for(Pose::Working), Some(Mark::Arc));
+        assert_eq!(mark_for(Pose::Idle), None);
+        // Every dot's colour is one the otter's palette has, in both themes.
+        for pose in [Pose::NeedsYou, Pose::Done, Pose::Error] {
+            let Some(Mark::Dot(token)) = mark_for(pose) else {
+                panic!("{pose:?}");
+            };
+            for appearance in [
+                crate::theme::Appearance::Light,
+                crate::theme::Appearance::Dark,
+            ] {
+                assert!(crate::otter::colour(token, appearance).is_some(), "{token}");
+            }
         }
     }
 

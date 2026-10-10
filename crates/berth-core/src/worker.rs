@@ -119,7 +119,12 @@ struct Status {
     unsent: Vec<v1::Event>,
     /// What had the terminal when last looked at, to see a program end.
     foreground: Option<u32>,
+    /// The terminal's title, as the program last set it, cleaned.
+    title: Option<String>,
 }
+
+/// The longest terminal title kept.
+const TITLE_AT_MOST: usize = 256;
 
 fn lock(seq: &Mutex<u64>) -> MutexGuard<'_, u64> {
     seq.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -295,6 +300,13 @@ impl Worker {
                 berth_term::StatusEvent::Reset => {
                     status.records.reset();
                 }
+                berth_term::StatusEvent::Title(title) => {
+                    let title = crate::status::shown(&title, TITLE_AT_MOST);
+                    if title != status.title {
+                        status.title = title.clone();
+                        events.push(v1::Event::Title(title.unwrap_or_default()));
+                    }
+                }
             }
         }
         events.extend(changes(&before, &status.records.to_wire()));
@@ -351,6 +363,12 @@ impl Worker {
             claude: self.claude(),
             pid: self.pty.local_pid(),
             status: crate::status::foremost(&self.statuses()).cloned(),
+            title: self
+                .status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .title
+                .clone(),
         }
     }
 
@@ -846,6 +864,17 @@ mod tests {
         })
         .await;
         assert!(ended.is_ok(), "the worker's output never ended");
+    }
+
+    /// The title a program gives the terminal reaches the session list,
+    /// trimmed.
+    #[tokio::test]
+    async fn the_terminal_title_is_kept_for_the_session_list() {
+        let (worker, _rx) = Worker::start(spec(None)).await.unwrap();
+        type_in(&worker, "printf '\\033]2;  build api  \\007'").await;
+        let events = status_events(&worker, 1).await;
+        assert_eq!(events, [v1::Event::Title("build api".into())]);
+        assert_eq!(worker.info().title.as_deref(), Some("build api"));
     }
 
     /// A report that breaks the protocol's rules changes nothing.

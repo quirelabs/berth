@@ -88,6 +88,8 @@ pub enum StatusEvent {
     PromptStart,
     /// A full reset: every record goes.
     Reset,
+    /// The program set the terminal's title (OSC 0 or 2). Untrusted text.
+    Title(String),
 }
 
 /// The most status events kept for a holder that does not take them.
@@ -766,6 +768,9 @@ struct Engine {
     seen_shell_marker: bool,
     /// Set for a session's own terminal: where its answers go.
     reply: Option<std::rc::Rc<Reply>>,
+    /// Raised by libghostty when the program sets the title; read after
+    /// each write.
+    title_changed: std::rc::Rc<std::cell::Cell<bool>>,
     numbering: Numbering,
     /// The most bytes parsed between two numbering updates.
     slice: usize,
@@ -870,6 +875,11 @@ impl Engine {
                 .ok()?;
             term.on_xtversion(|_| Some(XTVERSION)).ok()?;
         }
+        let title_changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        if reply.is_some() {
+            let changed = title_changed.clone();
+            term.on_title_changed(move |_| changed.set(true)).ok()?;
+        }
         let mut engine = Self {
             term,
             screen: Screen::new()?,
@@ -885,6 +895,7 @@ impl Engine {
             status_events: Vec::new(),
             seen_shell_marker: false,
             reply,
+            title_changed,
             numbering: Numbering::default(),
             slice: scrollback.lines.unwrap_or(usize::MAX).clamp(256, 4096),
             shadow: None,
@@ -978,6 +989,10 @@ impl Engine {
                     for slice in bytes.chunks(self.slice) {
                         self.term.vt_write(slice);
                         self.numbering.update(&self.term);
+                    }
+                    if self.title_changed.take() {
+                        let title = self.term.title().unwrap_or_default().to_string();
+                        self.status_events.push(StatusEvent::Title(title));
                     }
                 }
                 Piece::Marker(kind) => {

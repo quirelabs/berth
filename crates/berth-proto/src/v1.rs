@@ -144,6 +144,9 @@ pub struct SessionInfo {
     /// The program status record the session is shown by, if any program in
     /// it reports one (OSC 7501, D53): the one that most needs the user.
     pub status: Option<Status>,
+    /// The terminal's title, where the program set one (OSC 0 or 2), cleaned
+    /// of control characters and cut to a line. Untrusted.
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
