@@ -255,6 +255,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
             accepted = listener.accept() => {
                 let Ok(stream) = accepted else { continue };
                 let Ok(opened) = link::open(stream, &link::hello()).await else { continue };
+                let other = opened.other_build(&crate::server::build());
                 connection += 1;
                 to_supervisor = Some(opened.write);
                 let tx = inbox_tx.clone();
@@ -269,6 +270,7 @@ pub async fn serve(places: Places, launch: Launch) -> Result<()> {
                                 }
                             }
                             Err(error) => {
+                                let error = link::unreadable(error, other.as_ref());
                                 tracing::warn!(%error, "a supervisor sent something unreadable");
                                 break;
                             }

@@ -26,6 +26,7 @@ use berth_proto::v1::{self, SessionId, SessionInfo, ToApp, ToServer};
 use tokio::sync::{mpsc, oneshot};
 
 use super::client;
+use super::link;
 use super::paths::{self, Places};
 use crate::error::{Error, Result};
 use crate::pty::{INPUT_QUEUE_SIZE, OUTPUT_QUEUE_SIZE, Pty, PtyEvent, PtyInput};
@@ -72,6 +73,9 @@ struct Shared {
     routes: HashMap<SessionId, Route>,
     waiting: VecDeque<Waiting>,
     to_server: Option<mpsc::Sender<ToServer>>,
+    /// Set while the connection is down because the supervisor, another
+    /// build, said something this one could not read (D54).
+    other_build: Option<link::OtherBuild>,
     claude: Option<ClaudeListener>,
     sessions: Option<SessionsListener>,
 }
@@ -90,8 +94,8 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 
 /// Connect to the supervisor, starting it if nothing answers and `start`
 /// allows.
-async fn reach(places: &Places, start: &Start) -> Result<client::Client> {
-    if let Ok(client) = client::connect(places).await {
+async fn reach(places: &Places, start: &Start, expected: &str) -> Result<client::Client> {
+    if let Ok(client) = client::connect_expecting(places, expected).await {
         return Ok(client);
     }
     let Start::Binary(exe) = start else {
@@ -102,7 +106,7 @@ async fn reach(places: &Places, start: &Start) -> Result<client::Client> {
     super::supervisor::spawn_detached(&copy, &["--supervisor".to_string()], &[])?;
     let deadline = tokio::time::Instant::now() + START_WITHIN;
     loop {
-        match client::connect(places).await {
+        match client::connect_expecting(places, expected).await {
             Ok(client) => return Ok(client),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -113,7 +117,12 @@ async fn reach(places: &Places, start: &Start) -> Result<client::Client> {
 impl LocalServer {
     /// Connect, starting the supervisor if needed, and keep connected.
     pub async fn start(places: Places, start: Start) -> Result<Self> {
-        let first = reach(&places, &start).await?;
+        // The supervisor should be the build this side would start.
+        let expected = match &start {
+            Start::Binary(exe) => paths::build_of(exe)?,
+            Start::External => super::build(),
+        };
+        let first = reach(&places, &start, &expected).await?;
         let server = Self {
             shared: Arc::new(Mutex::new(Shared {
                 to_server: Some(first.to_server.clone()),
@@ -121,7 +130,7 @@ impl LocalServer {
             })),
         };
         let shared = server.shared.clone();
-        tokio::spawn(route(shared, places, start, first));
+        tokio::spawn(route(shared, places, start, expected, first));
         Ok(server)
     }
 
@@ -134,13 +143,25 @@ impl LocalServer {
     }
 
     async fn send(&self, message: ToServer) -> Result<()> {
-        let tx = lock(&self.shared)
-            .to_server
-            .clone()
-            .ok_or_else(|| Error::Server("not connected to the local server".into()))?;
+        let tx = lock(&self.shared).to_server.clone();
+        let Some(tx) = tx else {
+            return Err(self.gone("not connected to the local server"));
+        };
         tx.send(message)
             .await
-            .map_err(|_| Error::Server("the local server went away".into()))
+            .map_err(|_| self.gone("the local server went away"))
+    }
+
+    /// Why the server is not answering: by name when it is another build
+    /// that this one could not read, and otherwise `what`.
+    fn gone(&self, what: &str) -> Error {
+        match lock(&self.shared).other_build.clone() {
+            Some(other) => Error::DifferentBuild {
+                theirs: other.theirs,
+                expected: other.expected,
+            },
+            None => Error::Server(what.into()),
+        }
     }
 
     /// Every session the server holds.
@@ -151,7 +172,7 @@ impl LocalServer {
         tokio::time::timeout(ANSWER_WITHIN, rx)
             .await
             .map_err(|_| Error::Server("no session list in time".into()))?
-            .map_err(|_| Error::Server("the local server went away".into()))
+            .map_err(|_| self.gone("the local server went away"))
     }
 
     /// Start a session. `pane` and `resume` are its Claude token and a
@@ -178,7 +199,7 @@ impl LocalServer {
         tokio::time::timeout(ANSWER_WITHIN, rx)
             .await
             .map_err(|_| Error::Server("no answer to create in time".into()))?
-            .map_err(|_| Error::Server("the local server went away".into()))?
+            .map_err(|_| self.gone("the local server went away"))?
             .map_err(Error::Server)
     }
 
@@ -487,23 +508,36 @@ async fn forward(
 }
 
 /// Hand the server's messages to whoever is waiting, and keep connected.
-async fn route(shared: Arc<Mutex<Shared>>, places: Places, start: Start, first: client::Client) {
+async fn route(
+    shared: Arc<Mutex<Shared>>,
+    places: Places,
+    start: Start,
+    expected: String,
+    first: client::Client,
+) {
     let mut client = first;
     loop {
         lock(&shared).to_server = Some(client.to_server.clone());
         while let Some(message) = client.from_server.recv().await {
             deliver(&shared, message);
         }
-        // The connection is gone. Requests in flight will not be answered.
+        // The connection is gone. Requests in flight will not be answered,
+        // and are told why when the supervisor is another build that could
+        // not be read.
         {
             let mut shared = lock(&shared);
             shared.to_server = None;
+            shared.other_build = client
+                .unreadable
+                .load(Ordering::Relaxed)
+                .then(|| client.other_build.clone())
+                .flatten();
             shared.waiting.clear();
         }
         tracing::warn!("lost the local server; connecting again");
         client = loop {
             tokio::time::sleep(RETRY_EVERY).await;
-            if let Ok(client) = reach(&places, &start).await {
+            if let Ok(client) = reach(&places, &start, &expected).await {
                 break client;
             }
         };

@@ -60,6 +60,16 @@ pub struct Local {
 pub type LocalServerCell =
     Arc<tokio::sync::OnceCell<Result<berth_core::server::local::LocalServer, String>>>;
 
+/// Why the local server is no use, in the app's words.
+fn local_server_error(error: &berth_core::Error) -> String {
+    match error {
+        berth_core::Error::DifferentBuild { theirs, expected } => {
+            crate::strings::local_server_other_build(theirs, expected)
+        }
+        other => crate::strings::local_server_failed(&other.to_string()),
+    }
+}
+
 /// The local server, or why there is none: the escape hatch is on, or it
 /// would not start.
 pub async fn local_server(
@@ -71,7 +81,7 @@ pub async fn local_server(
             Some(reason) => Err(reason),
             None => berth_core::server::local::LocalServer::standard()
                 .await
-                .map_err(|e| crate::strings::local_server_failed(&e.to_string())),
+                .map_err(|e| local_server_error(&e)),
         }
     })
     .await
@@ -125,7 +135,7 @@ pub async fn open_local_tab(
                         direct: None,
                     });
                 }
-                Err(error) => crate::strings::local_server_failed(&error.to_string()),
+                Err(error) => local_server_error(&error),
             }
         }
         Err(reason) => reason,

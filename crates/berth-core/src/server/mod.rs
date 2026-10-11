@@ -34,13 +34,26 @@ pub use transport::{Listener, Stream, connect};
 /// What this build announces in its handshake. Nothing optional yet.
 pub const FEATURES: &[&str] = &[];
 
-/// This build, as its handshake names it: the version, and the name of the
-/// binary it runs from, which for a worker is its versioned copy. The
-/// supervisor keeps the copies running workers name (D50).
+/// This build, as its handshake names it: the version and a hash of the
+/// binary it runs from, `0.1.0+3f9c2a1b7d4e5f60` ([`paths::build_of`]). Two
+/// builds of one version differ in it, which is how a server left running by
+/// another build is told from this one (D54), and how the supervisor knows
+/// which copies running workers use (D50).
+///
+/// A binary that cannot be read names no build that another could match.
 pub fn build() -> String {
-    let exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_default();
-    format!("berth {} ({exe})", env!("CARGO_PKG_VERSION"))
+    static OWN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(|exe| paths::build_of(&exe))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not name this build");
+                format!(
+                    "{}+unreadable-{}",
+                    env!("CARGO_PKG_VERSION"),
+                    std::process::id()
+                )
+            })
+    })
+    .clone()
 }

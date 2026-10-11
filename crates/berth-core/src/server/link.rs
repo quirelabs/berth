@@ -72,6 +72,40 @@ pub struct Opened<S> {
     pub write: FrameWrite<WriteHalf<S>>,
 }
 
+/// A peer that greeted as a build other than the one expected of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherBuild {
+    pub theirs: String,
+    pub expected: String,
+}
+
+impl<S> Opened<S> {
+    /// Whether the other side is a build other than `expected`. That is no
+    /// reason to refuse it: a server left running by an older build keeps
+    /// its sessions, and the app still reaches them. It is what an upgrade
+    /// is offered on, and what [`unreadable`] names if the two builds turn
+    /// out to differ on the wire.
+    pub fn other_build(&self, expected: &str) -> Option<OtherBuild> {
+        (self.theirs.build != expected).then(|| OtherBuild {
+            theirs: self.theirs.build.clone(),
+            expected: expected.to_string(),
+        })
+    }
+}
+
+/// A message that could not be read. From another build that is what went
+/// wrong, and it is said so by name; "malformed" is kept for a peer of this
+/// very build, where it means a bug or a damaged connection (D54).
+pub fn unreadable(error: berth_proto::Error, other: Option<&OtherBuild>) -> Error {
+    match other {
+        Some(other) => Error::DifferentBuild {
+            theirs: other.theirs.clone(),
+            expected: other.expected.clone(),
+        },
+        None => protocol(error),
+    }
+}
+
 /// Greet, read the other side's greeting, and settle on a version. Both sides
 /// send first, so neither waits on the other.
 pub async fn open<S>(stream: S, ours: &Hello) -> Result<Opened<S>>

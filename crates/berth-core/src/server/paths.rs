@@ -188,22 +188,62 @@ pub fn live_workers(places: &Places) -> Vec<SessionId> {
     live
 }
 
+/// How many hex digits of a binary's SHA-256 name its build.
+const BUILD_ID_DIGITS: usize = 16;
+
+fn build_named(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let id = hex::encode(&Sha256::digest(bytes)[..BUILD_ID_DIGITS / 2]);
+    format!("{}+{id}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The build the binary at `exe` is: its version and the start of its
+/// SHA-256, `0.1.0+3f9c2a1b7d4e5f60`. A versioned copy carries both in its
+/// name, and is taken at its word: a worker and a hook start often, and
+/// should not read their whole binary to say hello.
+pub fn build_of(exe: &Path) -> io::Result<String> {
+    let named = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(build_in_copy_name);
+    match named {
+        Some(build) => Ok(build),
+        None => Ok(build_named(&std::fs::read(exe)?)),
+    }
+}
+
+/// The name of the copy a build runs from: `berth-0.1.0-3f9c2a1b7d4e5f60`.
+pub fn copy_name(build: &str) -> Option<String> {
+    let (version, id) = build.split_once('+')?;
+    let plain = |s: &str| !s.is_empty() && !s.contains(['/', '\\']);
+    (plain(version) && is_build_id(id))
+        .then(|| format!("berth-{version}-{id}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The build a copy's name carries, for this version's copies only.
+fn build_in_copy_name(name: &str) -> Option<String> {
+    let name = name
+        .strip_suffix(std::env::consts::EXE_SUFFIX)
+        .unwrap_or(name);
+    let (version, id) = name.strip_prefix("berth-")?.rsplit_once('-')?;
+    (version == env!("CARGO_PKG_VERSION") && is_build_id(id)).then(|| format!("{version}+{id}"))
+}
+
+fn is_build_id(id: &str) -> bool {
+    id.len() == BUILD_ID_DIGITS && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// This build's copy of the binary in `bin`, made if it is not there yet, and
 /// its name. Workers run from it, never from the app bundle or install
 /// directory: on Windows an update cannot replace an executable a running
 /// worker uses, and on macOS an update never touches one (D50).
 ///
-/// Named by version and a hash of the binary, so two builds that share a
-/// version number never share a copy.
+/// Named by its build, so two builds that share a version number never share
+/// a copy.
 pub fn install_copy(bin: &Path, exe: &Path) -> io::Result<PathBuf> {
-    use sha2::{Digest, Sha256};
     let bytes = std::fs::read(exe)?;
-    let tag = hex::encode(&Sha256::digest(&bytes)[..4]);
-    let name = format!(
-        "berth-{}-{tag}{}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::EXE_SUFFIX
-    );
+    let name = copy_name(&build_named(&bytes))
+        .ok_or_else(|| io::Error::other("this build has no name for its copy"))?;
     let copy = bin.join(&name);
     if copy.is_file() {
         return Ok(copy);
@@ -305,6 +345,43 @@ mod tests {
     fn this_process_is_alive() {
         assert!(alive(std::process::id()));
         assert!(!alive(99_999_999));
+    }
+
+    /// A copy is named by its build, and says the same of itself without
+    /// being read again; anything else is named by what is in it.
+    #[test]
+    fn a_build_is_named_by_its_version_and_what_is_in_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("exe");
+        std::fs::write(&exe, b"binary one").unwrap();
+        let one = build_of(&exe).unwrap();
+        let (version, id) = one.split_once('+').unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        assert!(is_build_id(id), "{id}");
+
+        let copy = install_copy(&dir.path().join("bin"), &exe).unwrap();
+        assert_eq!(
+            build_of(&copy).unwrap(),
+            one,
+            "a copy is the build it copies"
+        );
+        let name = copy.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(copy_name(&one).as_deref(), Some(name.as_str()));
+
+        std::fs::write(&exe, b"binary two").unwrap();
+        assert_ne!(build_of(&exe).unwrap(), one, "same version, another build");
+    }
+
+    /// What an older build called itself, and anything that could step out
+    /// of the directory, names no copy.
+    #[test]
+    fn only_a_build_name_names_a_copy() {
+        assert_eq!(copy_name("berth 0.1.0 (berth-0.1.0-ab12cd34)"), None);
+        assert_eq!(copy_name("0.1.0"), None);
+        assert_eq!(copy_name("0.1.0+short"), None);
+        assert_eq!(copy_name("../x+0123456789abcdef"), None);
+        assert_eq!(build_in_copy_name("berth-server"), None);
+        assert_eq!(build_in_copy_name("berth-9.9.9-0123456789abcdef"), None);
     }
 
     #[test]

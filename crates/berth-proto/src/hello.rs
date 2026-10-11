@@ -25,7 +25,10 @@ pub struct Hello {
     pub newest: u16,
     /// Optional capabilities by name. Unknown names are ignored.
     pub features: Vec<String>,
-    /// The sender's build, for logs and for the host row's upgrade notice.
+    /// The sender's build: its version and a hash of its binary. Two builds
+    /// of one version differ in it, which is what an upgrade is offered on,
+    /// and what a message one of them cannot read is put down to (D54).
+    /// Never a reason to refuse a connection: only versions are.
     pub build: String,
 }
 

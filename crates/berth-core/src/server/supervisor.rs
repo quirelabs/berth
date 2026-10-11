@@ -242,6 +242,7 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
             return;
         }
     };
+    let other = opened.other_build(&super::build());
     let (tx, mut rx) = mpsc::channel::<ToApp>(QUEUE);
     if events.send(Event::ClientUp(id, tx)).await.is_err() {
         return;
@@ -272,6 +273,7 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
                         }
                     }
                     Err(error) => {
+                        let error = link::unreadable(error, other.as_ref());
                         tracing::warn!(%error, "a client sent something unreadable");
                         break;
                     }
@@ -281,13 +283,6 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
     }
     writer.abort();
     let _ = events.send(Event::ClientGone(id)).await;
-}
-
-/// The copy-of-the-binary name a build string carries: `berth 0.1.0 (name)`.
-fn copy_name(build: &str) -> Option<String> {
-    let start = build.rfind('(')?;
-    let end = build.rfind(')')?;
-    (start < end).then(|| build[start + 1..end].to_string())
 }
 
 impl State {
@@ -717,7 +712,14 @@ impl State {
                     return;
                 }
             };
-            let info = match describe(&mut opened).await {
+            // A worker left by another build is still reached: its session
+            // lives until it ends (D50). If the two differ on the wire, that
+            // is named as what it is (D54).
+            let other = opened.other_build(&super::build());
+            if let Some(other) = &other {
+                tracing::info!(session, theirs = %other.theirs, "a worker is another build");
+            }
+            let info = match describe(&mut opened, other.as_ref()).await {
                 Ok(info) => info,
                 Err(error) => {
                     let _ = events.send(failed(error.to_string())).await;
@@ -777,6 +779,7 @@ impl State {
                         }
                     }
                     Err(error) => {
+                        let error = link::unreadable(error, other.as_ref());
                         tracing::warn!(session, %error, "a worker sent something unreadable");
                         break;
                     }
@@ -792,9 +795,9 @@ impl State {
         let mut keep: HashSet<String> = self
             .sessions
             .values()
-            .filter_map(|s| copy_name(&s.build))
+            .filter_map(|s| paths::copy_name(&s.build))
             .collect();
-        if let Some(own) = copy_name(&super::build()) {
+        if let Some(own) = paths::copy_name(&super::build()) {
             keep.insert(own);
         }
         if let Launcher::Process { exe } = &self.config.launcher
@@ -808,7 +811,10 @@ impl State {
 
 /// Ask a freshly reached worker what it is. Output it sends first is dropped:
 /// whoever attaches gets a screen.
-async fn describe<S>(opened: &mut link::Opened<S>) -> Result<SessionInfo>
+async fn describe<S>(
+    opened: &mut link::Opened<S>,
+    other: Option<&link::OtherBuild>,
+) -> Result<SessionInfo>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
@@ -820,7 +826,8 @@ where
             .await
             .map_err(|_| Error::Server("a worker did not describe itself".into()))??
             .ok_or_else(|| Error::Server("a worker closed before describing itself".into()))?;
-        if let ToApp::Sessions(mut list) = ToApp::decode(&payload).map_err(protocol)?
+        if let ToApp::Sessions(mut list) =
+            ToApp::decode(&payload).map_err(|e| link::unreadable(e, other))?
             && let Some(info) = list.pop()
         {
             return Ok(info);
@@ -871,18 +878,4 @@ pub fn spawn_detached(
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
     command.spawn().map(|_| ())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_copy_name_comes_out_of_a_build_string() {
-        assert_eq!(
-            copy_name("berth 0.1.0 (berth-0.1.0-ab12cd34)").as_deref(),
-            Some("berth-0.1.0-ab12cd34")
-        );
-        assert_eq!(copy_name("berth 0.1.0"), None);
-    }
 }

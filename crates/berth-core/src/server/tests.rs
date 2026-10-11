@@ -658,6 +658,165 @@ async fn typing_and_resizing_at_a_busy_worker_never_freezes_the_session() {
     let _ = second.to_server.send(ToServer::Kill { session }).await;
 }
 
+/// A stand-in supervisor at `places` that greets as `hello` and then sends
+/// each of `frames` as it is.
+async fn greeting_as(
+    places: &Places,
+    hello: berth_proto::Hello,
+    frames: Vec<Vec<u8>>,
+) -> tokio::task::JoinHandle<()> {
+    places.prepare().unwrap();
+    let mut listener = crate::server::Listener::bind(&places.supervisor())
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let Ok(mut opened) = link::open(stream, &hello).await else {
+            return;
+        };
+        for frame in frames {
+            opened.write.send(&frame).await.unwrap();
+        }
+        // Held open: what the client makes of it is the client's doing.
+        let _ = opened.read.recv().await;
+    })
+}
+
+/// A message as a draft with one field fewer would send it: a session list
+/// cut short of its last byte.
+fn of_another_draft() -> Vec<u8> {
+    let info = v1::SessionInfo {
+        id: 1,
+        name: "one".into(),
+        cwd: None,
+        program: None,
+        cols: 80,
+        rows: 24,
+        claude: None,
+        pid: None,
+        status: None,
+        title: None,
+    };
+    let mut bytes = ToApp::Sessions(vec![info]).encode().unwrap();
+    bytes.pop();
+    assert!(matches!(
+        ToApp::decode(&bytes),
+        Err(berth_proto::Error::Malformed { .. })
+    ));
+    bytes
+}
+
+fn greeting(build: &str) -> berth_proto::Hello {
+    berth_proto::Hello::ours(build, crate::server::FEATURES)
+}
+
+/// The same build on both ends: nothing is flagged, and messages flow.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_build_is_not_remarked_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    let listed = ToApp::Sessions(Vec::new()).encode().unwrap();
+    let _server = greeting_as(&places, link::hello(), vec![listed]).await;
+    let mut app = client::connect(&places).await.unwrap();
+    assert_eq!(app.other_build, None);
+    assert_eq!(app.server_build, crate::server::build());
+    let said = timeout(Duration::from_secs(5), app.from_server.recv()).await;
+    assert!(matches!(said, Ok(Some(ToApp::Sessions(_)))), "{said:?}");
+}
+
+/// Another build of the same protocol version is used all the same, and
+/// known for what it is: what it says that this build can read arrives, and
+/// what it cannot read is put down to the build, never called malformed.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_build_of_the_same_version_is_named_not_called_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    let theirs = format!("{}+0123456789abcdef", env!("CARGO_PKG_VERSION"));
+    let listed = ToApp::Sessions(Vec::new()).encode().unwrap();
+    let unknown = of_another_draft();
+    let _server = greeting_as(&places, greeting(&theirs), vec![listed, unknown.clone()]).await;
+
+    let mut app = client::connect(&places).await.unwrap();
+    assert_eq!(app.agreed.version, 1);
+    let other = app.other_build.clone().expect("another build");
+    assert_eq!(other.theirs, theirs);
+    assert_eq!(other.expected, crate::server::build());
+    let said = timeout(Duration::from_secs(5), app.from_server.recv()).await;
+    assert!(matches!(said, Ok(Some(ToApp::Sessions(_)))), "{said:?}");
+    // Then the one it cannot read: the connection ends, marked as such.
+    let ended = timeout(Duration::from_secs(5), app.from_server.recv()).await;
+    assert_eq!(ended, Ok(None));
+    assert!(app.unreadable.load(std::sync::atomic::Ordering::Relaxed));
+
+    let error = ToApp::decode(&unknown).unwrap_err();
+    let named = link::unreadable(error.clone(), Some(&other)).to_string();
+    assert!(named.contains("different Berth server build"), "{named}");
+    assert!(named.contains(&theirs), "{named}");
+    assert!(!named.contains("malformed"), "{named}");
+    // From this very build the same bytes are a fault, and are called one.
+    let fault = link::unreadable(error, None).to_string();
+    assert!(!fault.contains("different Berth server build"), "{fault}");
+}
+
+/// The app's own handle says so too: asked for a session after such a
+/// supervisor has gone unread, it answers with the build, by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_is_told_a_different_build_is_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    let theirs = format!("{}+0123456789abcdef", env!("CARGO_PKG_VERSION"));
+    let _server = greeting_as(&places, greeting(&theirs), vec![of_another_draft()]).await;
+    let server = super::local::LocalServer::start(places.clone(), super::local::Start::External)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match server.list().await {
+            Err(crate::error::Error::DifferentBuild { theirs: said, .. }) => {
+                assert_eq!(said, theirs);
+                break;
+            }
+            other if tokio::time::Instant::now() >= deadline => {
+                panic!("never named the build: {other:?}")
+            }
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+}
+
+/// A different protocol version is its own answer: refused at the greeting,
+/// with both ranges, whatever the builds are.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_different_version_is_refused_as_a_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    let mut newer = greeting("9.0.0+0123456789abcdef");
+    newer.oldest = berth_proto::NEWEST + 1;
+    newer.newest = berth_proto::NEWEST + 3;
+    let _server = greeting_as(&places, newer, Vec::new()).await;
+    let refused = match client::connect(&places).await {
+        Ok(_) => panic!("connected across versions"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("no protocol version in common"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains(&format!(
+            "the other {} to {}",
+            berth_proto::NEWEST + 1,
+            berth_proto::NEWEST + 3
+        )),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("different Berth server build"),
+        "{refused}"
+    );
+    assert!(!refused.contains("malformed"), "{refused}");
+}
+
 /// A client that queues more for a worker than the worker takes is
 /// disconnected: its own connection, never the worker (D50). The worker here
 /// is a stand-in that greets the supervisor, says what it is and then reads

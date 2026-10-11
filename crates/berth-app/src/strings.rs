@@ -31,6 +31,11 @@ pub const LOCAL_DIRECT_BY_SETTING: &str = "local_direct is on in settings";
 pub fn local_server_failed(error: &str) -> String {
     format!("the local server could not start ({error})")
 }
+/// The server on this machine was left running by another build, and the two
+/// could not read each other (D54). Never worded as a malformed message.
+pub fn local_server_other_build(theirs: &str, ours: &str) -> String {
+    format!("this machine runs a different Berth server build ({theirs}; this app is {ours})")
+}
 
 pub const STATE_DISCONNECTED: &str = "Disconnected";
 pub const STATE_CONNECTING: &str = "Connecting";

@@ -60,6 +60,12 @@ pub enum Error {
     #[error("local server: {0}")]
     Server(String),
 
+    /// The server answering is not the build expected of it, and said
+    /// something this build could not read. Both speak the same protocol
+    /// version, so this is never reported as malformed (D54).
+    #[error("a different Berth server build is running: {theirs}, where {expected} was expected")]
+    DifferentBuild { theirs: String, expected: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
