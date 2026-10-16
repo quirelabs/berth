@@ -33,13 +33,18 @@ pub struct Theme {
     /// Applied as a top border on hosts tagged `prod`.
     pub warning: Rgba,
     /// Status colours that belong to no program: gold for needs you, rose
-    /// for an error, a lighter rose for an error's title, and the dark ink
-    /// a "?" or "!" is drawn in on them.
+    /// for an error, a lighter rose for an error's title, and the dark inks
+    /// a "?" and a "!" are drawn in on them.
     pub gold: Rgba,
     pub rose: Rgba,
     pub rose_text: Rgba,
-    pub ink: Rgba,
+    pub gold_ink: Rgba,
+    pub rose_ink: Rgba,
 }
+
+/// How far the chrome is from the terminal's background towards its
+/// foreground: #131315 to #161618 in the mockup (D53).
+const CHROME: f32 = 0.02;
 
 /// The least contrast a status colour has against the background (D53),
 /// as WCAG asks of graphics.
@@ -70,11 +75,9 @@ impl Theme {
             background,
             // A shade off the terminal's, darker on a dark theme as a window
             // frame is, so the terminal reads as the brighter surface.
-            chrome: if dark {
-                mix(background, rgb(0x000000), 0.35)
-            } else {
-                mix(background, text, 0.05)
-            },
+            // A shade off the terminal's towards the foreground: the
+            // terminal reads as the deeper surface, the chrome around it.
+            chrome: mix(background, text, CHROME),
             surface: mix(background, text, 0.06),
             border: mix(background, text, 0.14),
             text,
@@ -84,7 +87,8 @@ impl Theme {
             gold: legible(gold, background, text, STATUS_CONTRAST),
             rose: legible(rose, background, text, STATUS_CONTRAST),
             rose_text: legible(rose_text, background, text, STATUS_CONTRAST),
-            ink: rgb(0x111114),
+            gold_ink: rgb(0x1d1605),
+            rose_ink: rgb(0x2a0b16),
         }
     }
 
@@ -265,8 +269,8 @@ pub(crate) mod tests {
     #[test]
     fn the_marks_are_legible_on_gold_and_rose() {
         for theme in themes() {
-            assert!(contrast(theme.ink, theme.gold) >= STATUS_CONTRAST);
-            assert!(contrast(theme.ink, theme.rose) >= STATUS_CONTRAST);
+            assert!(contrast(theme.gold_ink, theme.gold) >= STATUS_CONTRAST);
+            assert!(contrast(theme.rose_ink, theme.rose) >= STATUS_CONTRAST);
         }
     }
 

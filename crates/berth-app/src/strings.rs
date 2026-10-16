@@ -181,8 +181,33 @@ pub fn status_count(state: crate::glyph::State, count: usize) -> String {
     )
 }
 
+/// A status bar count as it reads on screen: "3 working", "1 needs you",
+/// "2 errors".
+pub fn status_count_shown(state: crate::glyph::State, count: usize) -> String {
+    use crate::glyph::State;
+    let one = count == 1;
+    let what = match (state, one) {
+        (State::Working, _) => "working",
+        (State::NeedsYou, true) => "needs you",
+        (State::NeedsYou, false) => "need you",
+        (State::Error, true) => "error",
+        (State::Error, false) => "errors",
+        (State::Done, _) => "done",
+        (State::Idle, _) => "idle",
+    };
+    format!("{count} {what}")
+}
+
+/// The status bar's word for this machine, beside the hosts' latencies.
+pub const STATUS_LOCAL: &str = "local";
+
 /// The sidebar's group of sessions that need the user (D53).
-pub const SIDEBAR_NEEDS_YOU: &str = "needs you";
+pub const SIDEBAR_NEEDS_YOU: &str = "Needs you";
+/// The sidebar's foot: a new session, and its key.
+pub const SIDEBAR_NEW_SESSION: &str = "New session";
+pub const KEY_NEW_TAB: &str = "⌘T";
+/// The button at the end of the tab strip, as a screen reader says it.
+pub const NEW_TAB: &str = "New tab";
 
 /// A sidebar row's meta (D53): how long it has been as it is, "done" with
 /// that when it finished, or how its last command exited when that was not
@@ -196,7 +221,7 @@ pub fn row_meta(
     let short = {
         let secs = since.as_secs();
         if secs < 60 {
-            format!("{secs}s")
+            "now".to_string()
         } else if secs < 3600 {
             format!("{}m", secs / 60)
         } else {
@@ -212,20 +237,27 @@ pub fn row_meta(
     }
 }
 
-/// A tab's hover panel heading: its number, how many panes, and the key
-/// that reaches it.
-pub fn tab_panel_header(number: usize, panes: usize) -> String {
-    let panes = if panes == 1 {
+/// A tab's hover panel (D53): its tab, how many panes, the key that
+/// reaches it, and what the keys do there.
+pub fn panel_tab(number: usize) -> String {
+    format!("tab {number}")
+}
+
+pub fn panel_panes(panes: usize) -> String {
+    if panes == 1 {
         "1 pane".to_string()
     } else {
         format!("{panes} panes")
-    };
-    if number <= 9 {
-        format!("tab {number} · {panes} · ⌘{number}")
-    } else {
-        format!("tab {number} · {panes}")
     }
 }
+
+/// The key that reaches tab N: ⌘1 to ⌘9 for the first nine.
+pub fn tab_key(number: usize) -> Option<String> {
+    (1..=9).contains(&number).then(|| format!("⌘{number}"))
+}
+
+pub const PANEL_CHOOSE: &str = "↑↓ choose";
+pub const PANEL_FOCUS: &str = "↵ focus pane";
 
 /// A status in a word or two, as the glyph shows it (D53).
 pub fn state_word(state: crate::glyph::State) -> &'static str {
@@ -236,6 +268,17 @@ pub fn state_word(state: crate::glyph::State) -> &'static str {
         State::Done => "done",
         State::Error => "error",
         State::Idle => "idle",
+    }
+}
+
+/// How long a pane has been in its state, as its status line says it:
+/// "14s", "2m 14s", "1h 5m".
+pub fn elapsed(since: std::time::Duration) -> String {
+    let secs = since.as_secs();
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
     }
 }
 

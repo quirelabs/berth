@@ -1320,7 +1320,8 @@ impl Workspace {
             accent: theme.accent_for(accent),
             gold: theme.gold,
             rose: theme.rose,
-            ink: theme.ink,
+            gold_ink: theme.gold_ink,
+            rose_ink: theme.rose_ink,
             muted: theme.text_muted,
         }
     }

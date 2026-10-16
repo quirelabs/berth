@@ -81,9 +81,11 @@ const DIP: f32 = 0.35;
 /// The shortest wait between frames while a heartbeat dips: 30 a second.
 pub const FRAME: Duration = Duration::from_micros(33_334);
 
-/// A glyph's corners, and the hollow block's stroke.
+/// A glyph's corners, the hollow block's stroke, and the underscore's
+/// height.
 pub const RADIUS: f32 = 1.5;
 pub const STROKE: f32 = 1.5;
+pub const UNDERSCORE: f32 = 2.0;
 
 /// A tab's glyph is a terminal cell: 8 by 14 at the default font size,
 /// following the font's cell. A sidebar's is fixed at 7 by 13, and a tab's
@@ -109,7 +111,9 @@ pub struct Colours {
     pub accent: Rgba,
     pub gold: Rgba,
     pub rose: Rgba,
-    pub ink: Rgba,
+    /// The "?" on gold and the "!" on rose.
+    pub gold_ink: Rgba,
+    pub rose_ink: Rgba,
     pub muted: Rgba,
 }
 
@@ -181,7 +185,7 @@ pub fn glyph(state: State, colours: Colours, at: Moment) -> Glyph {
     let drawn = |shape, colour| Glyph {
         shape,
         colour,
-        ink: colours.ink,
+        ink: colours.gold_ink,
         opacity: 1.0,
     };
     match state {
@@ -202,7 +206,10 @@ pub fn glyph(state: State, colours: Colours, at: Moment) -> Glyph {
             ..drawn(Shape::Marked('?'), colours.gold)
         },
         State::Done => drawn(Shape::Hollow, colours.accent),
-        State::Error => drawn(Shape::Marked('!'), colours.rose),
+        State::Error => Glyph {
+            ink: colours.rose_ink,
+            ..drawn(Shape::Marked('!'), colours.rose)
+        },
         State::Idle => drawn(Shape::Underscore, colours.muted),
     }
 }
@@ -315,7 +322,7 @@ pub fn render(glyph: Glyph, (w, h): (f32, f32)) -> gpui::AnyElement {
             .flex()
             .flex_col()
             .justify_end()
-            .child(div().w_full().h(px(STROKE)).bg(glyph.colour))
+            .child(div().w_full().h(px(UNDERSCORE)).bg(glyph.colour))
             .into_any_element(),
     }
 }
@@ -330,6 +337,9 @@ fn paint_hollow(bounds: Bounds<Pixels>, colour: Rgba, stroke: f32, window: &mut 
         gpui::BorderStyle::Solid,
     ));
 }
+
+/// A hollow cell's stroke in a pane map.
+const MAP_STROKE: f32 = 1.25;
 
 /// A tab's pane map, drawn: plain filled and stroked rects, no text.
 pub fn render_map(cells: Vec<MapCell>) -> gpui::AnyElement {
@@ -354,11 +364,11 @@ pub fn render_map(cells: Vec<MapCell>) -> gpui::AnyElement {
                         };
                         match cell.glyph.shape {
                             Shape::Block | Shape::Marked(_) => {
-                                window.paint_quad(gpui::fill(at, colour).corner_radii(px(1.0)))
+                                window.paint_quad(gpui::fill(at, colour).corner_radii(px(RADIUS)))
                             }
-                            Shape::Hollow | Shape::Underscore => {
-                                paint_hollow(at, colour, 1.0, window)
-                            }
+                            Shape::Hollow => paint_hollow(at, colour, MAP_STROKE, window),
+                            // Idle in a map is an outline, as an unlit cell.
+                            Shape::Underscore => paint_hollow(at, colour, 1.0, window),
                         }
                     }
                 },
@@ -378,7 +388,8 @@ mod tests {
             accent: gpui::rgb(0xd97757),
             gold: gpui::rgb(0xe9b949),
             rose: gpui::rgb(0xf25c86),
-            ink: gpui::rgb(0x111114),
+            gold_ink: gpui::rgb(0x1d1605),
+            rose_ink: gpui::rgb(0x2a0b16),
             muted: gpui::rgb(0x7a7a7c),
         }
     }

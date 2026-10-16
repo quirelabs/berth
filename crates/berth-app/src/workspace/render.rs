@@ -74,16 +74,23 @@ impl Workspace {
             needs_you: &needs_you,
         });
 
+        let needing = rows
+            .iter()
+            .filter(|row| matches!(row, Row::Session { pinned: true, .. }))
+            .count();
         let mut list = div().flex().flex_col().gap(px(1.0));
         for (index, row) in rows.into_iter().enumerate() {
             list = list.child(match row {
                 Row::NeedsYou => div()
+                    .flex()
+                    .mx(px(6.0))
                     .px(px(10.0))
                     .pt(px(8.0))
-                    .pb(px(2.0))
+                    .pb(px(6.0))
                     .text_xs()
                     .text_color(hsla(theme.gold))
                     .child(strings::SIDEBAR_NEEDS_YOU)
+                    .child(div().ml_auto().child(needing.to_string()))
                     .into_any_element(),
                 Row::Heading(name) => div()
                     .px(px(10.0))
@@ -150,18 +157,43 @@ impl Workspace {
         }
 
         div()
-            .id("sidebar")
-            .w(px(220.0))
+            .w(px(SIDEBAR))
             .h_full()
             .flex()
             .flex_col()
-            .gap(px(6.0))
-            .overflow_y_scroll()
             .font_family(self.chrome_font())
             .bg(hsla(theme.chrome))
-            .py(px(6.0))
-            .child(list)
-            .child(self.warnings())
+            .child(
+                div()
+                    .id("sidebar")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(6.0))
+                    .overflow_y_scroll()
+                    .py(px(6.0))
+                    .child(list)
+                    .child(self.warnings()),
+            )
+            // A new session, and the key for it.
+            .child(
+                div()
+                    .id("new-session")
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .px(px(18.0))
+                    .pt(px(10.0))
+                    .pb(px(12.0))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .hover(|row| row.text_color(hsla(theme.text)))
+                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                    .child(strings::SIDEBAR_NEW_SESSION)
+                    .child(div().ml_auto().child(strings::KEY_NEW_TAB)),
+            )
     }
 
     /// A host, or this machine. Clicking a host that is not connected opens it,
@@ -232,17 +264,20 @@ impl Workspace {
                     this.click_folder(clicked.clone(), expanded, cx);
                 }
             }))
-            .hover(|row| row.bg(hsla(theme.border)))
+            .hover(|row| row.bg(hsla(theme.surface)))
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(8.0))
+            .mx(px(6.0))
             .px(px(10.0))
-            .py(px(3.0))
+            .pt(px(14.0))
+            .pb(px(6.0))
+            .rounded(px(6.0))
+            .text_xs()
             .child(
                 div()
                     .flex_shrink_0()
                     .w(px(10.0))
-                    .text_xs()
                     .text_color(hsla(theme.text_muted))
                     .child(if expanded {
                         strings::FOLDER_OPEN
@@ -250,37 +285,42 @@ impl Workspace {
                         strings::FOLDER_CLOSED
                     }),
             )
-            // Never shrink: flex was collapsing this to nothing to make room
-            // for a long label, which took the state indicator away from
-            // exactly the host that most needed one.
             .child(
                 div()
-                    .flex_shrink_0()
-                    .w(px(6.0))
-                    .h(px(6.0))
-                    .rounded(px(3.0))
-                    .bg(dot),
-            )
-            .child(div().truncate().text_color(hsla(theme.text)).child(name));
-        // How far away the host is, on the header's right.
+                    .truncate()
+                    .text_color(hsla(theme.text_muted))
+                    .child(name),
+            );
+        // On the header's right: the connection's dot, and how far away the
+        // host is. Never shrunk: flex was collapsing the dot to nothing to
+        // make room for a long name, which took the state away from exactly
+        // the host that most needed it.
         let latency = self
             .conns
             .get(&alias)
             .and_then(|c| c.rtt)
-            .map(|rtt| format!("{} ms", rtt.as_millis()));
-        if let Some(latency) = latency {
-            row = row.child(
-                div()
-                    .ml_auto()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(hsla(theme.text_muted))
-                    .child(latency),
-            );
-        }
+            .map(|rtt| format!("{}ms", rtt.as_millis()));
+        row = row.child(
+            div()
+                .ml_auto()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(5.0))
+                .text_color(hsla(theme.text_muted))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .rounded(px(2.5))
+                        .bg(dot),
+                )
+                .when_some(latency, |right, latency| right.child(latency)),
+        );
 
         if on_screen {
-            row = row.bg(hsla(theme.border));
+            row = row.bg(hsla(theme.surface));
         }
         if let Some(status) = status {
             // Only the states that need explaining carry a label. Connected is
@@ -418,6 +458,17 @@ impl Workspace {
             exit,
         );
         let tab_number = pane.and_then(|id| self.tab_of(id)).map(|at| at + 1);
+        // A row speaks in its state's tones: gold while it needs you, rose
+        // when it failed, muted at rest or detached, the foreground when
+        // focused.
+        let state = look.as_ref().map(|(_, l)| l.state);
+        let tones = row_tones(
+            theme,
+            state,
+            focused,
+            detached,
+            exit.is_some_and(|c| c != 0),
+        );
         let host = match (&folder, pinned) {
             (crate::sidebar::Folder::Host(alias), true) => Some(self.host_label(alias)),
             _ => None,
@@ -482,19 +533,20 @@ impl Workspace {
                     |drag, _, _, cx| cx.new(|_| drag.clone()),
                 )
             })
-            .hover(|row| row.bg(hsla(theme.surface)))
+            .hover(|row| row.bg(hsla(lit(theme, ROW_IN_TAB))))
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(10.0))
             .mx(px(6.0))
-            .pl(px(if pinned { 6.0 } else { 18.0 }))
-            .pr(px(8.0))
-            .py(px(3.0))
-            .rounded(px(5.0))
+            .h(px(ROW))
+            .px(px(10.0))
+            .rounded(px(6.0))
             // Rows in the tab on screen are lit a little, the focused one
             // more.
-            .when(in_tab && !focused, |row| row.bg(hsla(theme.surface)))
-            .when(focused, |row| row.bg(hsla(theme.border)))
+            .when(in_tab && !focused, |row| {
+                row.bg(hsla(lit(theme, ROW_IN_TAB)))
+            })
+            .when(focused, |row| row.bg(hsla(lit(theme, ROW_FOCUSED))))
             .child(tile)
             .child(
                 div()
@@ -506,32 +558,17 @@ impl Workspace {
                         names.child(
                             div()
                                 .flex_shrink_0()
-                                .text_color(hsla(theme.text_muted))
-                                .child(format!("{host}:")),
+                                .text_color(hsla(tones.muted))
+                                .child(format!("{host} ")),
                         )
                     })
-                    // Detached is dimmer: it is running, but nothing here
-                    // shows it.
-                    .child(
-                        div()
-                            .truncate()
-                            .text_color(hsla(if detached {
-                                theme.text_muted
-                            } else {
-                                theme.text
-                            }))
-                            .child(name),
-                    ),
+                    .child(div().truncate().text_color(hsla(tones.name)).child(name)),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_xs()
-                    .text_color(hsla(if exit.is_some_and(|code| code != 0) {
-                        theme.rose_text
-                    } else {
-                        theme.text_muted
-                    }))
+                    .text_color(hsla(tones.meta))
                     .child(meta),
             )
             .child(
@@ -666,6 +703,9 @@ impl Workspace {
             } else {
                 None
             };
+            // A tab in a state speaks in its tones: its number and host
+            // muted towards the title's gold or rose.
+            let quiet = tone.map(|tone| crate::theme::mix(tone, theme.background, 0.45));
             // The focused pane's glyph, or a map of every pane's.
             let glyph = if others > 0 {
                 crate::glyph::render_map(crate::glyph::pane_map(&tab.root, |pane| {
@@ -771,7 +811,7 @@ impl Workspace {
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_color(hsla(theme.text_muted))
+                        .text_color(hsla(quiet.unwrap_or(theme.text_muted)))
                         .child(number.to_string()),
                 )
                 // Production says so on its tabs, the one colour that is not
@@ -798,7 +838,7 @@ impl Workspace {
                             label.child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_color(hsla(theme.text_muted))
+                                    .text_color(hsla(quiet.unwrap_or(theme.text_muted)))
                                     .child(format!("{host}:")),
                             )
                         })
@@ -834,7 +874,25 @@ impl Workspace {
             }
             strip = strip.child(row);
         }
-        strip
+        // A new tab, at the strip's end.
+        strip.child(
+            div()
+                .id("new-tab")
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .w(px(TAB_BAR))
+                .h(px(TAB_BAR - 2.0 * TAB_INSET))
+                .rounded(px(TAB_RADIUS))
+                .cursor_pointer()
+                .text_color(hsla(theme.text_muted))
+                .hover(|plus| plus.text_color(hsla(theme.text)))
+                .role(gpui::Role::Button)
+                .aria_label(strings::NEW_TAB)
+                .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                .child("+"),
+        )
     }
 
     /// What a tab is called: the focused pane's title as its program gives
@@ -859,6 +917,7 @@ impl Workspace {
         let tab = self.tabs.get(index)?;
         let at = self.tab_bounds.borrow().get(&panel.tab).copied()?;
         let panes = tab.root.panes();
+        let number = index + 1;
         let mut list = div()
             .id("tab-panel")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
@@ -869,38 +928,54 @@ impl Workspace {
             }))
             .flex()
             .flex_col()
-            .min_w(px(280.0))
-            .max_w(px(480.0))
-            .p(px(6.0))
-            .gap(px(2.0))
-            .rounded(px(TAB_RADIUS))
-            .bg(hsla(theme.background))
+            .w(px(PANEL_WIDTH))
+            .rounded(px(9.0))
+            .bg(hsla(theme.surface))
             .font_family(self.chrome_font())
             .text_xs()
             .text_color(hsla(theme.text))
+            // Its tab: the map of its panes, its number, how many, its key.
             .child(
                 div()
-                    .px(px(6.0))
-                    .pb(px(4.0))
-                    .text_color(hsla(theme.text_muted))
-                    .child(strings::tab_panel_header(index + 1, panes.len())),
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(14.0))
+                    .pt(px(12.0))
+                    .pb(px(10.0))
+                    .child(crate::glyph::render_map(crate::glyph::pane_map(
+                        &tab.root,
+                        |pane| self.pane_glyph(pane),
+                    )))
+                    .child(strings::panel_tab(number))
+                    .child(
+                        div()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::panel_panes(panes.len())),
+                    )
+                    .when_some(strings::tab_key(number), |header, key| {
+                        header.child(
+                            div()
+                                .ml_auto()
+                                .text_color(hsla(theme.text_muted))
+                                .child(key),
+                        )
+                    }),
             );
+        let mut rows = div().flex().flex_col().px(px(6.0));
         for (row_index, pane_id) in panes.iter().enumerate() {
             let Some(pane) = self.pane(*pane_id) else {
                 continue;
             };
             let pane_id = *pane_id;
             let look = self.pane_look(pane_id);
+            let state = look.as_ref().map(|l| l.state);
             let program = self
                 .pane_program(pane)
                 .or(look.as_ref().and_then(|l| l.program.as_deref()))
-                .map(crate::programs::display_name);
-            let who = match (&program, pane.is_local()) {
-                (Some(program), true) => program.clone(),
-                (Some(program), false) => format!("{program} · {}", self.host_label(pane.alias())),
-                (None, true) => strings::LOCAL_ALIAS.to_string(),
-                (None, false) => self.host_label(pane.alias()),
-            };
+                .map(crate::programs::display_name)
+                .unwrap_or_else(|| strings::LOCAL_ALIAS.to_string());
+            let host = (!pane.is_local()).then(|| self.host_label(pane.alias()));
             let directory = pane
                 .session
                 .and_then(|session| self.local_sessions.iter().find(|i| i.id == session))
@@ -911,12 +986,17 @@ impl Workspace {
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(" · ");
-            let since = look
-                .as_ref()
-                .map(|_| strings::status_since(self.status_since(StatusKey::Pane(pane_id))))
-                .unwrap_or_default();
+            let when = match state {
+                None | Some(crate::glyph::State::Idle) => {
+                    strings::state_word(crate::glyph::State::Idle).to_string()
+                }
+                Some(_) => {
+                    strings::row_meta(state, self.status_since(StatusKey::Pane(pane_id)), None)
+                }
+            };
+            let tones = row_tones(theme, state, true, false, false);
             let chosen = row_index == panel.selected;
-            list = list.child(
+            rows = rows.child(
                 div()
                     .id(("tab-panel-row", pane_id as usize))
                     .cursor_pointer()
@@ -926,32 +1006,64 @@ impl Workspace {
                     }))
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
-                    .px(px(6.0))
-                    .py(px(3.0))
-                    .rounded(px(4.0))
-                    .when(chosen, |row| row.bg(hsla(theme.surface)))
-                    .hover(|row| row.bg(hsla(theme.surface)))
-                    .child(crate::glyph::render(
-                        self.pane_glyph(pane_id),
-                        crate::glyph::SIDEBAR,
-                    ))
-                    .child(div().flex_shrink_0().child(who))
+                    .gap(px(10.0))
+                    .p(px(8.0))
+                    .rounded(px(6.0))
+                    .when(chosen, |row| {
+                        row.bg(hsla(crate::theme::mix(theme.surface, theme.text, 0.05)))
+                    })
+                    .hover(|row| row.bg(hsla(crate::theme::mix(theme.surface, theme.text, 0.05))))
                     .child(
                         div()
+                            .flex_shrink_0()
+                            .w(px(20.0))
+                            .child(crate::glyph::render(
+                                self.pane_glyph(pane_id),
+                                crate::glyph::tab_size(None, self.settings.font_size),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
-                            .truncate()
-                            .text_color(hsla(theme.text_muted))
-                            .child(what),
+                            .min_w_0()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(6.0))
+                                    .text_color(hsla(tones.name))
+                                    .child(program)
+                                    .when_some(host, |line, host| {
+                                        line.child(div().text_color(hsla(tones.muted)).child(host))
+                                    }),
+                            )
+                            .when(!what.is_empty(), |lines| {
+                                lines.child(
+                                    div().truncate().text_color(hsla(tones.meta)).child(what),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
-                            .text_color(hsla(theme.text_muted))
-                            .child(since),
+                            .text_color(hsla(tones.meta))
+                            .child(when),
                     ),
             );
         }
+        list = list.child(rows).child(
+            div()
+                .flex()
+                .gap(px(14.0))
+                .px(px(14.0))
+                .pt(px(9.0))
+                .pb(px(11.0))
+                .text_color(hsla(theme.text_muted))
+                .child(strings::PANEL_CHOOSE)
+                .child(strings::PANEL_FOCUS),
+        );
         Some(
             gpui::deferred(
                 gpui::anchored()
@@ -1427,55 +1539,66 @@ impl Workspace {
                 let needs_you =
                     look.as_ref().map(|l| l.state) == Some(crate::glyph::State::NeedsYou);
                 if split {
+                    // The header's glyph moves with its tab's, on the same
+                    // timer: no wakeup of its own.
                     let glyph = match &look {
-                        Some(look) => self.glyph_of(StatusKey::Pane(pane_id), look, true),
+                        Some(look) => self.glyph_of(StatusKey::Pane(pane_id), look, false),
                         None => self.pane_glyph(pane_id),
                     };
                     let message = look
                         .as_ref()
                         .and_then(|l| l.msg.clone())
                         .unwrap_or_default();
-                    let named = [program.clone(), directory.clone()]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    body = body.child(first_bar(
-                        div()
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap(px(6.0))
-                            .px(px(8.0))
-                            .py(px(3.0))
-                            .text_xs()
-                            .font_family(self.chrome_font())
-                            .bg(hsla(if needs_you {
-                                crate::theme::mix(theme.background, theme.gold, NEEDS_YOU_TINT)
-                            } else {
-                                theme.background
-                            }))
-                            .text_color(hsla(if focused {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            }))
-                            .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR))
-                            .child(div().flex_shrink_0().child(if named.is_empty() {
-                                pane.alias().to_string()
-                            } else {
-                                named
-                            }))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_right()
-                                    .text_color(hsla(theme.text_muted))
-                                    .child(message),
-                            ),
-                        true,
-                    ));
+                    let mix = crate::theme::mix;
+                    let (name_tone, quiet) = if needs_you {
+                        (
+                            mix(theme.gold, theme.text, 0.5),
+                            mix(theme.gold, theme.background, 0.35),
+                        )
+                    } else if focused {
+                        (theme.text, theme.text_muted)
+                    } else {
+                        (mix(theme.text, theme.background, 0.15), theme.text_muted)
+                    };
+                    body =
+                        body.child(first_bar(
+                            div()
+                                .flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(9.0))
+                                .h(px(PANE_HEADER))
+                                .px(px(16.0))
+                                .text_xs()
+                                .font_family(self.chrome_font())
+                                .bg(hsla(if needs_you {
+                                    mix(theme.background, theme.gold, NEEDS_YOU_TINT)
+                                } else {
+                                    theme.background
+                                }))
+                                .text_color(hsla(name_tone))
+                                .child(crate::glyph::render(glyph, PANE_GLYPH))
+                                .child(div().flex_shrink_0().child(
+                                    program.clone().unwrap_or_else(|| pane.alias().to_string()),
+                                ))
+                                .when_some(directory.clone(), |header, directory| {
+                                    header.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(hsla(quiet))
+                                            .child(directory),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_right()
+                                        .text_color(hsla(quiet))
+                                        .child(message),
+                                ),
+                            true,
+                        ));
                 }
                 // Never a silent fallback: a local tab running its shell
                 // outside the local server says so, and why (D50).
@@ -1509,18 +1632,16 @@ impl Workspace {
                 // keys needs no border to say so; how far is berth.toml's.
                 let dim = split && !focused;
                 let opacity = self.unfocused_opacity;
-                // Each pane's own status line: its state and for how long.
-                let line = match &look {
-                    Some(look) => format!(
-                        "{} {}",
-                        strings::state_word(look.state),
-                        strings::status_since(self.status_since(StatusKey::Pane(pane_id)))
-                    ),
-                    None => strings::state_word(crate::glyph::State::Idle).to_string(),
-                };
-                let tone = match look.as_ref().map(|l| l.state) {
-                    Some(crate::glyph::State::NeedsYou) => theme.gold,
-                    Some(crate::glyph::State::Error) => theme.rose_text,
+                // Each pane's own status line: its state on the left, and for
+                // how long on the right.
+                let state = look.as_ref().map_or(crate::glyph::State::Idle, |l| l.state);
+                let elapsed = look
+                    .as_ref()
+                    .map(|_| strings::elapsed(self.status_since(StatusKey::Pane(pane_id))))
+                    .unwrap_or_default();
+                let tone = match state {
+                    crate::glyph::State::NeedsYou => theme.gold,
+                    crate::glyph::State::Error => theme.rose_text,
                     _ => theme.text_muted,
                 };
                 body.child(
@@ -1533,9 +1654,11 @@ impl Workspace {
                 )
                 .child(
                     div()
+                        .flex()
                         .flex_shrink_0()
-                        .px(px(8.0))
-                        .py(px(2.0))
+                        .items_center()
+                        .h(px(PANE_LINE))
+                        .px(px(16.0))
                         .text_xs()
                         .font_family(self.chrome_font())
                         .bg(hsla(theme.background))
@@ -1543,7 +1666,8 @@ impl Workspace {
                         .rounded_br(px(corner(outer[2])))
                         .text_color(hsla(tone))
                         .when(dim, |line| line.opacity(opacity))
-                        .child(line),
+                        .child(strings::state_word(state))
+                        .child(div().ml_auto().child(elapsed)),
                 )
                 .into_any_element()
             }
@@ -1675,71 +1799,59 @@ impl Workspace {
     fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::glyph::State;
         let theme = self.theme;
+        let mix = crate::theme::mix;
         let mut bar = div()
-            .h(px(24.0))
+            .h(px(26.0))
             .flex()
+            .flex_shrink_0()
             .items_center()
-            .gap(px(14.0))
-            .px(px(12.0))
+            .gap(px(18.0))
+            .px(px(14.0))
             .font_family(self.chrome_font())
             .bg(hsla(theme.chrome))
             .text_xs()
             .text_color(hsla(theme.text_muted));
+        // Only what there is: a count of none says nothing.
         for state in [State::Working, State::NeedsYou, State::Error] {
             let count = self.status_targets(state).len();
-            let glyph = crate::glyph::glyph(
-                state,
-                self.glyph_colours(None),
-                crate::glyph::Moment {
-                    clock: Duration::ZERO,
-                    since: Duration::ZERO,
-                    steady: true,
-                    still: true,
-                },
-            );
-            let tone = match (state, count) {
-                (_, 0) => theme.text_muted,
-                (State::NeedsYou, _) => theme.gold,
-                (State::Error, _) => theme.rose_text,
-                _ => theme.text,
+            if count == 0 {
+                continue;
+            }
+            // Working in the foreground here, not any one program's accent:
+            // the count is of every program's.
+            let (fill, tone) = match state {
+                State::NeedsYou => (theme.gold, mix(theme.gold, theme.text, 0.25)),
+                State::Error => (theme.rose, mix(theme.rose, theme.text, 0.25)),
+                _ => (mix(theme.text, theme.background, 0.3), theme.text_muted),
             };
             bar = bar.child(
                 div()
                     .id(gpui::ElementId::Name(format!("count-{state:?}").into()))
                     .flex()
                     .items_center()
-                    .gap(px(5.0))
-                    .when(count > 0, |chip| {
-                        chip.cursor_pointer().on_click(
-                            cx.listener(move |this, _, _, cx| this.cycle_status(state, cx)),
-                        )
-                    })
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .text_color(hsla(tone))
+                    .hover(|chip| chip.text_color(hsla(theme.text)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.cycle_status(state, cx)))
                     .role(gpui::Role::Button)
                     .aria_label(strings::status_count(state, count))
-                    .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR))
-                    .child(div().text_color(hsla(tone)).child(count.to_string())),
+                    .child(div().w(px(5.0)).h(px(9.0)).rounded(px(1.0)).bg(hsla(fill)))
+                    .child(strings::status_count_shown(state, count)),
             );
         }
-        let mut hosts = div().ml_auto().flex().gap(px(14.0));
+        let mut hosts = div().ml_auto().flex().gap(px(18.0));
         for (alias, conn) in &self.conns {
             if alias == strings::LOCAL_ALIAS {
                 continue;
             }
             let Some(rtt) = conn.rtt else { continue };
-            hosts = hosts.child(
-                div()
-                    .flex()
-                    .gap(px(5.0))
-                    .child(self.host_label(alias))
-                    .child(
-                        div()
-                            .text_color(hsla(theme.text))
-                            .child(format!("{} ms", rtt.as_millis())),
-                    ),
-            );
+            hosts = hosts.child(format!("{} {}ms", self.host_label(alias), rtt.as_millis()));
         }
-        bar = bar.child(hosts);
-        bar
+        if self.panes.iter().any(|p| p.is_local()) || !self.local_sessions.is_empty() {
+            hosts = hosts.child(strings::STATUS_LOCAL);
+        }
+        bar.child(hosts)
     }
 }
 
@@ -1939,7 +2051,11 @@ const PILL_OPACITY: f32 = 0.35;
 /// A pane corner facing the edge of the pane area.
 const PANE_RADIUS: f32 = 8.0;
 /// How much gold tints the header of a pane that needs the user.
-const NEEDS_YOU_TINT: f32 = 0.18;
+const NEEDS_YOU_TINT: f32 = 0.06;
+/// A split pane's header, its glyph, and every pane's status line (D53).
+const PANE_HEADER: f32 = 26.0;
+const PANE_GLYPH: (f32, f32) = (6.0, 11.0);
+const PANE_LINE: f32 = 24.0;
 
 /// A program's tile in the sidebar (D53): an agent's mark in white on its
 /// brand's colour, dark on a light tile for one without, and anything else
@@ -1968,6 +2084,72 @@ fn program_tile(program: crate::programs::Program, theme: Theme) -> gpui::Div {
         )
 }
 
+/// A sidebar row's height, and how much the rows of the tab on screen and
+/// the focused one are lit (D53).
+const ROW: f32 = 30.0;
+const ROW_IN_TAB: f32 = 0.035;
+const ROW_FOCUSED: f32 = 0.075;
+
+/// The chrome lit towards the foreground by `by`.
+fn lit(theme: Theme, by: f32) -> gpui::Rgba {
+    crate::theme::mix(theme.chrome, theme.text, by)
+}
+
+/// The colours of a sidebar row's name, its muted parts and its meta.
+struct Tones {
+    name: gpui::Rgba,
+    muted: gpui::Rgba,
+    meta: gpui::Rgba,
+}
+
+fn row_tones(
+    theme: Theme,
+    state: Option<crate::glyph::State>,
+    focused: bool,
+    detached: bool,
+    failed: bool,
+) -> Tones {
+    use crate::glyph::State;
+    let mix = crate::theme::mix;
+    match state {
+        Some(State::NeedsYou) => Tones {
+            name: mix(theme.gold, theme.text, 0.5),
+            muted: mix(theme.gold, theme.background, 0.45),
+            meta: mix(theme.gold, theme.background, 0.25),
+        },
+        Some(State::Error) => Tones {
+            name: theme.rose_text,
+            muted: mix(theme.rose, theme.background, 0.35),
+            meta: mix(theme.rose, theme.background, 0.3),
+        },
+        _ if failed => Tones {
+            name: theme.text_muted,
+            muted: theme.text_muted,
+            meta: mix(theme.rose, theme.background, 0.3),
+        },
+        Some(State::Idle) | None if detached => Tones {
+            name: theme.text_muted,
+            muted: theme.text_muted,
+            meta: theme.text_muted,
+        },
+        _ => Tones {
+            name: if focused {
+                theme.text
+            } else {
+                mix(theme.text, theme.background, 0.08)
+            },
+            muted: theme.text_muted,
+            meta: theme.text_muted,
+        },
+    }
+}
+
+/// A tab's hover panel's width (D53).
+const PANEL_WIDTH: f32 = 440.0;
+
+/// The sidebar's width (D53).
+const SIDEBAR: f32 = 244.0;
+
 /// A program tile's size, corner and mark.
 const TILE: f32 = 18.0;
 const TILE_RADIUS: f32 = 4.0;
@@ -1982,7 +2164,7 @@ fn corner(outside: bool) -> f32 {
 const TAB_LABEL_MAX: f32 = 200.0;
 /// The tab bar's height, how far a tab sits in from its top and bottom, and
 /// a tab's corner (D53).
-const TAB_BAR: f32 = 34.0;
+const TAB_BAR: f32 = 38.0;
 const TAB_INSET: f32 = 5.0;
 const TAB_RADIUS: f32 = 7.0;
 
@@ -2100,6 +2282,8 @@ mod tests {
             "1 session needs you"
         );
         assert_eq!(strings::status_count(Glyph::Error, 3), "3 sessions failed");
+        assert_eq!(strings::status_count_shown(Glyph::Working, 3), "3 working");
+        assert_eq!(strings::status_count_shown(Glyph::Error, 1), "1 error");
     }
 
     /// A row says how long it has been as it is, "done" when it finished,
@@ -2117,7 +2301,7 @@ mod tests {
             strings::row_meta(Some(State::Error), s(5), Some(1)),
             "exit 1"
         );
-        assert_eq!(strings::row_meta(Some(State::Error), s(5), None), "5s");
+        assert_eq!(strings::row_meta(Some(State::Error), s(5), None), "now");
         assert_eq!(strings::row_meta(None, s(5), Some(2)), "exit 2");
         assert_eq!(strings::row_meta(None, s(5), Some(0)), "");
         assert_eq!(
@@ -2150,10 +2334,20 @@ mod tests {
     }
 
     #[test]
+    fn a_panes_line_says_how_long() {
+        let s = Duration::from_secs;
+        assert_eq!(strings::elapsed(s(14)), "14s");
+        assert_eq!(strings::elapsed(s(134)), "2m 14s");
+        assert_eq!(strings::elapsed(s(3900)), "1h 5m");
+    }
+
+    #[test]
     fn a_tab_panel_says_its_tab_panes_and_key() {
-        assert_eq!(strings::tab_panel_header(2, 3), "tab 2 · 3 panes · ⌘2");
-        assert_eq!(strings::tab_panel_header(1, 1), "tab 1 · 1 pane · ⌘1");
-        assert_eq!(strings::tab_panel_header(12, 2), "tab 12 · 2 panes");
+        assert_eq!(strings::panel_tab(2), "tab 2");
+        assert_eq!(strings::panel_panes(1), "1 pane");
+        assert_eq!(strings::panel_panes(3), "3 panes");
+        assert_eq!(strings::tab_key(2).as_deref(), Some("⌘2"));
+        assert_eq!(strings::tab_key(12), None);
     }
 
     /// The tooltip gives the program's own words, as a report, named by its
