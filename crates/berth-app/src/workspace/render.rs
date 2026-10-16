@@ -60,6 +60,10 @@ impl Workspace {
                 (name, agent)
             })
             .collect();
+        let needs_you = |folder: &crate::sidebar::Folder, name: &str, pane: Option<u64>| {
+            self.row_look(folder, name, pane)
+                .is_some_and(|(_, look)| look.state == crate::glyph::State::NeedsYou)
+        };
         let rows = crate::sidebar::rows(&Input {
             hosts: &hosts,
             open: &open,
@@ -67,11 +71,20 @@ impl Workspace {
             expanded: &self.expanded,
             local_label: &shell,
             local_detached: &detached,
+            needs_you: &needs_you,
         });
 
         let mut list = div().flex().flex_col().gap(px(1.0));
         for (index, row) in rows.into_iter().enumerate() {
             list = list.child(match row {
+                Row::NeedsYou => div()
+                    .px(px(10.0))
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .text_xs()
+                    .text_color(hsla(theme.gold))
+                    .child(strings::SIDEBAR_NEEDS_YOU)
+                    .into_any_element(),
                 Row::Heading(name) => div()
                     .px(px(10.0))
                     .pt(px(8.0))
@@ -89,8 +102,9 @@ impl Workspace {
                     folder,
                     name,
                     pane,
-                    agent,
-                } => self.session_row(index, folder, name, pane, agent, cx),
+                    pinned,
+                    ..
+                } => self.session_row(index, folder, name, pane, pinned, cx),
                 Row::NewTerminal(folder) => div()
                     .id(("new-terminal", index))
                     .cursor_pointer()
@@ -247,7 +261,23 @@ impl Workspace {
                     .rounded(px(3.0))
                     .bg(dot),
             )
-            .child(div().text_color(hsla(theme.text)).child(name));
+            .child(div().truncate().text_color(hsla(theme.text)).child(name));
+        // How far away the host is, on the header's right.
+        let latency = self
+            .conns
+            .get(&alias)
+            .and_then(|c| c.rtt)
+            .map(|rtt| format!("{} ms", rtt.as_millis()));
+        if let Some(latency) = latency {
+            row = row.child(
+                div()
+                    .ml_auto()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(hsla(theme.text_muted))
+                    .child(latency),
+            );
+        }
 
         if on_screen {
             row = row.bg(hsla(theme.border));
@@ -299,27 +329,57 @@ impl Workspace {
 
     /// One session under its folder. Open ones are switched to, detached ones
     /// are reattached in a tab of their own.
+    /// A local server session no tab shows, found again by the name the
+    /// tree gave it.
+    fn local_session_named(&self, name: &str) -> Option<u64> {
+        self.detached_local()
+            .into_iter()
+            .find(|(_, n)| n == name)
+            .map(|(id, _)| id)
+    }
+
+    /// What a sidebar row's session shows: its pane's status, or a local
+    /// session's no pane shows. A remote session no pane shows has none.
+    fn row_look(
+        &self,
+        folder: &crate::sidebar::Folder,
+        name: &str,
+        pane: Option<u64>,
+    ) -> Option<(StatusKey, StatusLook)> {
+        match (pane, folder) {
+            (Some(id), _) => Some((StatusKey::Pane(id), self.pane_look(id)?)),
+            (None, crate::sidebar::Folder::Local) => {
+                let session = self.local_session_named(name)?;
+                Some((StatusKey::Session(session), self.session_look(session)?))
+            }
+            (None, crate::sidebar::Folder::Host(_)) => None,
+        }
+    }
+
+    /// One session (D53): its program's tile, its name, how long it has been
+    /// as it is or how it exited, the number of the tab showing it, and its
+    /// glyph, which never moves here. Open ones are switched to, detached
+    /// ones are reattached in a tab of their own. A pinned one is in the
+    /// needs-you group, a remote one there with its host in front.
     fn session_row(
         &self,
         index: usize,
         folder: crate::sidebar::Folder,
         name: String,
         pane: Option<u64>,
-        agent: bool,
+        pinned: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = self.theme;
         let focused = pane.is_some() && self.focused().map(|p| p.id) == pane;
+        let in_tab = pane.is_some_and(|id| self.tab().is_some_and(|t| t.root.contains(id)));
         let detached = pane.is_none();
-
-        // A local server session no tab shows, found again by the name the
-        // tree gave it.
-        let local_session = self
-            .detached_local()
-            .into_iter()
-            .find(|(_, n)| *n == name)
-            .map(|(id, _)| id);
-        // What runs in it, for the stone of an agent that says nothing.
+        let local_session = match (&folder, pane) {
+            (crate::sidebar::Folder::Local, None) => self.local_session_named(&name),
+            (_, Some(id)) => self.pane(id).and_then(|p| p.session),
+            _ => None,
+        };
+        // What runs in it, for its tile.
         let program: Option<String> = match (pane.and_then(|id| self.pane(id)), &folder) {
             (Some(pane), _) => self.pane_program(pane),
             (None, crate::sidebar::Folder::Host(alias)) => self.remote_program(alias, &name),
@@ -346,6 +406,32 @@ impl Workspace {
                 local_session.map(|session| crate::menu::Target::LocalDetached { session })
             }
         };
+        let look = self.row_look(&folder, &name, pane);
+        let exit = local_session
+            .and_then(|session| self.local_sessions.iter().find(|s| s.id == session))
+            .and_then(|info| info.exit);
+        let meta = strings::row_meta(
+            look.as_ref().map(|(_, look)| look.state),
+            look.as_ref()
+                .map(|(key, _)| self.status_since(*key))
+                .unwrap_or_default(),
+            exit,
+        );
+        let tab_number = pane.and_then(|id| self.tab_of(id)).map(|at| at + 1);
+        let host = match (&folder, pinned) {
+            (crate::sidebar::Folder::Host(alias), true) => Some(self.host_label(alias)),
+            _ => None,
+        };
+        let tile = program_tile(
+            crate::programs::lookup(
+                program
+                    .as_deref()
+                    .or(look.as_ref().and_then(|(_, l)| l.program.as_deref()))
+                    .unwrap_or_default(),
+            ),
+            theme,
+        );
+
         let mut row = div()
             .id(("session", index))
             .on_mouse_down(
@@ -377,36 +463,88 @@ impl Workspace {
                     |drag, _, _, cx| cx.new(|_| drag.clone()),
                 )
             })
-            .hover(|row| row.bg(hsla(theme.border)))
+            .hover(|row| row.bg(hsla(theme.surface)))
             .flex()
             .items_center()
-            .gap(px(6.0))
-            .pl(px(INDENT))
-            .pr(px(10.0))
-            .py(px(2.0))
-            // Detached is dimmer: it is running, but nothing here shows it.
+            .gap(px(8.0))
+            .mx(px(6.0))
+            .pl(px(if pinned { 6.0 } else { 18.0 }))
+            .pr(px(8.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            // Rows in the tab on screen are lit a little, the focused one
+            // more.
+            .when(in_tab && !focused, |row| row.bg(hsla(theme.surface)))
+            .when(focused, |row| row.bg(hsla(theme.border)))
+            .child(tile)
             .child(
                 div()
-                    .text_color(hsla(if detached {
-                        theme.text_muted
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when_some(host, |names, host| {
+                        names.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(hsla(theme.text_muted))
+                                .child(format!("{host}:")),
+                        )
+                    })
+                    // Detached is dimmer: it is running, but nothing here
+                    // shows it.
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(hsla(if detached {
+                                theme.text_muted
+                            } else {
+                                theme.text
+                            }))
+                            .child(name),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(hsla(if exit.is_some_and(|code| code != 0) {
+                        theme.rose_text
                     } else {
-                        theme.text
+                        theme.text_muted
                     }))
-                    .child(name),
+                    .child(meta),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(px(12.0))
+                    .text_xs()
+                    .text_right()
+                    .text_color(hsla(theme.text_muted))
+                    .child(tab_number.map(|n| n.to_string()).unwrap_or_default()),
             );
-        if focused {
-            row = row.bg(hsla(theme.border));
-        }
-        // What the session's programs report of themselves comes first
-        // (OSC 7501, D53); Claude's hooks are the fallback for a Claude too
-        // old to report that way. The glyph is at the row's end and never
-        // moves: a visible sidebar costs no wakeups.
-        let look = match pane {
-            Some(id) => self.pane_look(id).map(|look| (StatusKey::Pane(id), look)),
-            None => local_session.and_then(|session| {
-                Some((StatusKey::Session(session), self.session_look(session)?))
-            }),
+        // The glyph, in a column of its own at the end; never moving, so a
+        // visible sidebar costs no wakeups.
+        let glyph = match &look {
+            Some((key, look)) => self.glyph_of(*key, look, true),
+            None => crate::glyph::glyph(
+                crate::glyph::State::Idle,
+                self.glyph_colours(program.as_deref()),
+                crate::glyph::Moment {
+                    clock: Duration::ZERO,
+                    since: Duration::ZERO,
+                    steady: true,
+                    still: true,
+                },
+            ),
         };
+        row = row.child(
+            div()
+                .flex_shrink_0()
+                .w(px(crate::glyph::SIDEBAR.0))
+                .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR)),
+        );
         let mut words = match &look {
             Some((key, look)) => format!(
                 "{}\n{}",
@@ -421,14 +559,6 @@ impl Workspace {
             }
             words.push_str(strings::SESSION_DETACHED_TOOLTIP);
         }
-        if let Some((key, look)) = &look {
-            let glyph = self.glyph_of(*key, look, true);
-            row = row.child(
-                div()
-                    .ml_auto()
-                    .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR)),
-            );
-        }
         if !words.is_empty() {
             row = row.tooltip(move |_, cx| {
                 cx.new(|_| Note {
@@ -438,7 +568,6 @@ impl Workspace {
                 .into()
             });
         }
-        let _ = (agent, program);
         row.into_any_element()
     }
 
@@ -1776,6 +1905,38 @@ const PANE_RADIUS: f32 = 8.0;
 /// How much gold tints the header of a pane that needs the user.
 const NEEDS_YOU_TINT: f32 = 0.18;
 
+/// A program's tile in the sidebar (D53): an agent's mark in white on its
+/// brand's colour, dark on a light tile for one without, and anything else
+/// a Phosphor glyph on the raised surface.
+fn program_tile(program: crate::programs::Program, theme: Theme) -> gpui::Div {
+    use crate::programs::Tile;
+    let (fill, mark) = match program.tile {
+        Tile::Brand(colour) => (gpui::rgb(colour), gpui::rgb(0xffffff)),
+        Tile::Light => (gpui::rgb(0xececee), gpui::rgb(0x111114)),
+        Tile::Neutral => (theme.surface, theme.text_muted),
+    };
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .w(px(TILE))
+        .h(px(TILE))
+        .rounded(px(TILE_RADIUS))
+        .bg(hsla(fill))
+        .child(
+            gpui::svg()
+                .path(program.icon)
+                .size(px(TILE_MARK))
+                .text_color(hsla(mark)),
+        )
+}
+
+/// A program tile's size, corner and mark.
+const TILE: f32 = 18.0;
+const TILE_RADIUS: f32 = 4.0;
+const TILE_MARK: f32 = 12.0;
+
 /// A pane corner's radius: rounded on the outside, square where panes meet.
 fn corner(outside: bool) -> f32 {
     if outside { PANE_RADIUS } else { 0.0 }
@@ -1906,6 +2067,30 @@ mod tests {
                 Duration::from_secs(5)
             ),
             "A program working: Building (for 5 s)"
+        );
+    }
+
+    /// A row says how long it has been as it is, "done" when it finished,
+    /// and how its last command failed when it did.
+    #[test]
+    fn a_rows_meta_says_time_done_or_exit() {
+        use crate::glyph::State;
+        let s = Duration::from_secs;
+        assert_eq!(strings::row_meta(Some(State::Working), s(130), None), "2m");
+        assert_eq!(
+            strings::row_meta(Some(State::Done), s(240), Some(0)),
+            "done 4m"
+        );
+        assert_eq!(
+            strings::row_meta(Some(State::Error), s(5), Some(1)),
+            "exit 1"
+        );
+        assert_eq!(strings::row_meta(Some(State::Error), s(5), None), "5s");
+        assert_eq!(strings::row_meta(None, s(5), Some(2)), "exit 2");
+        assert_eq!(strings::row_meta(None, s(5), Some(0)), "");
+        assert_eq!(
+            strings::row_meta(Some(State::NeedsYou), s(7200), None),
+            "2h"
         );
     }
 

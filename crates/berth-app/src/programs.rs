@@ -1,5 +1,6 @@
 //! What runs in a session, by name: one table from a foreground process name
-//! to the icon a tab shows and the accent its status is drawn in (D53).
+//! to its name, its sidebar tile and the accent its status is drawn in
+//! (D53).
 //!
 //! The name is the process's own, as the machine reports it: `claude`,
 //! `python3.12`, `-zsh`, `/usr/bin/nvim`. Anything not in the table, and any
@@ -23,6 +24,18 @@ pub struct Program {
     pub icon: &'static str,
     /// The colour its status is drawn in, as `0xrrggbb`.
     pub accent: Option<u32>,
+    /// Its tile in the sidebar.
+    pub tile: Tile,
+}
+
+/// A program's tile in the sidebar (D53): an agent's mark in white on its
+/// brand's colour, or dark on a light tile for one without a brand colour;
+/// anything else a Phosphor glyph on the raised surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tile {
+    Brand(u32),
+    Light,
+    Neutral,
 }
 
 /// What an unknown program and a plain shell look like.
@@ -30,6 +43,7 @@ pub const GENERIC: Program = Program {
     name: "",
     icon: icons::TERMINAL,
     accent: None,
+    tile: Tile::Neutral,
 };
 
 const fn tool(name: &'static str, icon: &'static str) -> Program {
@@ -37,6 +51,7 @@ const fn tool(name: &'static str, icon: &'static str) -> Program {
         name,
         icon,
         accent: None,
+        tile: Tile::Neutral,
     }
 }
 
@@ -45,6 +60,18 @@ const fn agent(name: &'static str, icon: &'static str, accent: u32) -> Program {
         name,
         icon,
         accent: Some(accent),
+        tile: Tile::Brand(accent),
+    }
+}
+
+/// An agent with no brand colour: a light tile, and the foreground for its
+/// status unless it has an accent of its own.
+const fn plain_agent(name: &'static str, icon: &'static str, accent: Option<u32>) -> Program {
+    Program {
+        name,
+        icon,
+        accent,
+        tile: Tile::Light,
     }
 }
 
@@ -55,12 +82,12 @@ const TABLE: &[(&str, Program)] = &[
     // them are accepted; gold and rose are kept apart from all of them.
     // Cursor has no brand colour and is drawn in the foreground.
     ("claude", agent("claude", icons::CLAUDE, 0xd97757)),
-    ("codex", agent("codex", icons::CODEX, 0x2bc49b)),
-    ("copilot", agent("copilot", icons::TERMINAL, 0x8534f3)),
-    ("mistral", agent("mistral", icons::TERMINAL, 0xfa520f)),
-    ("qwen", agent("qwen", icons::TERMINAL, 0x615ced)),
-    ("gemini", agent("gemini", icons::TERMINAL, 0x4285f4)),
-    ("cursor-agent", tool("cursor", icons::TERMINAL)),
+    ("codex", plain_agent("codex", icons::CODEX, Some(0x2bc49b))),
+    ("copilot", agent("copilot", icons::COPILOT, 0x8534f3)),
+    ("mistral", agent("mistral", icons::MISTRAL, 0xfa520f)),
+    ("qwen", agent("qwen", icons::QWEN, 0x615ced)),
+    ("gemini", agent("gemini", icons::GEMINI, 0x4285f4)),
+    ("cursor-agent", plain_agent("cursor", icons::CURSOR, None)),
     ("node", tool("node", icons::NODE)),
     ("nodejs", tool("node", icons::NODE)),
     ("npm", tool("npm", icons::NODE)),
@@ -171,6 +198,10 @@ mod tests {
         assert_eq!(lookup("gemini").accent, Some(0x4285f4));
         assert_eq!(lookup("copilot").accent, Some(0x8534f3));
         assert_eq!(lookup("cursor-agent").accent, None);
+        assert_eq!(lookup("claude").tile, Tile::Brand(0xd97757));
+        assert_eq!(lookup("codex").tile, Tile::Light);
+        assert_eq!(lookup("cursor-agent").tile, Tile::Light);
+        assert_eq!(lookup("zsh").tile, Tile::Neutral);
         assert_eq!(lookup("node").icon, icons::NODE);
         assert_eq!(lookup("bun").icon, icons::BUN);
         assert_eq!(lookup("deno").icon, icons::DENO);

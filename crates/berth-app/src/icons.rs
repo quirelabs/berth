@@ -6,7 +6,7 @@
 //! silently fails to draw at runtime. `include_bytes!` gives exactly that.
 //!
 //! The interface's own icons are Phosphor (MIT, `assets/icons/LICENSE`).
-//! Program icons, which say what runs in a tab, are Phosphor for the generic
+//! Program icons, which say what runs in a session, are Phosphor for the generic
 //! ones, Lobe Icons for the agents and Simple Icons for developer tools, all
 //! in one colour and tinted with the theme's text colour. Sources, commits,
 //! licences and the trademark note are in `assets/icons/THIRD-PARTY.md`.
@@ -28,6 +28,11 @@ pub const TERMINAL: &str = "icons/programs/terminal.svg";
 pub const SSH: &str = "icons/programs/ssh.svg";
 pub const CLAUDE: &str = "icons/programs/claude.svg";
 pub const CODEX: &str = "icons/programs/codex.svg";
+pub const COPILOT: &str = "icons/programs/copilot.svg";
+pub const MISTRAL: &str = "icons/programs/mistral.svg";
+pub const QWEN: &str = "icons/programs/qwen.svg";
+pub const GEMINI: &str = "icons/programs/gemini.svg";
+pub const CURSOR: &str = "icons/programs/cursor.svg";
 pub const NODE: &str = "icons/programs/node.svg";
 pub const BUN: &str = "icons/programs/bun.svg";
 pub const DENO: &str = "icons/programs/deno.svg";
@@ -52,6 +57,11 @@ const TABLE: &[(&str, &[u8])] = &[
     program!(SSH, "ssh.svg"),
     program!(CLAUDE, "claude.svg"),
     program!(CODEX, "codex.svg"),
+    program!(COPILOT, "copilot.svg"),
+    program!(MISTRAL, "mistral.svg"),
+    program!(QWEN, "qwen.svg"),
+    program!(GEMINI, "gemini.svg"),
+    program!(CURSOR, "cursor.svg"),
     program!(NODE, "node.svg"),
     program!(BUN, "bun.svg"),
     program!(DENO, "deno.svg"),

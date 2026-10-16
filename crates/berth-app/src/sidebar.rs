@@ -1,4 +1,5 @@
-//! The sidebar tree: a folder per host, its sessions under it.
+//! The sidebar tree: a folder per host, its sessions under it, and the
+//! sessions that need the user pinned above them all (D53).
 //!
 //! Pure structure, like `panes`: what is configured, open and running goes in,
 //! a flat list of rows comes out, and no gpui is involved. The things that go
@@ -22,6 +23,9 @@ pub enum Folder {
 /// One line of the sidebar, in the order it is drawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
+    /// The group of sessions that need the user, across hosts, at the top
+    /// while there are any.
+    NeedsYou,
     /// An ssh config comment heading (D37).
     Heading(String),
     /// A host, or this machine. `agent` is only set while collapsed, so an
@@ -38,6 +42,8 @@ pub enum Row {
         /// The pane showing it, or `None` when it runs detached.
         pane: Option<u64>,
         agent: bool,
+        /// In the needs-you group rather than under its folder.
+        pinned: bool,
     },
     NewTerminal(Folder),
 }
@@ -71,6 +77,9 @@ pub struct Input<'a> {
     /// (D50).
     /// (With whether Claude runs in each.)
     pub local_detached: &'a [(String, bool)],
+    /// Whether a session needs the user, by its folder, name and pane: it
+    /// is pinned to the top then, whatever its folder.
+    pub needs_you: &'a dyn Fn(&Folder, &str, Option<u64>) -> bool,
 }
 
 /// Berth's own sessions from one host's scan, with whether an agent is running
@@ -117,6 +126,7 @@ pub fn programs(scan: &[Running]) -> BTreeMap<String, String> {
 /// Build the rows, headings and folders in ssh config order, this machine last.
 pub fn rows(input: &Input) -> Vec<Row> {
     let mut out = Vec::new();
+    let mut pinned = Vec::new();
     let empty = BTreeMap::new();
 
     // File order, heading printed when it changes. Sorting would reorder the
@@ -149,9 +159,10 @@ pub fn rows(input: &Input) -> Vec<Row> {
 
         push_folder(
             &mut out,
+            &mut pinned,
             Folder::Host(host.alias.to_string()),
             ordered,
-            input.expanded,
+            input,
         );
     }
 
@@ -168,18 +179,39 @@ pub fn rows(input: &Input) -> Vec<Row> {
             .iter()
             .map(|(name, agent)| (name.clone(), None, *agent)),
     );
-    push_folder(&mut out, Folder::Local, local, input.expanded);
+    push_folder(&mut out, &mut pinned, Folder::Local, local, input);
 
-    out
+    if pinned.is_empty() {
+        return out;
+    }
+    let mut top = vec![Row::NeedsYou];
+    top.append(&mut pinned);
+    top.append(&mut out);
+    top
 }
 
 fn push_folder(
     out: &mut Vec<Row>,
+    pinned: &mut Vec<Row>,
     folder: Folder,
     sessions: Vec<(String, Option<u64>, bool)>,
-    expanded: &BTreeMap<Folder, bool>,
+    input: &Input,
 ) {
-    let open = expanded
+    // Those needing the user go to the top, open folder or closed.
+    let (needing, sessions): (Vec<_>, Vec<_>) = sessions
+        .into_iter()
+        .partition(|(name, pane, _)| (input.needs_you)(&folder, name, *pane));
+    for (name, pane, agent) in needing {
+        pinned.push(Row::Session {
+            folder: folder.clone(),
+            name,
+            pane,
+            agent,
+            pinned: true,
+        });
+    }
+    let open = input
+        .expanded
         .get(&folder)
         .copied()
         .unwrap_or(!sessions.is_empty());
@@ -198,6 +230,7 @@ fn push_folder(
             name,
             pane,
             agent,
+            pinned: false,
         });
     }
     out.push(Row::NewTerminal(folder));
@@ -344,6 +377,7 @@ mod tests {
             expanded,
             local_label: "zsh",
             local_detached: &[],
+            needs_you: &|_, _, _| false,
         })
     }
 
@@ -354,6 +388,69 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A session that needs the user is pinned to the top, across hosts,
+    /// out of its folder even when that is closed, and the group is there
+    /// only while it has something in it.
+    #[test]
+    fn sessions_that_need_you_are_pinned_to_the_top() {
+        let hosts = [host("web", None), host("db", None)];
+        let mut running = BTreeMap::new();
+        running.insert(
+            "web".to_string(),
+            BTreeMap::from([("main".to_string(), true), ("logs".to_string(), false)]),
+        );
+        running.insert(
+            "db".to_string(),
+            BTreeMap::from([("main".to_string(), true)]),
+        );
+        let mut expanded = BTreeMap::new();
+        expanded.insert(Folder::Host("db".into()), false);
+        let needs = |folder: &Folder, name: &str, _: Option<u64>| {
+            name == "main" && *folder != Folder::Local
+        };
+        let rows = rows(&Input {
+            hosts: &hosts,
+            open: &[],
+            running: &running,
+            expanded: &expanded,
+            local_label: "zsh",
+            local_detached: &[],
+            needs_you: &needs,
+        });
+        assert_eq!(rows[0], Row::NeedsYou);
+        let pinned: Vec<(Folder, String)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session {
+                    folder,
+                    name,
+                    pinned: true,
+                    ..
+                } => Some((folder.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pinned,
+            [
+                (Folder::Host("web".into()), "main".to_string()),
+                (Folder::Host("db".into()), "main".to_string())
+            ]
+        );
+        assert_eq!(
+            session_names(&rows, &web()),
+            ["main", "logs"],
+            "pinned and under"
+        );
+        let under: Vec<&Row> = rows
+            .iter()
+            .filter(|r| matches!(r, Row::Session { pinned: false, .. }))
+            .collect();
+        assert_eq!(under.len(), 1, "only logs is left under its folder");
+        let quiet = build(&hosts, &[], &running, &expanded);
+        assert!(!quiet.contains(&Row::NeedsYou));
     }
 
     fn web() -> Folder {
@@ -406,12 +503,14 @@ mod tests {
             name: "main".into(),
             pane: Some(7),
             agent: false,
+            pinned: false,
         }));
         assert!(rows.contains(&Row::Session {
             folder: web(),
             name: "deploy".into(),
             pane: None,
             agent: true,
+            pinned: false,
         }));
     }
 
@@ -570,6 +669,7 @@ mod tests {
             name: "zsh 2".into(),
             pane: Some(5),
             agent: false,
+            pinned: false,
         }));
     }
 
@@ -604,6 +704,7 @@ mod tests {
             expanded: &BTreeMap::new(),
             local_label: "zsh",
             local_detached: &detached,
+            needs_you: &|_, _, _| false,
         });
         assert_eq!(session_names(&rows, &Folder::Local), ["zsh", "zsh #4"]);
         assert!(rows.contains(&Row::Session {
@@ -611,6 +712,7 @@ mod tests {
             name: "zsh #4".into(),
             pane: None,
             agent: true,
+            pinned: false,
         }));
     }
 

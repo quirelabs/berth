@@ -140,6 +140,37 @@ pub fn status_tooltip(
     text
 }
 
+/// The sidebar's group of sessions that need the user (D53).
+pub const SIDEBAR_NEEDS_YOU: &str = "needs you";
+
+/// A sidebar row's meta (D53): how long it has been as it is, "done" with
+/// that when it finished, or how its last command exited when that was not
+/// a success.
+pub fn row_meta(
+    state: Option<crate::glyph::State>,
+    since: std::time::Duration,
+    exit: Option<i32>,
+) -> String {
+    use crate::glyph::State;
+    let short = {
+        let secs = since.as_secs();
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{}h", secs / 3600)
+        }
+    };
+    let failed = exit.filter(|code| *code != 0);
+    match (state, failed) {
+        (Some(State::Error) | Some(State::Idle) | None, Some(code)) => format!("exit {code}"),
+        (Some(State::Done), _) => format!("done {short}"),
+        (Some(State::Working | State::NeedsYou | State::Error), _) => short,
+        (Some(State::Idle) | None, None) => String::new(),
+    }
+}
+
 /// A tab's hover panel heading: its number, how many panes, and the key
 /// that reaches it.
 pub fn tab_panel_header(number: usize, panes: usize) -> String {
