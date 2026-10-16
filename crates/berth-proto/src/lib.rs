@@ -8,6 +8,10 @@
 //! encoded with postcard. Screens and history travel zstd-compressed inside
 //! their messages ([`Packed`]).
 //!
+//! Beside the versions there is the [`core`]: listing the sessions a server
+//! holds and ending one, which every build answers whatever version it
+//! speaks, frozen for good like the greeting (D54, D55).
+//!
 //! Each version's messages live in their own module and are frozen once
 //! released: a newer build keeps every older module, so an old worker still
 //! running after an update is always reachable. `tests/frozen.rs` holds the
@@ -20,6 +24,7 @@
 //! Pure: no sockets, no tasks, no terminal. Anything that can be wrong about
 //! bytes is tested here without a network.
 
+pub mod core;
 mod error;
 mod frame;
 mod hello;

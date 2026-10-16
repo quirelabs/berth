@@ -686,24 +686,36 @@ mod tests {
     }
 
     /// Streaming, reads that come within the batch's time join it, up to
-    /// its size.
+    /// its size. The batch's time is two milliseconds, and on a busy machine
+    /// the thread that writes may not get to run within it, so the wait is
+    /// shown to happen within a few tries rather than on every one; the size
+    /// is held to on all of them.
     #[test]
     fn streaming_gathering_waits_for_more_up_to_the_cap() {
-        let (tx, mut rx) = mpsc::channel(64);
-        std::thread::spawn(move || {
-            for _ in 0..40 {
-                std::thread::sleep(std::time::Duration::from_micros(20));
-                if tx
-                    .blocking_send(PtyEvent::Output(vec![b'x'; 4096]))
-                    .is_err()
-                {
-                    break;
+        let mut joined = false;
+        for _ in 0..50 {
+            let (tx, mut rx) = mpsc::channel(64);
+            let writer = std::thread::spawn(move || {
+                for _ in 0..40 {
+                    std::thread::sleep(std::time::Duration::from_micros(20));
+                    if tx
+                        .blocking_send(PtyEvent::Output(vec![b'x'; 4096]))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
+            });
+            let (bytes, _) = gather(vec![b'x'; 4096], &mut rx, true);
+            assert!(bytes.len() <= BATCH_AT_MOST + 4096, "{}", bytes.len());
+            drop(rx);
+            let _ = writer.join();
+            if bytes.len() > 4096 {
+                joined = true;
+                break;
             }
-        });
-        let (bytes, _) = gather(vec![b'x'; 4096], &mut rx, true);
-        assert!(bytes.len() > 4096, "nothing joined: {}", bytes.len());
-        assert!(bytes.len() <= BATCH_AT_MOST + 4096, "{}", bytes.len());
+        }
+        assert!(joined, "nothing ever joined a batch");
     }
 
     #[tokio::test]

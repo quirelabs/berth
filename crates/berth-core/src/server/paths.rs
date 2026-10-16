@@ -1,9 +1,12 @@
-//! Where the server keeps its endpoints, pid files and binaries (D50).
+//! Where the server keeps its endpoints, pid files and binaries (D50, D55).
 //!
 //! The runtime directory is private to the user, is never `$TMPDIR` (macOS
 //! clears files there that have gone untouched for about three days, so a
-//! week-long session would lose its socket while it runs), and holds only
-//! short names: macOS limits a socket path to 104 bytes.
+//! week-long session would lose its socket while it runs), is never
+//! `$XDG_RUNTIME_DIR` (logind removes `/run/user/<uid>` at the user's last
+//! logout, which would leave a supervisor that outlives the connection with
+//! no socket anyone can reach), and holds only short names: a socket path is
+//! limited to 104 bytes on macOS and 108 on Linux.
 
 use std::collections::HashSet;
 use std::io;
@@ -16,37 +19,54 @@ use berth_proto::v1::SessionId;
 pub struct Places {
     /// Endpoints and pid files. Private to the user.
     pub run: PathBuf,
-    /// Versioned copies of the binary that workers run from.
+    /// One directory per build, holding the binary that build's processes
+    /// run from.
     pub bin: PathBuf,
 }
 
 impl Places {
-    /// The platform's places: under the local data directory
+    /// This server's places, the first of: `BERTH_DATA`, which moves all of
+    /// it for tests; the directory this binary is installed in, when it runs
+    /// from `<data>/bin/<build>/`, so a server on a host keeps its files
+    /// where it was put (D55); the platform's local data directory
     /// (`~/Library/Application Support/berth` on macOS, `%LOCALAPPDATA%\berth`
-    /// on Windows). `BERTH_DATA` moves all of it, for tests.
+    /// on Windows, `~/.local/share/berth` elsewhere).
     pub fn standard() -> Option<Self> {
         if let Some(base) = crate::env::data() {
             return Some(Self::under(&base));
         }
-        let mut places = Self::under(&dirs::data_local_dir()?.join("berth"));
-        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(base) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| installed_under(&exe))
         {
-            places.run = linux_run(dirs::runtime_dir(), dirs::home_dir())?;
+            return Some(Self::under(&base));
         }
-        #[cfg(any(target_os = "macos", windows))]
-        let _ = &mut places;
-        Some(places)
+        Some(Self::under(&dirs::data_local_dir()?.join("berth")))
     }
 
-    pub(crate) fn under(base: &Path) -> Self {
+    /// The places under one data directory: `bin/` and `run/` inside it. The
+    /// runtime directory moves to `/tmp/berth-<uid>/` only when a socket
+    /// there would have too long a path to exist at all.
+    pub fn under(base: &Path) -> Self {
+        let run = base.join("run");
+        #[cfg(unix)]
+        let run = if fits(&run) {
+            run
+        } else {
+            fallback_run(base).unwrap_or(run)
+        };
         Self {
-            run: base.join("run"),
+            run,
             bin: base.join("bin"),
         }
     }
 
     /// Both directories, created, and the runtime one made private.
     pub fn prepare(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(shared) = self.run.parent().filter(|p| is_fallback_root(p)) {
+            make_own_in_tmp(shared)?;
+        }
         make_private(&self.run)?;
         std::fs::create_dir_all(&self.bin)?;
         Ok(())
@@ -74,16 +94,79 @@ impl Places {
     }
 }
 
-/// The runtime directory on Linux and other Unix: `$XDG_RUNTIME_DIR/berth`
-/// where a desktop login set one, and otherwise `~/.berth/run`, which is
-/// common on a server reached over SSH without one (step 3). Never `/tmp`,
-/// which every user shares and which is cleaned on its own schedule.
-#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
-fn linux_run(runtime: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    match runtime {
-        Some(runtime) => Some(runtime.join("berth")),
-        None => Some(home?.join(".berth").join("run")),
+/// The data directory a binary at `<data>/bin/<build>/<name>` is installed
+/// in.
+fn installed_under(exe: &Path) -> Option<PathBuf> {
+    let build = exe.parent()?;
+    let bin = build.parent()?;
+    let named = is_build(build.file_name()?.to_str()?) && bin.file_name()? == "bin";
+    named.then(|| bin.parent().map(Path::to_path_buf)).flatten()
+}
+
+/// The longest socket path the platform takes, less the byte that ends it.
+#[cfg(unix)]
+const SOCKET_PATH_AT_MOST: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// Whether the longest endpoint name there is fits in `run`.
+#[cfg(unix)]
+fn fits(run: &Path) -> bool {
+    endpoint(run, &format!("w{}", SessionId::MAX))
+        .as_os_str()
+        .len()
+        <= SOCKET_PATH_AT_MOST
+}
+
+/// Where the runtime files go when the data directory's path is too long
+/// for a socket: `/tmp/berth-<uid>/<data directory's tag>`, as tmux keeps
+/// its sockets. `/tmp` is shared, so the directory is checked to be the
+/// user's alone before anything is put in it ([`make_own_in_tmp`]).
+#[cfg(unix)]
+fn fallback_run(base: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let tag = hex::encode(&Sha256::digest(base.as_os_str().as_encoded_bytes())[..6]);
+    Some(PathBuf::from(format!("/tmp/berth-{}", own_uid()?)).join(tag))
+}
+
+#[cfg(unix)]
+fn is_fallback_root(dir: &Path) -> bool {
+    dir.parent() == Some(Path::new("/tmp"))
+        && dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("berth-"))
+}
+
+/// This user's id, asked of `id` once: the standard library has no call for
+/// it, and it is needed only on the rare path above.
+#[cfg(unix)]
+fn own_uid() -> Option<u32> {
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        let out = std::process::Command::new("id").arg("-u").output().ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    })
+}
+
+/// Create `dir` under `/tmp` for this user alone, or refuse it: it must be a
+/// real directory, not a link, owned by this user, with nothing allowed to
+/// anyone else. Someone else could have made it first.
+#[cfg(unix)]
+fn make_own_in_tmp(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
     }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let own = own_uid().is_some_and(|uid| uid == meta.uid());
+    if !meta.file_type().is_dir() || !own || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not this user's alone", dir.display()),
+        ));
+    }
+    Ok(())
 }
 
 /// An endpoint's address: a socket file in the runtime directory, or on
@@ -191,89 +274,95 @@ pub fn live_workers(places: &Places) -> Vec<SessionId> {
 /// How many hex digits of a binary's SHA-256 name its build.
 const BUILD_ID_DIGITS: usize = 16;
 
-fn build_named(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let id = hex::encode(&Sha256::digest(bytes)[..BUILD_ID_DIGITS / 2]);
-    format!("{}+{id}", env!("CARGO_PKG_VERSION"))
+/// The build a binary with these bytes is: this version and the start of
+/// their SHA-256, `0.1.0+3f9c2a1b7d4e5f60`.
+pub fn build_named(bytes: &[u8]) -> String {
+    build_with(env!("CARGO_PKG_VERSION"), &sha256_hex(bytes))
 }
 
-/// The build the binary at `exe` is: its version and the start of its
-/// SHA-256, `0.1.0+3f9c2a1b7d4e5f60`. A versioned copy carries both in its
-/// name, and is taken at its word: a worker and a hook start often, and
-/// should not read their whole binary to say hello.
+/// A build's name from its version and its binary's whole SHA-256 in hex.
+pub fn build_with(version: &str, sha256: &str) -> String {
+    let id = sha256.get(..BUILD_ID_DIGITS).unwrap_or(sha256);
+    format!("{version}+{id}")
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The build the binary at `exe` is. One installed under `bin/<build>/` is
+/// taken at its directory's word: a worker starts often, and should not read
+/// its whole binary to say hello.
 pub fn build_of(exe: &Path) -> io::Result<String> {
     let named = exe
-        .file_name()
+        .parent()
+        .and_then(|dir| dir.file_name())
         .and_then(|n| n.to_str())
-        .and_then(build_in_copy_name);
+        .filter(|name| is_build(name) && name.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
     match named {
-        Some(build) => Ok(build),
+        Some(build) => Ok(build.to_string()),
         None => Ok(build_named(&std::fs::read(exe)?)),
     }
 }
 
-/// The name of the copy a build runs from: `berth-0.1.0-3f9c2a1b7d4e5f60`.
-pub fn copy_name(build: &str) -> Option<String> {
-    let (version, id) = build.split_once('+')?;
-    let plain = |s: &str| !s.is_empty() && !s.contains(['/', '\\']);
-    (plain(version) && is_build_id(id))
-        .then(|| format!("berth-{version}-{id}{}", std::env::consts::EXE_SUFFIX))
+/// Whether `name` is shaped like a build: a version, `+`, and the id. It is
+/// used as a directory name, so nothing that could step out of one passes.
+pub fn is_build(name: &str) -> bool {
+    let Some((version, id)) = name.split_once('+') else {
+        return false;
+    };
+    let plain = !version.is_empty()
+        && !version.starts_with('.')
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    plain && id.len() == BUILD_ID_DIGITS && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The build a copy's name carries, for this version's copies only.
-fn build_in_copy_name(name: &str) -> Option<String> {
-    let name = name
-        .strip_suffix(std::env::consts::EXE_SUFFIX)
-        .unwrap_or(name);
-    let (version, id) = name.strip_prefix("berth-")?.rsplit_once('-')?;
-    (version == env!("CARGO_PKG_VERSION") && is_build_id(id)).then(|| format!("{version}+{id}"))
-}
-
-fn is_build_id(id: &str) -> bool {
-    id.len() == BUILD_ID_DIGITS && id.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// This build's copy of the binary in `bin`, made if it is not there yet, and
-/// its name. Workers run from it, never from the app bundle or install
+/// This build's copy of the binary, `bin/<build>/<name>`, made if it is not
+/// there yet. Workers run from it, never from the app bundle or install
 /// directory: on Windows an update cannot replace an executable a running
-/// worker uses, and on macOS an update never touches one (D50).
-///
-/// Named by its build, so two builds that share a version number never share
-/// a copy.
+/// worker uses, and on macOS an update never touches one (D50). The layout
+/// is the one a host's install has (D55).
 pub fn install_copy(bin: &Path, exe: &Path) -> io::Result<PathBuf> {
     let bytes = std::fs::read(exe)?;
-    let name = copy_name(&build_named(&bytes))
-        .ok_or_else(|| io::Error::other("this build has no name for its copy"))?;
-    let copy = bin.join(&name);
+    let name = exe
+        .file_name()
+        .ok_or_else(|| io::Error::other("the binary has no name"))?;
+    let dir = bin.join(build_named(&bytes));
+    let copy = dir.join(name);
     if copy.is_file() {
         return Ok(copy);
     }
-    std::fs::create_dir_all(bin)?;
+    make_private(&dir)?;
     // Written aside and renamed, so a half-written copy is never run.
-    let partial = bin.join(format!(".{name}.partial"));
+    let partial = dir.join(format!(".{}.partial", name.to_string_lossy()));
     std::fs::write(&partial, &bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700))?;
     }
     std::fs::rename(&partial, &copy)?;
     Ok(copy)
 }
 
-/// Delete every copy in `bin` except those named in `keep`: the current one
-/// and any a running worker still uses. On Windows a copy still running
-/// refuses to go, which is the same answer.
-pub fn remove_unused_copies(bin: &Path, keep: &HashSet<String>) {
+/// Delete every build in `bin` except those named in `keep`: the current one
+/// and any a running worker still uses. Only directories named as builds are
+/// touched. On Windows a binary still running refuses to go, which is the
+/// same answer.
+pub fn remove_unused_builds(bin: &Path, keep: &HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(bin) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("berth-") && !keep.contains(&name) {
-            match std::fs::remove_file(entry.path()) {
-                Ok(()) => tracing::info!(%name, "removed an unused worker binary"),
-                Err(error) => tracing::debug!(%name, %error, "kept a worker binary"),
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir && is_build(&name) && !keep.contains(&name) {
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => tracing::info!(%name, "removed an unused build"),
+                Err(error) => tracing::debug!(%name, %error, "kept a build"),
             }
         }
     }
@@ -314,17 +403,64 @@ mod tests {
         assert!(path.as_os_str().len() < 104, "{}", path.display());
     }
 
+    /// Everything is under the data directory, the runtime files too.
     #[test]
-    fn without_a_runtime_directory_linux_uses_one_under_home() {
+    fn the_runtime_directory_is_inside_the_data_directory() {
+        let places = Places::under(Path::new("/home/u/.local/share/berth"));
+        assert_eq!(places.run, Path::new("/home/u/.local/share/berth/run"));
+        assert_eq!(places.bin, Path::new("/home/u/.local/share/berth/bin"));
+    }
+
+    /// A data directory too deep for a socket keeps its runtime files in
+    /// `/tmp/berth-<uid>/`, apart from any other data directory's, and that
+    /// directory is made for this user alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_too_long_for_a_socket_falls_back_to_tmp() {
+        let deep = |name: &str| PathBuf::from(format!("/home/{}/{name}", "a".repeat(90)));
+        let places = Places::under(&deep("one"));
+        let root = PathBuf::from(format!("/tmp/berth-{}", own_uid().unwrap()));
+        assert_eq!(places.run.parent(), Some(root.as_path()), "{places:?}");
+        assert!(fits(&places.run));
+        assert!(is_fallback_root(&root));
+        assert_ne!(places.run, Places::under(&deep("two")).run);
+        assert_eq!(places.bin, deep("one").join("bin"), "only the sockets move");
+    }
+
+    /// The shared directory in `/tmp` is refused unless it is a real
+    /// directory of this user's with nothing open to anyone else.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_in_tmp_someone_else_could_use_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("berth-1");
+        make_own_in_tmp(&ours).unwrap();
+        let mode = std::fs::metadata(&ours).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        make_own_in_tmp(&ours).unwrap();
+
+        std::fs::set_permissions(&ours, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(make_own_in_tmp(&ours).is_err(), "open to others");
+
+        let link = dir.path().join("berth-2");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(make_own_in_tmp(&link).is_err(), "a link to somewhere else");
+    }
+
+    /// A server installed on a host keeps its files where it was put.
+    #[test]
+    fn an_installed_binary_names_its_data_directory() {
+        let exe = Path::new("/home/u/.local/share/berth/bin/0.1.0+0123456789abcdef/berth-server");
         assert_eq!(
-            linux_run(Some("/run/user/1000".into()), Some("/home/u".into())),
-            Some(PathBuf::from("/run/user/1000/berth"))
+            installed_under(exe).as_deref(),
+            Some(Path::new("/home/u/.local/share/berth"))
         );
         assert_eq!(
-            linux_run(None, Some("/home/u".into())),
-            Some(PathBuf::from("/home/u/.berth/run"))
+            installed_under(Path::new("/usr/local/bin/berth-server")),
+            None
         );
-        assert_eq!(linux_run(None, None), None, "never a shared fallback");
+        assert_eq!(installed_under(Path::new("/w/target/debug/berth")), None);
     }
 
     #[test]
@@ -347,41 +483,43 @@ mod tests {
         assert!(!alive(99_999_999));
     }
 
-    /// A copy is named by its build, and says the same of itself without
-    /// being read again; anything else is named by what is in it.
+    /// A copy lives in its build's directory, and says the same of itself
+    /// without being read again; anything else is named by what is in it.
     #[test]
     fn a_build_is_named_by_its_version_and_what_is_in_the_binary() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("exe");
+        let exe = dir.path().join("berth-server");
         std::fs::write(&exe, b"binary one").unwrap();
         let one = build_of(&exe).unwrap();
-        let (version, id) = one.split_once('+').unwrap();
-        assert_eq!(version, env!("CARGO_PKG_VERSION"));
-        assert!(is_build_id(id), "{id}");
+        assert!(is_build(&one), "{one}");
+        assert!(one.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")));
 
-        let copy = install_copy(&dir.path().join("bin"), &exe).unwrap();
+        let bin = dir.path().join("bin");
+        let copy = install_copy(&bin, &exe).unwrap();
+        assert_eq!(copy, bin.join(&one).join("berth-server"));
         assert_eq!(
             build_of(&copy).unwrap(),
             one,
             "a copy is the build it copies"
         );
-        let name = copy.file_name().unwrap().to_string_lossy().to_string();
-        assert_eq!(copy_name(&one).as_deref(), Some(name.as_str()));
+        assert_eq!(installed_under(&copy).as_deref(), Some(dir.path()));
 
         std::fs::write(&exe, b"binary two").unwrap();
         assert_ne!(build_of(&exe).unwrap(), one, "same version, another build");
     }
 
     /// What an older build called itself, and anything that could step out
-    /// of the directory, names no copy.
+    /// of the directory, is no build's name.
     #[test]
-    fn only_a_build_name_names_a_copy() {
-        assert_eq!(copy_name("berth 0.1.0 (berth-0.1.0-ab12cd34)"), None);
-        assert_eq!(copy_name("0.1.0"), None);
-        assert_eq!(copy_name("0.1.0+short"), None);
-        assert_eq!(copy_name("../x+0123456789abcdef"), None);
-        assert_eq!(build_in_copy_name("berth-server"), None);
-        assert_eq!(build_in_copy_name("berth-9.9.9-0123456789abcdef"), None);
+    fn only_a_build_name_names_a_directory() {
+        assert!(is_build("0.1.0+0123456789abcdef"));
+        assert!(is_build("0.2.0-rc.1+0123456789abcdef"));
+        assert!(!is_build("berth 0.1.0 (berth-0.1.0-ab12cd34)"));
+        assert!(!is_build("0.1.0"));
+        assert!(!is_build("0.1.0+short"));
+        assert!(!is_build("../x+0123456789abcdef"));
+        assert!(!is_build("..+0123456789abcdef"));
+        assert!(!is_build("+0123456789abcdef"));
     }
 
     #[test]
@@ -395,12 +533,15 @@ mod tests {
         std::fs::write(&exe, b"binary two").unwrap();
         let second = install_copy(&bin, &exe).unwrap();
         assert_ne!(first, second, "a changed binary is a new copy");
+        // Not a build: left alone whatever is kept.
+        std::fs::write(bin.join("claude"), b"shim").unwrap();
+        std::fs::create_dir(bin.join("notes")).unwrap();
 
-        let keep: HashSet<String> = [second.file_name().unwrap().to_string_lossy().to_string()]
-            .into_iter()
-            .collect();
-        remove_unused_copies(&bin, &keep);
+        let keep: HashSet<String> = [build_of(&second).unwrap()].into_iter().collect();
+        remove_unused_builds(&bin, &keep);
         assert!(!first.exists());
         assert!(second.exists());
+        assert!(bin.join("claude").exists());
+        assert!(bin.join("notes").exists());
     }
 }

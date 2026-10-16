@@ -13,6 +13,7 @@ mod reconnect;
 mod render_probe;
 mod restore;
 mod runtime;
+mod servers;
 mod session;
 mod sidebar;
 mod strings;

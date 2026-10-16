@@ -12,6 +12,7 @@ pub mod host;
 pub mod known_hosts;
 pub mod local;
 pub mod pty;
+pub mod remote;
 pub mod restore;
 pub mod server;
 pub mod session;

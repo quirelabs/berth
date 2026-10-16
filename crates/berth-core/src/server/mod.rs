@@ -21,6 +21,7 @@ pub mod hook;
 pub mod link;
 pub mod local;
 pub mod paths;
+pub mod remove;
 pub mod supervisor;
 pub mod sync;
 mod transport;

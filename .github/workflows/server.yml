@@ -1,8 +1,9 @@
 name: server
 
-# berth-server for Linux hosts: the binaries step 3's bootstrap ships, built
-# the one way they are ever built (D49, D50). Every push builds them, so the
-# speed floor and the hosts always run what a release would.
+# berth-server for Linux and macOS hosts: the four binaries the app carries
+# and installs (D49, D50, D55), built the one way they are ever built. Every
+# push builds them, so the speed floor and the hosts always run what a
+# release would.
 on:
   push:
   workflow_dispatch:
@@ -64,6 +65,70 @@ jobs:
       - name: Runs
         if: startsWith(matrix.target, 'x86_64')
         run: dist/berth-server-${{ matrix.target }} --bench-throughput cjk --mb 4 --no-tmux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berth-server-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # macOS hosts, arm64 and x86_64, both from the arm64 runner: the engine's
+  # build passes the target on to Zig, and Apple's linker links either.
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: ./.github/actions/ghostty
+      - run: cargo build --release --locked -p berth-core --bin berth-server --target ${{ matrix.target }}
+
+      # Apple Silicon runs nothing unsigned. The ad-hoc signature is inside
+      # the file, so it is still there after the upload to a host, and it is
+      # put on before the checksum: the signed file is the build.
+      - name: Signed, and for the right machine
+        shell: bash
+        run: |
+          set -eux
+          bin=target/${{ matrix.target }}/release/berth-server
+          codesign --force --sign - --timestamp=none "$bin"
+          codesign --verify --strict "$bin"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            aarch64-*) file "$bin" | grep -q 'arm64' ;;
+            x86_64-*) file "$bin" | grep -q 'x86_64' ;;
+          esac
+          # Nothing from Homebrew or the toolchain: only what every Mac has.
+          otool -L "$bin"
+          ! otool -L "$bin" | tail -n +2 | grep -v -E '^[[:space:]]*/(usr/lib|System)/'
+
+      - name: Name and checksum
+        shell: bash
+        run: |
+          set -eux
+          mkdir dist
+          name=berth-server-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/berth-server "dist/$name"
+          cd dist
+          shasum -a 256 "$name" > "$name.sha256"
+          cat "$name.sha256"
+
+      # The arm64 build runs on the runner: it says which build it is, and a
+      # small throughput run gets through the whole server path.
+      - name: Runs
+        if: startsWith(matrix.target, 'aarch64')
+        run: |
+          dist/berth-server-${{ matrix.target }} --version
+          dist/berth-server-${{ matrix.target }} --bench-throughput cjk --mb 4 --no-tmux
 
       - uses: actions/upload-artifact@v4
         with:

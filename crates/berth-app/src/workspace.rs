@@ -3,6 +3,7 @@
 mod machine;
 mod render;
 mod saving;
+mod server;
 mod trust;
 
 use std::sync::Arc;
@@ -231,6 +232,12 @@ enum Modal {
         alias: String,
         field: TextField,
     },
+    /// Offering Berth's server to a host: exactly what would be installed
+    /// and where, before anything is (D55).
+    Server {
+        alias: String,
+        plan: Box<berth_core::remote::Plan>,
+    },
 }
 
 /// What the main area shows when there is no session to show.
@@ -265,6 +272,9 @@ pub struct Workspace {
     expanded: std::collections::BTreeMap<crate::sidebar::Folder, bool>,
     /// Per-host status, so the sidebar can show hosts landing independently.
     statuses: std::collections::BTreeMap<String, HostStatus>,
+    /// Hosts running a server build other than the one this app carries: the
+    /// build there, and the one on offer (D55).
+    server_updates: std::collections::BTreeMap<String, (String, String)>,
     /// When the process started, for the cold-start measurement.
     started: std::time::Instant,
     /// Reported once, when the first host reaches a prompt.
@@ -460,6 +470,7 @@ impl Workspace {
             theme: Theme::for_appearance(Appearance::Dark),
             empty: Empty::FirstRun,
             settings: berth_core::settings::Settings::load(),
+            server_updates: std::collections::BTreeMap::new(),
             conns: std::collections::BTreeMap::new(),
             panes: Vec::new(),
             tabs: Vec::new(),
@@ -839,6 +850,10 @@ impl Workspace {
             .map(|h| h.alias.clone())
             .unwrap_or_else(|| strings::LOCAL_ALIAS.to_string());
 
+        let place_shown = match &place {
+            Place::Tab { show } => Some(*show),
+            Place::Beside { .. } => None,
+        };
         let _ = self.place_pane(
             host,
             slug,
@@ -878,7 +893,13 @@ impl Workspace {
         if fresh {
             self.drive(alias.clone(), cx);
             self.measure_rtt(alias.clone(), cx);
-            self.watch_agents(alias, cx);
+            self.watch_agents(alias.clone(), cx);
+            // Only a host the user asked for is asked anything, and a
+            // benchmark run is never interrupted by a question.
+            let asking = matches!(place_shown, Some(true));
+            if alias != strings::LOCAL_ALIAS && crate::bench::Bench::from_env().is_none() {
+                self.check_server(alias, asking, false, cx);
+            }
         }
         cx.notify();
     }
@@ -2065,6 +2086,7 @@ impl Workspace {
             }
             (Action::Connect, Target::Host(alias)) => self.open(alias, cx),
             (Action::RenameHost, Target::Host(alias)) => self.ask_rename_host(alias, cx),
+            (Action::Server, Target::Host(alias)) => self.ask_server(alias, cx),
             // The menu only lists what `actions` allows, so anything else is a
             // menu built from one target and run against another.
             (action, target) => tracing::debug!(?action, ?target, "menu action does not apply"),

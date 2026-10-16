@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use berth_proto::Agreed;
 use berth_proto::v1::{ToApp, ToServer};
+use berth_proto::{Agreed, core};
 use tokio::sync::mpsc;
 
 use super::link;
@@ -89,4 +89,47 @@ pub async fn connect_expecting(places: &Places, expected: &str) -> Result<Client
         to_server,
         from_server,
     })
+}
+
+/// How long a supervisor has to answer the core.
+const CORE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the supervisor at `places` one of the things every build answers
+/// (D54, D55), on a connection of its own: which sessions it holds, or to
+/// end one. It works whatever else this build and that one cannot read of
+/// each other, and whatever the main connection is doing.
+pub async fn core(places: &Places, ask: core::Ask) -> Result<Vec<core::Session>> {
+    let stream = super::transport::connect(&places.supervisor())
+        .await
+        .map_err(|e| Error::Server(format!("no supervisor answers: {e}")))?;
+    core_over(stream, ask).await
+}
+
+/// The same over any stream to a supervisor.
+pub async fn core_over<S>(stream: S, ask: core::Ask) -> Result<Vec<core::Session>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+{
+    let mut opened = link::open(stream, &link::hello()).await?;
+    opened
+        .write
+        .send(&ask.encode().map_err(link::protocol)?)
+        .await?;
+    let answered = async {
+        // Whatever of a version arrives meanwhile is not for this.
+        loop {
+            match opened.read.recv().await? {
+                Some(payload) if core::is_core(&payload) => {
+                    let core::Answer::Sessions(list) =
+                        core::Answer::decode(&payload).map_err(link::protocol)?;
+                    return Ok(list);
+                }
+                Some(_) => continue,
+                None => return Err(Error::Server("closed before answering the core".into())),
+            }
+        }
+    };
+    tokio::time::timeout(CORE_WITHIN, answered)
+        .await
+        .map_err(|_| Error::Server("no answer to the core in time".into()))?
 }

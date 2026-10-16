@@ -398,3 +398,50 @@ fn a_conversation_survives_the_frame_reader() {
     let sent: Vec<ToServer> = to_server().into_iter().map(|(m, _)| m).collect();
     assert_eq!(got, sent);
 }
+
+/// The core: what every build answers for good (D54, D55). These bytes never
+/// change, draft or not, and nothing is ever added to them.
+const CORE_ASK_SESSIONS: &str = "ff42524300";
+const CORE_ASK_END: &str = "ff42524301ac02";
+const CORE_ANSWER: &str = concat!(
+    "ff425243",
+    "00",
+    "02",
+    "07",
+    "0976696d206e6f746573",
+    "16302e312e302b30313233343536373839616263646566",
+    "01",
+    "ac02",
+    "00",
+    "00",
+    "00",
+);
+
+#[test]
+fn the_core_is_frozen() {
+    use berth_proto::core::{Answer, Ask, Session};
+    let asks = [
+        (Ask::Sessions, CORE_ASK_SESSIONS),
+        (Ask::End { session: 300 }, CORE_ASK_END),
+    ];
+    for (ask, golden) in asks {
+        assert_eq!(hex(&ask.encode().unwrap()), golden, "{ask:?}");
+        assert_eq!(Ask::decode(&unhex(golden)).unwrap(), ask);
+    }
+    let answer = Answer::Sessions(vec![
+        Session {
+            id: 7,
+            title: "vim notes".into(),
+            build: "0.1.0+0123456789abcdef".into(),
+            alive: true,
+        },
+        Session {
+            id: 300,
+            title: String::new(),
+            build: String::new(),
+            alive: false,
+        },
+    ]);
+    assert_eq!(hex(&answer.encode().unwrap()), CORE_ANSWER);
+    assert_eq!(Answer::decode(&unhex(CORE_ANSWER)).unwrap(), answer);
+}

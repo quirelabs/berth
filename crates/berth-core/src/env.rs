@@ -21,12 +21,14 @@
 //! | `BERTH_BENCH_SETTLE` | seconds the cat benchmark waits before measuring |
 //! | `BERTH_REFRESH_HZ`   | the display's refresh rate, for the frame budget |
 //! | `BERTH_PIXEL_CHECK`  | run the pixel test, which needs a window server |
+//! | `BERTH_SERVER_DIR`   | install servers from this directory of builds, not the ones the app carries; only in builds with the `dev-server-dir` feature, never a release (D55) |
 //! | `BERTH_LOCAL_DIRECT` | `1` sends local tabs straight to a shell, not the local server; removed before v0.1.0 |
 //! | `BERTH_TEST_HOST`    | the alias the live suites connect to            |
+//! | `BERTH_TEST_SERVERS` | a directory of server builds the live install test puts on the test host, under `~/berth-bench` only |
 //! | `BERTH_TEST_CLAUDE`  | `1` runs the live Claude Code suite, which spends a few tokens |
 //! | `BERTH_TEST_OTHER_USER` | a second local account the socket tests connect as, through `sudo -n -u` |
 //!
-//! The last four are read by test harnesses rather than by Berth, and are named
+//! The last five are read by test harnesses rather than by Berth, and are named
 //! here so the list is the whole list.
 //!
 //! Several more go the other way: Berth sets them in the panes it spawns and
@@ -50,6 +52,10 @@
 //! so other users cannot read them in the process list: `BERTH_WORKER_PANE`,
 //! the pane token for the worker's shell, and `BERTH_WORKER_RESUME`, a
 //! conversation for it to resume.
+//!
+//! One is read when Berth is built, not when it runs: `BERTH_SERVER_MANIFEST`
+//! is the manifest of the server binaries a release carries, compiled in so
+//! their hashes cannot be changed beside the app afterwards (D55).
 //!
 //! Berth also reads variables it does not own: `SHELL` and `ComSpec` for the
 //! local shell, `USER` and `USERNAME` when ssh config names no user. Those stay
@@ -83,11 +89,18 @@ pub const PIXEL_CHECK: &str = "BERTH_PIXEL_CHECK";
 pub const LOCAL_DIRECT: &str = "BERTH_LOCAL_DIRECT";
 pub const TEST_HOST: &str = "BERTH_TEST_HOST";
 pub const TEST_CLAUDE: &str = "BERTH_TEST_CLAUDE";
+pub const TEST_SERVERS: &str = "BERTH_TEST_SERVERS";
 pub const TEST_OTHER_USER: &str = "BERTH_TEST_OTHER_USER";
 pub const HOOK: &str = "BERTH_HOOK";
 pub const BIN: &str = "BERTH_BIN";
 pub const WORKER_PANE: &str = "BERTH_WORKER_PANE";
 pub const WORKER_RESUME: &str = "BERTH_WORKER_RESUME";
+#[cfg(feature = "dev-server-dir")]
+pub const SERVER_DIR: &str = "BERTH_SERVER_DIR";
+
+/// The manifest of the servers this build carries, from `BERTH_SERVER_MANIFEST`
+/// when it was built. `None` in a build that carries none.
+pub const SERVER_MANIFEST: Option<&str> = option_env!("BERTH_SERVER_MANIFEST");
 
 /// Every name above, so the test below can hold them to one shape.
 #[cfg(test)]
@@ -113,12 +126,15 @@ const NAMES: &[&str] = &[
     PIXEL_CHECK,
     TEST_HOST,
     TEST_CLAUDE,
+    TEST_SERVERS,
     TEST_OTHER_USER,
     LOCAL_DIRECT,
     HOOK,
     BIN,
     WORKER_PANE,
     WORKER_RESUME,
+    #[cfg(feature = "dev-server-dir")]
+    SERVER_DIR,
 ];
 
 /// Unset and empty mean the same thing.
@@ -181,6 +197,15 @@ pub fn shell() -> Option<String> {
 /// dogfooding escape hatch, removed before v0.1.0 (D50).
 pub fn local_direct() -> bool {
     text(LOCAL_DIRECT).is_some_and(|v| v == "1")
+}
+
+/// A directory of server builds to install from instead of the ones the app
+/// carries, named as CI names them. Development only: the hashes come from
+/// the files themselves, so nothing vouches for them, and the function does
+/// not exist in a build without the feature.
+#[cfg(feature = "dev-server-dir")]
+pub fn server_dir() -> Option<PathBuf> {
+    path(SERVER_DIR)
 }
 
 /// The hook socket a `berth --hook` call reports to.

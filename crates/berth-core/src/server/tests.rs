@@ -817,6 +817,129 @@ async fn a_different_version_is_refused_as_a_version() {
     assert!(!refused.contains("malformed"), "{refused}");
 }
 
+/// The core (D54, D55): asked on a connection that says nothing of any
+/// version, a supervisor lists its sessions with their builds, and ends one.
+#[tokio::test(flavor = "multi_thread")]
+async fn any_build_can_see_a_servers_sessions_and_end_one() {
+    use berth_proto::core::Ask;
+    let server = server().await;
+    assert!(
+        client::core(&server.places, Ask::Sessions)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut app = client::connect(&server.places).await.unwrap();
+    let first = create(&mut app).await;
+    let second = create(&mut app).await;
+    let listed = client::core(&server.places, Ask::Sessions).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [first, second]
+    );
+    for session in &listed {
+        assert!(session.alive);
+        assert_eq!(session.build, crate::server::build());
+        assert!(
+            !session.title.is_empty(),
+            "a session this build reads has a name"
+        );
+    }
+
+    // Ended through the core, it is gone from the core's list and from the
+    // list the app keeps.
+    client::core(&server.places, Ask::End { session: first })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = client::core(&server.places, Ask::Sessions).await.unwrap();
+        if left.iter().map(|s| s.id).collect::<Vec<_>>() == [second] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still listed: {left:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut later = client::connect(&server.places).await.unwrap();
+    let kept: Vec<SessionId> = list(&mut later).await.iter().map(|s| s.id).collect();
+    assert_eq!(kept, [second]);
+    // Ending one that is not there changes nothing and still answers.
+    let same = client::core(&server.places, Ask::End { session: 9999 })
+        .await
+        .unwrap();
+    assert_eq!(same.len(), 1);
+}
+
+/// A worker left by a build this supervisor cannot read is not in the
+/// session list, which it cannot fill in, and is in the core's: by its
+/// number and the build it greeted as. It is ended from there, as a
+/// process, which asks nothing of its build.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_of_a_build_that_cannot_be_read_is_still_seen_and_ended() {
+    use berth_proto::core::Ask;
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    places.prepare().unwrap();
+    let session: SessionId = 5;
+    let theirs = format!("{}+0123456789abcdef", env!("CARGO_PKG_VERSION"));
+
+    // The worker's process: one whose arguments name the mode, waited on
+    // from a thread, as a real worker is nobody's child.
+    let mut process = std::process::Command::new("sh")
+        .args(["-c", "while :; do sleep 1; done", "--worker"])
+        .spawn()
+        .unwrap();
+    let pid = process.id();
+    std::fs::write(places.worker_pid(session), pid.to_string()).unwrap();
+    let reaped = std::thread::spawn(move || process.wait());
+    // Its endpoint: it greets as its own build, and what it says of itself
+    // is in a draft this build does not have.
+    let mut listener = crate::server::Listener::bind(&places.worker(session))
+        .await
+        .unwrap();
+    let greeting = greeting(&theirs);
+    let stand_in = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let mut opened = link::open(stream, &greeting).await.unwrap();
+        let _ = opened.read.recv().await;
+        opened.write.send(&of_another_draft()).await.unwrap();
+        let _ = opened.read.recv().await;
+    });
+
+    let tasks = Tasks::default();
+    let supervisor = supervise(places.clone(), &tasks, Duration::from_secs(60)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        let seen = client::core(&places, Ask::Sessions).await.unwrap();
+        if !seen.is_empty() {
+            break seen;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never listed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, session);
+    assert_eq!(seen[0].build, theirs);
+    assert!(seen[0].alive);
+    assert_eq!(seen[0].title, "", "nothing this build can say of it");
+    let mut app = client::connect(&places).await.unwrap();
+    assert!(
+        list(&mut app).await.is_empty(),
+        "not a session this build reads"
+    );
+
+    let left = client::core(&places, Ask::End { session }).await.unwrap();
+    let _ = reaped.join();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!paths::alive(pid));
+    stand_in.abort();
+    supervisor.abort();
+}
+
 /// A client that queues more for a worker than the worker takes is
 /// disconnected: its own connection, never the worker (D50). The worker here
 /// is a stand-in that greets the supervisor, says what it is and then reads

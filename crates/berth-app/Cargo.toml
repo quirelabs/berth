@@ -27,6 +27,10 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# See berth-core: development only, never in a release build.
+dev-server-dir = ["berth-core/dev-server-dir"]
+
 [dev-dependencies]
 # Decoding the screenshot the pixel check takes. Already in the tree via gpui,
 # so this adds a direct reference rather than new code.

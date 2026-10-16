@@ -289,10 +289,23 @@ impl Workspace {
             }
             // Why it failed, or why it was left alone, goes on the row: this is
             // where someone is looking when they ask.
+            // A host on another server build says so, with both builds a
+            // hover away. Never updated without being asked (D55).
+            let update = self.server_updates.get(&alias);
+            if update.is_some() {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(strings::SERVER_UPDATE),
+                );
+            }
             let note: Option<gpui::SharedString> = match &status {
                 HostStatus::Failed(reason) => Some(reason.clone().into()),
                 HostStatus::NeedsVerify => Some(strings::VERIFY_TOOLTIP.into()),
-                HostStatus::Verifying | HostStatus::Connection(_) => None,
+                HostStatus::Verifying | HostStatus::Connection(_) => {
+                    update.map(|(there, offered)| strings::server_update(there, offered).into())
+                }
             };
             if let Some(note) = note {
                 row = row.tooltip(move |_, cx| {
@@ -833,6 +846,86 @@ impl Workspace {
                     false,
                 )
             }
+            Some(Modal::Server { alias, plan }) => {
+                let muted = |text: gpui::SharedString| {
+                    div()
+                        .text_xs()
+                        .text_color(hsla(theme.text_muted))
+                        .child(text)
+                };
+                let fact = |label: &'static str, value: String| {
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(56.0))
+                                .text_xs()
+                                .text_color(hsla(theme.text_muted))
+                                .child(label),
+                        )
+                        .child(div().text_xs().text_color(hsla(theme.text)).child(value))
+                };
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::SERVER_WHAT),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .p(px(8.0))
+                            .rounded(px(4.0))
+                            .bg(hsla(theme.background))
+                            .border_1()
+                            .border_color(hsla(theme.border))
+                            .child(fact(
+                                strings::SERVER_HOST_LABEL,
+                                strings::server_host(&self.host_label(alias), &plan.os, &plan.arch),
+                            ))
+                            .child(fact(strings::SERVER_PATH_LABEL, plan.path.clone()))
+                            .child(fact(
+                                strings::SERVER_SIZE_LABEL,
+                                strings::server_size(plan.size),
+                            ))
+                            .child(fact(
+                                strings::SERVER_HASH_LABEL,
+                                strings::server_hash(&plan.sha256),
+                            )),
+                    );
+                if plan.hash_tool.is_none() {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.warning))
+                            .child(strings::SERVER_NO_HASH_TOOL),
+                    );
+                }
+                if plan.sessions_end_at_logout {
+                    body = body.child(
+                        div()
+                            .text_xs()
+                            .text_color(hsla(theme.warning))
+                            .child(strings::SERVER_LOGOUT_WARNING),
+                    );
+                }
+                body = body
+                    .child(muted(strings::server_removal(&plan.removal()).into()))
+                    .child(muted(
+                        strings::server_removal_by_hand(&plan.removal_by_hand()).into(),
+                    ));
+                (
+                    strings::SERVER_TITLE,
+                    strings::SERVER_ACCEPT,
+                    strings::SERVER_REJECT,
+                    false,
+                )
+            }
             None => return div(),
         };
 
@@ -910,7 +1003,7 @@ impl Workspace {
                                     .border_color(hsla(theme.border))
                                     .text_color(hsla(theme.text))
                                     .hover(|b| b.bg(hsla(theme.border)))
-                                    .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.reject(cx)))
                                     .child(reject),
                             )
                             .child(
@@ -1224,6 +1317,7 @@ fn menu_label(action: crate::menu::Action) -> &'static str {
         Action::NewTerminal => strings::MENU_NEW_TERMINAL,
         Action::Connect => strings::MENU_CONNECT,
         Action::RenameHost => strings::MENU_RENAME_HOST,
+        Action::Server => strings::MENU_SERVER,
     }
 }
 

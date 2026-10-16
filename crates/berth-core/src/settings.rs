@@ -44,6 +44,10 @@ pub struct Settings {
     /// dogfooded, so a bug in it cannot block a day's work. Removed before
     /// v0.1.0 (D50).
     pub local_direct: bool,
+    /// What was chosen for each host when Berth's server was offered there,
+    /// by alias: install it, or keep using tmux (D55). A host with no entry
+    /// has not been asked.
+    pub host_servers: std::collections::BTreeMap<String, crate::remote::Choice>,
 }
 
 impl Default for Settings {
@@ -52,6 +56,7 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             host_names: std::collections::BTreeMap::new(),
             local_direct: false,
+            host_servers: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -143,6 +148,22 @@ impl Settings {
         }
         self.host_names.insert(alias.to_string(), cleaned);
         true
+    }
+}
+
+impl Settings {
+    /// What was chosen for a host's server, if it has been asked.
+    pub fn host_server(&self, alias: &str) -> Option<crate::remote::Choice> {
+        self.host_servers.get(alias).copied()
+    }
+
+    /// Remember a choice, or forget it with `None` so the host is asked
+    /// again. Returns whether anything changed.
+    pub fn set_host_server(&mut self, alias: &str, choice: Option<crate::remote::Choice>) -> bool {
+        match choice {
+            Some(choice) => self.host_servers.insert(alias.to_string(), choice) != Some(choice),
+            None => self.host_servers.remove(alias).is_some(),
+        }
     }
 }
 
@@ -304,5 +325,27 @@ mod tests {
         settings.set_host_name("web-1", "Production web");
         settings.save_to(&path);
         assert_eq!(Settings::load_from(&path), settings);
+    }
+
+    /// A host's choice is kept across a save, and forgotten when asked to
+    /// be, so the host is asked again.
+    #[test]
+    fn a_hosts_server_choice_is_remembered_until_it_is_forgotten() {
+        use crate::remote::Choice;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut settings = Settings::default();
+        assert_eq!(settings.host_server("web"), None);
+        assert!(settings.set_host_server("web", Some(Choice::Tmux)));
+        assert!(!settings.set_host_server("web", Some(Choice::Tmux)));
+        assert!(settings.set_host_server("db", Some(Choice::Install)));
+        settings.save_to(&path);
+
+        let mut loaded = Settings::load_from(&path);
+        assert_eq!(loaded.host_server("web"), Some(Choice::Tmux));
+        assert_eq!(loaded.host_server("db"), Some(Choice::Install));
+        assert!(loaded.set_host_server("web", None));
+        assert_eq!(loaded.host_server("web"), None);
+        assert!(!loaded.set_host_server("web", None));
     }
 }

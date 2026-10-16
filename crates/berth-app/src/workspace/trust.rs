@@ -74,9 +74,25 @@ impl Workspace {
             }) => self.kill(alias, slug, pane, cx),
             Some(Modal::Rename { pane, field }) => self.rename(pane, field.value().to_string(), cx),
             Some(Modal::RenameHost { alias, field }) => self.rename_host(&alias, field.value(), cx),
+            Some(Modal::Server { alias, plan }) => self.install_server(alias, *plan, cx),
             None => {}
         }
         cx.notify();
+    }
+
+    /// The dialog's no button. Only the server question tells it apart from
+    /// Escape: "Keep using tmux" is an answer, and is remembered as one.
+    pub(super) fn reject(&mut self, cx: &mut Context<Self>) {
+        match self.modal.take() {
+            Some(Modal::Server { alias, .. }) => {
+                self.decline_server(&alias);
+                cx.notify();
+            }
+            modal => {
+                self.modal = modal;
+                self.dismiss(cx);
+            }
+        }
     }
 
     /// Say no. Nothing is written, nothing is ended.
@@ -90,6 +106,11 @@ impl Workspace {
                 tracing::info!(%alias, "kill cancelled");
             }
             Some(Modal::Rename { .. } | Modal::RenameHost { .. }) => {}
+            // Escape is "not now": nothing is remembered, and the next
+            // connect the user makes, or the menu item, asks again.
+            Some(Modal::Server { alias, .. }) => {
+                tracing::info!(%alias, "the server question was put off");
+            }
             None => {}
         }
         cx.notify();

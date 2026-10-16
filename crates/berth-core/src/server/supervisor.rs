@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use berth_proto::core;
 use berth_proto::v1::{self, SessionId, SessionInfo, ToApp, ToServer};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::link::{self, protocol};
 use super::paths::{self, Places};
@@ -65,6 +66,14 @@ enum Event {
         session: SessionId,
         reply_to: Option<ClientId>,
         why: String,
+        /// The worker's build, when it greeted and then could not be read.
+        build: Option<String>,
+    },
+    /// The core (D54, D55): asked by any build, answered by this one.
+    Core {
+        client: ClientId,
+        ask: core::Ask,
+        reply: oneshot::Sender<core::Answer>,
     },
     WorkerSaid(SessionId, ToApp),
     WorkerGone(SessionId),
@@ -161,6 +170,11 @@ struct State {
     events: mpsc::Sender<Event>,
     sessions: HashMap<SessionId, Session>,
     clients: HashMap<ClientId, ClientQueue>,
+    /// Workers found running that greeted and then could not be read, by
+    /// the build they greeted as: another draft's (D54). They are not in the
+    /// session list, which this build cannot fill in for them, and are in
+    /// the core's, so they can still be seen and ended.
+    unreadable: HashMap<SessionId, String>,
     /// Sessions being started, so an idle check does not exit under them.
     starting: usize,
     next_session: SessionId,
@@ -184,6 +198,7 @@ pub async fn run(config: Config) -> Result<()> {
         events,
         sessions: HashMap::new(),
         clients: HashMap::new(),
+        unreadable: HashMap::new(),
     };
     for session in found {
         state.connect_worker(session, None);
@@ -247,11 +262,24 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
     if events.send(Event::ClientUp(id, tx)).await.is_err() {
         return;
     }
+    // Core answers go out as they are, beside the version's messages.
+    let (core_tx, mut core_rx) = mpsc::channel::<Vec<u8>>(4);
     let mut write = opened.write;
     let mut writer = tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            let Ok(payload) = message.encode() else {
-                continue;
+        loop {
+            let payload = tokio::select! {
+                // In this order every time: a core answer is rare and must
+                // not wait behind a flood of output, and checking for one
+                // costs the output nothing worth counting.
+                biased;
+                Some(payload) = core_rx.recv() => payload,
+                // The table dropping this client's queue ends the writer,
+                // and with it the connection, whatever the core is doing.
+                message = rx.recv() => match message.map(|m| m.encode()) {
+                    Some(Ok(payload)) => payload,
+                    Some(Err(_)) => continue,
+                    None => break,
+                },
             };
             if write.send(&payload).await.is_err() {
                 break;
@@ -266,6 +294,21 @@ async fn client(id: ClientId, stream: super::transport::Stream, events: mpsc::Se
             _ = &mut writer => break,
             received = read.recv() => {
                 let Ok(Some(payload)) = received else { break };
+                // Before anything of a version: the core is read whatever
+                // else this client and this build make of each other.
+                if core::is_core(&payload) {
+                    let Ok(ask) = core::Ask::decode(&payload) else { continue };
+                    let (reply, answer) = oneshot::channel();
+                    if events.send(Event::Core { client: id, ask, reply }).await.is_err() {
+                        break;
+                    }
+                    if let Ok(answer) = answer.await
+                        && let Ok(payload) = answer.encode()
+                    {
+                        let _ = core_tx.send(payload).await;
+                    }
+                    continue;
+                }
                 match ToServer::decode(&payload) {
                     Ok(message) => {
                         if events.send(Event::ClientSaid(id, message)).await.is_err() {
@@ -445,13 +488,23 @@ impl State {
                 }
                 self.push_sessions();
             }
+            Event::Core { client, ask, reply } => {
+                if let core::Ask::End { session } = ask {
+                    self.core_end(client, session).await;
+                }
+                let _ = reply.send(core::Answer::Sessions(self.core_sessions()));
+            }
             Event::WorkerFailed {
                 session,
                 reply_to,
                 why,
+                build,
             } => {
                 self.starting = self.starting.saturating_sub(1);
                 tracing::warn!(session, %why, "a worker did not start");
+                if let (None, Some(build)) = (reply_to, build) {
+                    self.unreadable.insert(session, build);
+                }
                 if let Some(client) = reply_to {
                     self.send_client(
                         client,
@@ -521,6 +574,55 @@ impl State {
                     self.sessions.remove(&session);
                     self.push_sessions();
                 }
+            }
+        }
+    }
+
+    /// Every session here as any build can be told of it (D55): the ones in
+    /// the session list, and workers of a build this one cannot read.
+    fn core_sessions(&mut self) -> Vec<core::Session> {
+        let places = &self.config.places;
+        self.unreadable.retain(|session, _| {
+            paths::read_pid(&places.worker_pid(*session)).is_some_and(paths::alive)
+        });
+        let mut list: Vec<core::Session> = self
+            .sessions
+            .values()
+            .map(|s| core::Session {
+                id: s.info.id,
+                title: s.info.title.clone().unwrap_or_else(|| s.info.name.clone()),
+                build: s.build.clone(),
+                alive: true,
+            })
+            .chain(self.unreadable.iter().map(|(id, build)| core::Session {
+                id: *id,
+                title: String::new(),
+                build: build.clone(),
+                alive: true,
+            }))
+            .collect();
+        list.sort_by_key(|s| s.id);
+        list
+    }
+
+    /// End a session for the core. One this build reads is ended as any
+    /// other; a worker it cannot read is ended as a process, which needs
+    /// nothing of its build.
+    async fn core_end(&mut self, client: ClientId, session: SessionId) {
+        if self.sessions.contains_key(&session) {
+            self.forward(client, session, ToServer::Kill { session })
+                .await;
+            return;
+        }
+        if !self.unreadable.contains_key(&session) {
+            return;
+        }
+        let pid = paths::read_pid(&self.config.places.worker_pid(session));
+        if let Some(pid) = pid {
+            tracing::info!(session, pid, "ending a worker of another build");
+            let ended = tokio::task::spawn_blocking(move || super::remove::end_worker(pid)).await;
+            if matches!(ended, Ok(true)) {
+                self.unreadable.remove(&session);
             }
         }
     }
@@ -663,6 +765,7 @@ impl State {
                                 session,
                                 reply_to: Some(reply_to),
                                 why: error.to_string(),
+                                build: None,
                             })
                             .await;
                     });
@@ -697,6 +800,7 @@ impl State {
                 session,
                 reply_to,
                 why,
+                build: None,
             };
             let stream = match worker_host::reach(&places, session).await {
                 Ok(stream) => stream,
@@ -722,7 +826,16 @@ impl State {
             let info = match describe(&mut opened, other.as_ref()).await {
                 Ok(info) => info,
                 Err(error) => {
-                    let _ = events.send(failed(error.to_string())).await;
+                    // It greeted, so it is running and its build is known:
+                    // kept for the core's list.
+                    let _ = events
+                        .send(Event::WorkerFailed {
+                            session,
+                            reply_to,
+                            why: error.to_string(),
+                            build: Some(opened.theirs.build.clone()),
+                        })
+                        .await;
                     return;
                 }
             };
@@ -789,23 +902,17 @@ impl State {
         });
     }
 
-    /// Delete worker binaries that neither this build nor any running worker
+    /// Delete builds that neither this supervisor nor any running worker
     /// uses (D50).
     fn remove_unused_copies(&self) {
-        let mut keep: HashSet<String> = self
-            .sessions
-            .values()
-            .filter_map(|s| paths::copy_name(&s.build))
-            .collect();
-        if let Some(own) = paths::copy_name(&super::build()) {
-            keep.insert(own);
-        }
+        let mut keep: HashSet<String> = self.sessions.values().map(|s| s.build.clone()).collect();
+        keep.insert(super::build());
         if let Launcher::Process { exe } = &self.config.launcher
-            && let Some(name) = exe.file_name()
+            && let Ok(build) = paths::build_of(exe)
         {
-            keep.insert(name.to_string_lossy().to_string());
+            keep.insert(build);
         }
-        paths::remove_unused_copies(&self.config.places.bin, &keep);
+        paths::remove_unused_builds(&self.config.places.bin, &keep);
     }
 }
 

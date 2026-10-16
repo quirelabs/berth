@@ -37,7 +37,10 @@ pub fn send(socket: &Path, line: &str) -> std::io::Result<()> {
         // Stay until the worker has read it and closed. Closing first would
         // leave the worker unable to ask who connected (macOS answers that
         // only while both ends are open), and it refuses who it cannot name.
-        stream.shutdown(std::net::Shutdown::Write)?;
+        // Not an error if it fails: the worker may have read the line and
+        // closed already, and macOS then refuses to shut down a socket whose
+        // other end is gone. The line was delivered either way.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         stream.set_read_timeout(Some(WITHIN))?;
         let mut rest = [0u8; 64];
         while let Ok(n) = std::io::Read::read(&mut stream, &mut rest) {

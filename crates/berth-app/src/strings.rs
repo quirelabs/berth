@@ -198,6 +198,86 @@ pub const MENU_OPEN: &str = "Open";
 pub const MENU_NEW_TERMINAL: &str = "New terminal";
 pub const MENU_CONNECT: &str = "Connect";
 pub const MENU_RENAME_HOST: &str = "Rename\u{2026}";
+pub const MENU_SERVER: &str = "Berth server\u{2026}";
+
+// Berth's server on a remote host (D55). The dialog shows exactly what would
+// be installed and where; nothing is installed without it.
+pub const SERVER_TITLE: &str = "Install Berth's server on this host?";
+pub const SERVER_WHAT: &str = "It keeps your sessions running on the host, so they outlive a \
+    dropped connection and come back at once. It runs as you, started over SSH when you \
+    connect: no listening port, nothing started at boot, no root.";
+pub const SERVER_HOST_LABEL: &str = "Host";
+pub const SERVER_PATH_LABEL: &str = "Path";
+pub const SERVER_SIZE_LABEL: &str = "Size";
+pub const SERVER_HASH_LABEL: &str = "SHA-256";
+pub const SERVER_ACCEPT: &str = "Install";
+pub const SERVER_REJECT: &str = "Keep using tmux";
+pub const SERVER_NO_HASH_TOOL: &str = "This host has neither sha256sum nor shasum, so the file \
+    cannot be checked there after it is uploaded. SSH's own integrity protects it on the way.";
+pub const SERVER_LOGOUT_WARNING: &str = "This host ends your processes when you log out, so \
+    sessions there will not outlive a disconnect. Running loginctl enable-linger on the host \
+    turns that off for your account. Berth never runs it for you.";
+pub const SERVER_UPDATE: &str = "Server update available";
+pub const SERVER_NOT_CARRIED: &str =
+    "This build of Berth carries no servers, so hosts stay on tmux.";
+pub fn server_host(name: &str, os: &str, arch: &str) -> String {
+    format!("{name} ({os} {arch})")
+}
+/// A size in megabytes to one place, as a download would be described.
+pub fn server_size(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+/// A SHA-256 in four groups, so it wraps where it can be compared.
+pub fn server_hash(sha256: &str) -> String {
+    let chars: Vec<char> = sha256.chars().collect();
+    chars
+        .chunks(16)
+        .map(|group| group.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+pub fn server_removal(command: &str) -> String {
+    format!("Remove it at any time by running this on the host: {command}")
+}
+pub fn server_removal_by_hand(command: &str) -> String {
+    format!("With no sessions running, {command} does the same.")
+}
+pub fn server_update(there: &str, offered: &str) -> String {
+    format!("This host runs Berth server {there}. This app carries {offered}.")
+}
+pub fn server_installed(host: &str, hash_checked: bool) -> String {
+    let checked = if hash_checked {
+        "its hash was checked on the host"
+    } else {
+        "its hash could not be checked on the host"
+    };
+    // Until the connection to it is built, sessions stay where they are.
+    format!(
+        "Berth's server is installed on {host}; {checked}. Sessions there still use tmux in this build."
+    )
+}
+pub fn server_in_use(host: &str, build: &str) -> String {
+    format!("Berth's server {build} is installed on {host}.")
+}
+pub fn server_none_for(host: &str, os: &str, arch: &str) -> String {
+    format!("This app carries no Berth server for {host} ({os} {arch}). It stays on tmux.")
+}
+pub fn server_path_unusable(host: &str, path: &str) -> String {
+    format!(
+        "Berth's server cannot be installed on {host}: its data directory is {path:?}. It stays on tmux."
+    )
+}
+pub fn server_noexec(host: &str, dir: &str) -> String {
+    format!(
+        "{host} will not run programs from {dir}: its home is mounted noexec. It stays on tmux."
+    )
+}
+pub fn server_install_failed(host: &str, why: &str) -> String {
+    format!("Berth's server was not installed on {host}: {why}")
+}
+pub fn server_probe_failed(host: &str, why: &str) -> String {
+    format!("Could not look at {host} for Berth's server: {why}")
+}
 
 pub const KILL_TITLE: &str = "End this session?";
 pub const KILL_ACCEPT: &str = "End session";
@@ -230,6 +310,17 @@ pub fn connection_state(state: ConnectionState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hash is shown whole, in groups that wrap where it can be read
+    /// against another, and the size as a download would be.
+    #[test]
+    fn a_servers_hash_and_size_are_shown_to_be_compared() {
+        let sha = "0123456789abcdef".repeat(4);
+        let shown = server_hash(&sha);
+        assert_eq!(shown.split(' ').count(), 4);
+        assert_eq!(shown.replace(' ', ""), sha);
+        assert_eq!(server_size(5_214_864), "5.2 MB");
+    }
 
     #[test]
     fn every_connection_state_has_a_label() {

@@ -38,6 +38,8 @@ pub enum Action {
     Connect,
     /// Give a host a name Berth shows instead of its alias.
     RenameHost,
+    /// Look at a host's Berth server again: offer it, or say how it stands.
+    Server,
 }
 
 /// What the menu needs to know beyond the target itself.
@@ -58,7 +60,9 @@ pub fn actions(target: &Target, facts: Facts) -> Vec<Action> {
         Target::Detached { .. } | Target::LocalDetached { .. } => {
             vec![Action::Open, Action::EndSession]
         }
-        Target::Host(_) if facts.connected => vec![Action::NewTerminal, Action::RenameHost],
+        Target::Host(_) if facts.connected => {
+            vec![Action::NewTerminal, Action::RenameHost, Action::Server]
+        }
         Target::Host(_) => vec![Action::Connect, Action::RenameHost],
         Target::Local => vec![Action::NewTerminal],
     }
@@ -146,9 +150,10 @@ mod tests {
             local: false,
             connected: true,
         };
+        // The server is asked about over the connection, so only then.
         assert_eq!(
             actions(&host, up),
-            [Action::NewTerminal, Action::RenameHost]
+            [Action::NewTerminal, Action::RenameHost, Action::Server]
         );
         assert_eq!(
             actions(&host, Facts::default()),
