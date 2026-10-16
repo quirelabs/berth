@@ -1635,75 +1635,77 @@ impl Workspace {
         }
     }
 
-    fn status_bar(&self) -> impl IntoElement {
+    /// The window's status bar (D53), in the terminal's font: how many
+    /// sessions are working, need you or have failed, each with its glyph,
+    /// on the left, a click going to the next of them; each host's latency
+    /// on the right.
+    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::glyph::State;
         let theme = self.theme;
-        let pane = self.focused();
-        let rtt = match pane.and_then(|p| self.conns.get(p.alias())?.rtt) {
-            Some(rtt) => format!("{} ms", rtt.as_millis()),
-            None => "-".to_string(),
-        };
         let mut bar = div()
             .h(px(24.0))
             .flex()
             .items_center()
-            .gap(px(12.0))
-            .px(px(10.0))
+            .gap(px(14.0))
+            .px(px(12.0))
             .font_family(self.chrome_font())
             .bg(hsla(theme.chrome))
             .text_xs()
-            .text_color(hsla(theme.text_muted))
-            // The host actually on screen, which with warming is whichever
-            // answered first and not necessarily the first in the file.
-            .child(
-                pane.map(|p| p.alias().to_string())
-                    .unwrap_or_else(|| strings::STATUS_NO_HOST.to_string()),
-            )
-            .child(strings::connection_state(
-                pane.map(|p| self.state_of(p.id))
-                    .unwrap_or(ConnectionState::Disconnected),
-            ))
-            .child(rtt)
-            .child(strings::STATUS_NOT_RECORDING);
-
-        // The focused pane's status in words, with its message and how long
-        // it has been so (D53).
-        if let Some(pane) = pane
-            && let Some(look) = self.pane_look(pane.id)
-            && look.state != crate::glyph::State::Idle
-        {
-            let provider = self
-                .pane_program(pane)
-                .or(look.program.as_deref())
-                .map(crate::programs::display_name);
-            let colour = match look.state {
-                crate::glyph::State::NeedsYou => theme.gold,
-                crate::glyph::State::Error => theme.rose_text,
-                _ => theme.text_muted,
+            .text_color(hsla(theme.text_muted));
+        for state in [State::Working, State::NeedsYou, State::Error] {
+            let count = self.status_targets(state).len();
+            let glyph = crate::glyph::glyph(
+                state,
+                self.glyph_colours(None),
+                crate::glyph::Moment {
+                    clock: Duration::ZERO,
+                    since: Duration::ZERO,
+                    steady: true,
+                    still: true,
+                },
+            );
+            let tone = match (state, count) {
+                (_, 0) => theme.text_muted,
+                (State::NeedsYou, _) => theme.gold,
+                (State::Error, _) => theme.rose_text,
+                _ => theme.text,
             };
             bar = bar.child(
                 div()
-                    .truncate()
-                    .text_color(hsla(colour))
-                    .child(strings::status_line(
-                        provider.as_deref(),
-                        look.state,
-                        look.msg.as_deref(),
-                        self.status_since(StatusKey::Pane(pane.id)),
-                    )),
+                    .id(gpui::ElementId::Name(format!("count-{state:?}").into()))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .when(count > 0, |chip| {
+                        chip.cursor_pointer().on_click(
+                            cx.listener(move |this, _, _, cx| this.cycle_status(state, cx)),
+                        )
+                    })
+                    .role(gpui::Role::Button)
+                    .aria_label(strings::status_count(state, count))
+                    .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR))
+                    .child(div().text_color(hsla(tone)).child(count.to_string())),
             );
         }
-
-        // Only while there is nothing to see. A keyboard feature nobody can
-        // find does not exist, and one that keeps explaining itself after you
-        // have used it is worse.
-        if self.tab().is_some_and(|t| t.root.panes().len() == 1) {
-            bar = bar.child(
+        let mut hosts = div().ml_auto().flex().gap(px(14.0));
+        for (alias, conn) in &self.conns {
+            if alias == strings::LOCAL_ALIAS {
+                continue;
+            }
+            let Some(rtt) = conn.rtt else { continue };
+            hosts = hosts.child(
                 div()
-                    .ml_auto()
-                    .text_color(hsla(theme.border))
-                    .child(strings::SPLIT_HINT),
+                    .flex()
+                    .gap(px(5.0))
+                    .child(self.host_label(alias))
+                    .child(
+                        div()
+                            .text_color(hsla(theme.text))
+                            .child(format!("{} ms", rtt.as_millis())),
+                    ),
             );
         }
+        bar = bar.child(hosts);
         bar
     }
 }
@@ -1838,7 +1840,7 @@ impl Render for Workspace {
             .bg(hsla(theme.background))
             .text_sm()
             .child(div().flex().flex_1().child(self.sidebar(cx)).child(pane))
-            .child(self.status_bar());
+            .child(self.status_bar(cx));
 
         if let Some(panel) = self.tab_panel(cx) {
             root = root.child(panel);
@@ -2056,18 +2058,14 @@ mod tests {
         );
         assert_eq!(claude_text(State::Working), strings::CLAUDE_WORKING);
         assert_eq!(
-            strings::status_line(Some("claude"), Glyph::Done, None, Duration::from_secs(190)),
-            "claude done (for 3 min)"
+            strings::status_count(Glyph::NeedsYou, 2),
+            "2 sessions need you"
         );
         assert_eq!(
-            strings::status_line(
-                None,
-                Glyph::Working,
-                Some("Building"),
-                Duration::from_secs(5)
-            ),
-            "A program working: Building (for 5 s)"
+            strings::status_count(Glyph::NeedsYou, 1),
+            "1 session needs you"
         );
+        assert_eq!(strings::status_count(Glyph::Error, 3), "3 sessions failed");
     }
 
     /// A row says how long it has been as it is, "done" when it finished,

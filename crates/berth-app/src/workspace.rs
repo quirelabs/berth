@@ -387,6 +387,8 @@ pub struct Workspace {
     /// What runs in each remote session, by alias and slug: the foreground
     /// process's name from the same scan as `running`.
     programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Where each status bar count last went, so the next click goes on.
+    status_cycle: std::collections::HashMap<crate::glyph::State, usize>,
     /// The divider being dragged, whose pill stays up while it is.
     dragging_divider: Option<(u64, crate::panes::Path)>,
     /// Where each tab was last drawn, for a dragged tab's landing place and
@@ -616,6 +618,7 @@ impl Workspace {
             hook_done_seen: std::collections::HashSet::new(),
             programs: std::collections::BTreeMap::new(),
             dragging_divider: None,
+            status_cycle: std::collections::HashMap::new(),
             tab_bounds: Default::default(),
             tab_dragging: None,
             tab_slides: std::collections::HashMap::new(),
@@ -1818,6 +1821,40 @@ impl Workspace {
             self.tabs[index].focus = pane;
             cx.notify();
         }
+    }
+
+    /// Every session in a state, in the order the status bar's count goes
+    /// through them: shown panes by tab, then local sessions no pane shows.
+    fn status_targets(&self, state: crate::glyph::State) -> Vec<RowTarget> {
+        let shown = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.root.panes())
+            .filter(|pane| {
+                self.pane_look(*pane)
+                    .is_some_and(|look| look.state == state)
+            })
+            .map(RowTarget::Pane);
+        let unshown = self
+            .detached_local()
+            .into_iter()
+            .filter(|(session, _)| {
+                self.session_look(*session)
+                    .is_some_and(|look| look.state == state)
+            })
+            .map(|(session, _)| RowTarget::Local(session));
+        shown.chain(unshown).collect()
+    }
+
+    /// A click on a status bar count: the next session in that state.
+    fn cycle_status(&mut self, state: crate::glyph::State, cx: &mut Context<Self>) {
+        let targets = self.status_targets(state);
+        if targets.is_empty() {
+            return;
+        }
+        let next = self.status_cycle.get(&state).copied().unwrap_or(0) % targets.len();
+        self.status_cycle.insert(state, next + 1);
+        self.click_row(targets[next].clone(), cx);
     }
 
     /// A new tab with a fresh session on the focused pane's host, or on this

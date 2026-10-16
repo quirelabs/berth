@@ -86,11 +86,6 @@ pub fn changed_key(line: usize, fingerprint: &str) -> String {
 pub const FORWARD_BIND_TOOLTIP: &str = "While Berth holds this port, a plain ssh to the same host will report \
      \"bind: Address already in use\" for it. Harmless: the forward is already up.";
 
-/// Shown once, under an unsplit tab, because a split that nobody can find is
-/// a feature that does not exist.
-pub const SPLIT_HINT: &str =
-    "Cmd+D splits right, Cmd+Shift+D splits down, Cmd+] moves between panes";
-
 /// Claude's state, from its own hooks (D48). Each says what Claude reported and
 /// nothing Berth inferred.
 pub const CLAUDE_WORKING: &str = "Claude is working.";
@@ -138,6 +133,24 @@ pub fn status_tooltip(
         text.push_str(msg);
     }
     text
+}
+
+/// A status bar count, as a screen reader says it.
+pub fn status_count(state: crate::glyph::State, count: usize) -> String {
+    use crate::glyph::State;
+    let one = count == 1;
+    let what = match (state, one) {
+        (State::Working, _) => "working",
+        (State::NeedsYou, true) => "needs you",
+        (State::NeedsYou, false) => "need you",
+        (State::Error, _) => "failed",
+        (State::Done, _) => "done",
+        (State::Idle, _) => "idle",
+    };
+    format!(
+        "{count} {} {what}",
+        if one { "session" } else { "sessions" }
+    )
 }
 
 /// The sidebar's group of sessions that need the user (D53).
@@ -207,27 +220,6 @@ pub fn status_since(since: std::time::Duration) -> String {
         format!("for {} min", secs / 60)
     } else {
         format!("for {} h", secs / 3600)
-    }
-}
-
-/// The focused pane's status in the status line: who, what, their message,
-/// and for how long.
-pub fn status_line(
-    provider: Option<&str>,
-    state: crate::glyph::State,
-    msg: Option<&str>,
-    since: std::time::Duration,
-) -> String {
-    let who = provider
-        .filter(|p| !p.is_empty())
-        .unwrap_or(STATUS_ANONYMOUS);
-    match msg.map(str::trim).filter(|m| !m.is_empty()) {
-        Some(msg) => format!(
-            "{who} {}: {msg} ({})",
-            state_word(state),
-            status_since(since)
-        ),
-        None => format!("{who} {} ({})", state_word(state), status_since(since)),
     }
 }
 
@@ -356,9 +348,6 @@ pub fn kill_body(alias: &str, session: &str) -> String {
          and its scrollback is gone. This cannot be undone."
     )
 }
-
-pub const STATUS_NO_HOST: &str = "No host";
-pub const STATUS_NOT_RECORDING: &str = "Not recording";
 
 use berth_core::connection::ConnectionState;
 
