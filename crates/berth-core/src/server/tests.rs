@@ -696,6 +696,7 @@ fn of_another_draft() -> Vec<u8> {
         pid: None,
         status: None,
         title: None,
+        exit: None,
     };
     let mut bytes = ToApp::Sessions(vec![info]).encode().unwrap();
     bytes.pop();
@@ -972,6 +973,7 @@ async fn a_client_that_floods_a_worker_is_disconnected_and_the_session_lives() {
             pid: None,
             status: None,
             title: None,
+            exit: None,
         };
         let payload = ToApp::Sessions(vec![info]).encode().unwrap();
         opened.write.send(&payload).await.unwrap();

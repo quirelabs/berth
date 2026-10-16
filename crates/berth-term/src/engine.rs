@@ -86,6 +86,11 @@ pub enum StatusEvent {
     Report(String),
     /// A new shell prompt began (OSC 133 A).
     PromptStart,
+    /// A command began to run at the prompt (OSC 133 C).
+    CommandStart,
+    /// The command at the prompt finished, with its exit code where the
+    /// shell gave one (OSC 133 D).
+    CommandEnd(Option<i32>),
     /// A full reset: every record goes.
     Reset,
     /// The program set the terminal's title (OSC 0 or 2). Untrusted text.
@@ -1030,8 +1035,17 @@ impl Engine {
                     }
                 }
                 Piece::Marker(kind) => {
-                    if kind == crate::shell::ShellEventKind::PromptStart && self.reply.is_some() {
-                        self.status_events.push(StatusEvent::PromptStart);
+                    if self.reply.is_some() {
+                        use crate::shell::ShellEventKind;
+                        let event = match kind {
+                            ShellEventKind::PromptStart => Some(StatusEvent::PromptStart),
+                            ShellEventKind::OutputStart => Some(StatusEvent::CommandStart),
+                            ShellEventKind::CommandEnd { exit_code } => {
+                                Some(StatusEvent::CommandEnd(exit_code))
+                            }
+                            ShellEventKind::CommandStart => None,
+                        };
+                        self.status_events.extend(event);
                     }
                     self.seen_shell_marker = true;
                     self.shell_events.push(ShellEvent {
@@ -1649,6 +1663,23 @@ mod tests {
         assert_eq!(
             answers(b"\x1b]7501;?\x07\x1b[c"),
             "\x1b]7501;?\x1b\\\x1b[?62;22c"
+        );
+    }
+
+    /// A command's start and its exit code reach the session's worker, in
+    /// order with the rest.
+    #[test]
+    fn a_server_terminal_reports_how_commands_end() {
+        let term = Terminal::server(TermSize::new(20, 5), Scrollback::VIEW, Box::new(|_| {}));
+        term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C\x07out\x1b]133;D;1\x07");
+        let _ = term.snapshot();
+        assert_eq!(
+            term.drain_status_events(),
+            [
+                StatusEvent::PromptStart,
+                StatusEvent::CommandStart,
+                StatusEvent::CommandEnd(Some(1)),
+            ]
         );
     }
 

@@ -147,6 +147,10 @@ pub struct SessionInfo {
     /// The terminal's title, where the program set one (OSC 0 or 2), cleaned
     /// of control characters and cut to a line. Untrusted.
     pub title: Option<String>,
+    /// How the last command at the shell's prompt exited, where the shell
+    /// marks its commands (OSC 133 D); none while one runs, or when it did
+    /// not say. Display only (D53, D54).
+    pub exit: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

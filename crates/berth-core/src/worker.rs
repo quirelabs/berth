@@ -84,6 +84,8 @@ pub struct Shell {
 struct Live {
     program: Option<String>,
     cwd: Option<String>,
+    /// How the last command at the prompt exited, as of the last look.
+    exit: Option<i32>,
 }
 
 pub struct Worker {
@@ -119,6 +121,9 @@ struct Status {
     unsent: Vec<v1::Event>,
     /// What had the terminal when last looked at, to see a program end.
     foreground: Option<u32>,
+    /// How the last command at the prompt exited (OSC 133 D), none while
+    /// one runs.
+    exit: Option<i32>,
     /// The terminal's title, as the program last set it, cleaned.
     title: Option<String>,
 }
@@ -185,6 +190,7 @@ impl Worker {
                 name: spec.name.clone(),
                 live: Mutex::new(Live {
                     program: None,
+                    exit: None,
                     cwd: spec
                         .cwd
                         .as_ref()
@@ -297,6 +303,10 @@ impl Worker {
                 berth_term::StatusEvent::PromptStart => {
                     status.records.program_ended();
                 }
+                // How the last command exited is for the session list: none
+                // while one runs (D53).
+                berth_term::StatusEvent::CommandStart => status.exit = None,
+                berth_term::StatusEvent::CommandEnd(code) => status.exit = code,
                 berth_term::StatusEvent::Reset => {
                     status.records.reset();
                 }
@@ -353,6 +363,11 @@ impl Worker {
     pub fn info(&self) -> v1::SessionInfo {
         let (cols, rows) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
         let live = self.live.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        // Taken together, under one lock held for no longer than this.
+        let (title, exit) = {
+            let status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            (status.title.clone(), status.exit)
+        };
         v1::SessionInfo {
             id: self.session,
             name: self.name.clone(),
@@ -363,12 +378,8 @@ impl Worker {
             claude: self.claude(),
             pid: self.pty.local_pid(),
             status: crate::status::foremost(&self.statuses()).cloned(),
-            title: self
-                .status
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .title
-                .clone(),
+            title,
+            exit,
         }
     }
 
@@ -381,15 +392,18 @@ impl Worker {
         if self.pty.local_pid() == Some(pid) {
             self.reassert_size();
         }
+        let exit = self.status.lock().unwrap_or_else(|p| p.into_inner()).exit;
         let now = Live {
             program: crate::local::program_of(pid),
             cwd: crate::local::cwd_of(pid).map(|d| d.to_string_lossy().to_string()),
+            exit,
         };
         let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
         // Something the machine would not say is not a change.
         let merged = Live {
             program: now.program.or_else(|| live.program.clone()),
             cwd: now.cwd.or_else(|| live.cwd.clone()),
+            exit: now.exit,
         };
         if merged == *live {
             return None;
@@ -977,6 +991,47 @@ mod tests {
             .to_string_lossy()
             .to_string();
         until(&mut rx, &name).await;
+    }
+
+    /// How the last command at the prompt exited reaches the session list,
+    /// and goes while the next one runs.
+    #[tokio::test]
+    async fn the_last_commands_exit_is_in_the_session_list() {
+        let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
+        until(&mut rx, "$ ").await;
+        let mark = |bytes: &'static [u8]| ToServer::Input {
+            session: 1,
+            bytes: bytes.to_vec(),
+        };
+        worker
+            .handle(mark(
+                b"printf '\\033]133;C\\007'; printf '\\033]133;D;3\\007'; echo marked\n",
+            ))
+            .await;
+        until(&mut rx, "\u{7}marked").await;
+        // The engine parses on its own thread: look until it has.
+        let exit_becomes = |wanted: Option<i32>| {
+            let worker = &worker;
+            async move {
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        let _ = worker.status_changes();
+                        if worker.info().exit == wanted {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            }
+        };
+        assert!(exit_becomes(Some(3)).await, "{:?}", worker.info().exit);
+        worker
+            .handle(mark(b"printf '\\033]133;C\\007'; echo running\n"))
+            .await;
+        until(&mut rx, "\u{7}running").await;
+        assert!(exit_becomes(None).await, "{:?}", worker.info().exit);
     }
 
     #[tokio::test]
