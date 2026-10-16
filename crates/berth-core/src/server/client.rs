@@ -37,6 +37,7 @@ pub async fn connect(places: &Places) -> Result<Client> {
 /// Connect to the supervisor at `places`, which should be the build
 /// `expected`: the one this side would have started or installed.
 pub async fn connect_expecting(places: &Places, expected: &str) -> Result<Client> {
+    places.trusted()?;
     let stream = super::transport::connect(&places.supervisor())
         .await
         .map_err(|e| Error::Server(format!("no supervisor answers: {e}")))?;
@@ -99,6 +100,7 @@ const CORE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// end one. It works whatever else this build and that one cannot read of
 /// each other, and whatever the main connection is doing.
 pub async fn core(places: &Places, ask: core::Ask) -> Result<Vec<core::Session>> {
+    places.trusted()?;
     let stream = super::transport::connect(&places.supervisor())
         .await
         .map_err(|e| Error::Server(format!("no supervisor answers: {e}")))?;

@@ -440,6 +440,7 @@ pub async fn run_process(args: &[String]) -> Result<()> {
 
 /// Connect to a worker's endpoint, waiting for it to come up.
 pub async fn reach(places: &Places, session: SessionId) -> Result<super::transport::Stream> {
+    places.trusted()?;
     let endpoint = places.worker(session);
     let mut last = None;
     for _ in 0..100 {

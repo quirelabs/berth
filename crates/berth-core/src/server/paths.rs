@@ -72,6 +72,18 @@ impl Places {
         Ok(())
     }
 
+    /// Before connecting to anything here: a runtime directory in `/tmp`
+    /// must already be this user's alone, or whoever made it first could be
+    /// the one answering. Nothing is created; under the data directory
+    /// there is nothing to check.
+    pub fn trusted(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(shared) = self.run.parent().filter(|p| is_fallback_root(p)) {
+            own_in_tmp(shared)?;
+        }
+        Ok(())
+    }
+
     pub fn supervisor(&self) -> PathBuf {
         endpoint(&self.run, "s")
     }
@@ -152,12 +164,20 @@ fn own_uid() -> Option<u32> {
 /// anyone else. Someone else could have made it first.
 #[cfg(unix)]
 fn make_own_in_tmp(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
     }
+    own_in_tmp(dir)
+}
+
+/// Whether `dir` under `/tmp` is this user's alone: a real directory, not a
+/// link, owned by this user, with nothing allowed to anyone else.
+#[cfg(unix)]
+fn own_in_tmp(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(dir)?;
     let own = own_uid().is_some_and(|uid| uid == meta.uid());
     if !meta.file_type().is_dir() || !own || meta.mode() & 0o077 != 0 {
@@ -446,6 +466,33 @@ mod tests {
         let link = dir.path().join("berth-2");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
         assert!(make_own_in_tmp(&link).is_err(), "a link to somewhere else");
+    }
+
+    /// A client only looks: a directory in `/tmp` that is missing, open to
+    /// others or a link is refused before anything connects, and nothing is
+    /// made.
+    #[cfg(unix)]
+    #[test]
+    fn a_client_checks_the_directory_in_tmp_before_it_connects() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("berth-3");
+        assert!(own_in_tmp(&missing).is_err());
+        assert!(!missing.exists(), "checking makes nothing");
+
+        let open = dir.path().join("berth-4");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(own_in_tmp(&open).is_err(), "open to others");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        own_in_tmp(&open).unwrap();
+
+        let link = dir.path().join("berth-5");
+        std::os::unix::fs::symlink(&open, &link).unwrap();
+        assert!(own_in_tmp(&link).is_err(), "a link, even to our own");
+
+        // Under a data directory there is nothing to check.
+        Places::under(dir.path()).trusted().unwrap();
     }
 
     /// A server installed on a host keeps its files where it was put.
