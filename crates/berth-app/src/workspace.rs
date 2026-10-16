@@ -27,7 +27,7 @@ use crate::panes::{Axis, Node};
 use crate::strings;
 use crate::terminal_view::TerminalView;
 use crate::text_field::{Outcome, TextField};
-use crate::theme::{Appearance, Theme, hsla};
+use crate::theme::{Theme, hsla};
 use crate::{runtime, session};
 use gpui::svg;
 
@@ -333,7 +333,7 @@ pub struct Workspace {
     /// The session whose finished or failed status the focused pane was
     /// showing at the last look: still so at the next, the user has seen it
     /// (D53).
-    status_shown: Looked<OtterKey>,
+    status_shown: Looked<StatusKey>,
     /// Panes whose Claude finished its turn, as its hooks said, and whose
     /// user has since looked: their `done` is no longer shown (D53).
     hook_done_seen: std::collections::HashSet<u64>,
@@ -342,14 +342,21 @@ pub struct Workspace {
     programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// The divider being dragged, whose pill stays up while it is.
     dragging_divider: Option<(u64, crate::panes::Path)>,
-    /// The otter icons' clock (D53): when the looping poses began, when each
-    /// pane's or session's `done` began (it plays for two seconds), whether
-    /// motion is off, and the one timer every icon shares. The timer is only
-    /// set while an icon on screen has another frame coming.
-    otter_epoch: std::time::Instant,
-    otter_done: std::collections::HashMap<OtterKey, std::time::Instant>,
-    otter_still: bool,
-    otter_timer: Option<gpui::Task<()>>,
+    /// The glyphs' clock (D53): what every blink keeps time by, what each
+    /// pane or session shows and since when, the panes needing the user
+    /// that have been focused since (their heartbeat is steady), whether
+    /// motion is off, and the one timer every glyph shares. The timer is
+    /// only set while a tab's glyph on screen moves.
+    glyph_epoch: std::time::Instant,
+    glyph_since: std::collections::HashMap<StatusKey, (crate::glyph::State, std::time::Instant)>,
+    glyph_steady: std::collections::HashSet<StatusKey>,
+    glyph_still: bool,
+    glyph_timer: Option<gpui::Task<()>>,
+    /// The accents `berth.toml` gives programs, by name in lower case.
+    accents: std::collections::BTreeMap<String, [u8; 3]>,
+    /// The terminal's font, which the chrome is set in too (D53): found
+    /// once, as a terminal finds it.
+    chrome_font: Option<gpui::SharedString>,
     /// Where the local server's Claude reports and session lists go, once
     /// it is up.
     claude_reports: session::ClaudeReports,
@@ -430,45 +437,61 @@ fn short_directory(directory: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Whose otter: a pane's, or a local session's that no pane shows.
+/// Whose status: a pane's, or a local session's that no pane shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OtterKey {
+enum StatusKey {
     Pane(u64),
     Session(u64),
 }
 
-/// What an otter shows and says.
-struct OtterLook {
-    pose: crate::otter::Pose,
-    stone: crate::otter::Stone,
-    /// The tooltip.
+/// What a status shows and says.
+struct StatusLook {
+    state: crate::glyph::State,
+    /// The program it is from, by the name it reports or runs under: its
+    /// accent, and how it is named.
+    program: Option<String>,
+    /// The tooltip's words for it: the program's own, as a report.
     text: String,
+    /// The program's own message, if it gave one.
+    msg: Option<String>,
 }
 
-impl OtterLook {
+impl StatusLook {
     fn of_status(status: &berth_proto::v1::Status) -> Self {
         Self {
-            pose: crate::otter::Pose::of_status(status.state),
-            stone: crate::otter::Stone::of_app(status.app.as_deref()),
+            state: crate::glyph::State::of_status(status.state),
+            program: status.app.clone(),
             text: render::status_text(status),
+            msg: status.msg.clone(),
         }
     }
 
     fn of_claude(state: berth_core::claude::State) -> Self {
         Self {
-            pose: crate::otter::Pose::of_claude(state),
-            stone: crate::otter::Stone::Claude,
+            state: crate::glyph::State::of_claude(state),
+            program: Some("claude".to_string()),
             text: render::claude_text(state).into(),
+            msg: None,
         }
     }
+}
 
-    /// An agent is there and has said nothing of what it is doing: asleep,
-    /// with its own stone, by the name it runs under.
-    fn presence(program: Option<&str>) -> Self {
-        Self {
-            pose: crate::otter::Pose::Idle,
-            stone: crate::otter::Stone::of_app(program),
-            text: strings::AGENT_TOOLTIP.into(),
+/// The accents `berth.toml` gives programs (D53). Read once, at start; a
+/// file that does not parse is said in the log and changes nothing.
+fn load_accents() -> std::collections::BTreeMap<String, [u8; 3]> {
+    use berth_core::config::BerthConfig;
+    let Some(path) = BerthConfig::path() else {
+        return Default::default();
+    };
+    match BerthConfig::load_or_default(&path) {
+        Ok(config) => config
+            .accents
+            .keys()
+            .filter_map(|name| Some((name.to_ascii_lowercase(), config.accent(name)?)))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "berth.toml was not read");
+            Default::default()
         }
     }
 }
@@ -500,7 +523,7 @@ impl Workspace {
             hosts,
             warnings,
             ssh_config_path: path,
-            theme: Theme::for_appearance(Appearance::Dark),
+            theme: Theme::of_terminal(&crate::terminal_style::TerminalStyle::default().palette),
             empty: Empty::FirstRun,
             settings: berth_core::settings::Settings::load(),
             server_updates: std::collections::BTreeMap::new(),
@@ -525,10 +548,13 @@ impl Workspace {
             hook_done_seen: std::collections::HashSet::new(),
             programs: std::collections::BTreeMap::new(),
             dragging_divider: None,
-            otter_epoch: std::time::Instant::now(),
-            otter_done: std::collections::HashMap::new(),
-            otter_still: false,
-            otter_timer: None,
+            glyph_epoch: std::time::Instant::now(),
+            glyph_since: std::collections::HashMap::new(),
+            glyph_steady: std::collections::HashSet::new(),
+            glyph_still: false,
+            glyph_timer: None,
+            accents: load_accents(),
+            chrome_font: None,
             claude_reports: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 Self::watch_claude_reports(rx, cx);
@@ -610,7 +636,7 @@ impl Workspace {
     /// app and the session list alike; for a turn Claude's hooks said is
     /// finished, the pane is noted as looked at.
     fn check_status_seen(&mut self, cx: &mut Context<Self>) {
-        use crate::otter::Pose;
+        use crate::glyph::State;
         use berth_proto::v1::StatusState;
         let showing = self
             .focused()
@@ -621,14 +647,14 @@ impl Workspace {
                         .is_some_and(|s| matches!(s.state, StatusState::Done | StatusState::Error))
                 });
                 match reported {
-                    Some(session) => Some(OtterKey::Session(session)),
+                    Some(session) => Some(StatusKey::Session(session)),
                     None => (self.pane_status(pane.id).is_none()
-                        && self.pane_otter(pane.id).map(|look| look.pose) == Some(Pose::Done))
-                    .then_some(OtterKey::Pane(pane.id)),
+                        && self.pane_look(pane.id).map(|look| look.state) == Some(State::Done))
+                    .then_some(StatusKey::Pane(pane.id)),
                 }
             });
         match self.status_shown.look(showing) {
-            Some(OtterKey::Session(session)) => {
+            Some(StatusKey::Session(session)) => {
                 let Some(Ok(server)) = self.local_server.get().cloned() else {
                     return;
                 };
@@ -639,7 +665,7 @@ impl Workspace {
                     })
                     .detach();
             }
-            Some(OtterKey::Pane(pane)) => {
+            Some(StatusKey::Pane(pane)) => {
                 self.hook_done_seen.insert(pane);
                 cx.notify();
             }
@@ -1122,17 +1148,25 @@ impl Workspace {
         self.session_status(self.pane(id)?.session?)
     }
 
-    /// What a pane's otter shows: what its session's programs report (OSC
+    /// What a pane's status shows: what its session's programs report (OSC
     /// 7501, D53) first, Claude's hooks for a Claude too old to report that
-    /// way, and nothing if neither has said anything.
-    fn pane_otter(&self, id: u64) -> Option<OtterLook> {
+    /// way, and nothing if neither has said anything. A report that names
+    /// no program is taken to be from what runs in the pane.
+    fn pane_look(&self, id: u64) -> Option<StatusLook> {
         if let Some(status) = self.pane_status(id) {
-            return Some(OtterLook::of_status(status));
+            let mut look = StatusLook::of_status(status);
+            if look.program.is_none() {
+                look.program = self
+                    .pane(id)
+                    .and_then(|pane| self.pane_program(pane))
+                    .map(str::to_string);
+            }
+            return Some(look);
         }
-        let mut look = self.claude_state(id).map(OtterLook::of_claude)?;
+        let mut look = self.claude_state(id).map(StatusLook::of_claude)?;
         // A finished turn the user has looked at since is no longer news.
-        if look.pose == crate::otter::Pose::Done && self.hook_done_seen.contains(&id) {
-            look.pose = crate::otter::Pose::Idle;
+        if look.state == crate::glyph::State::Done && self.hook_done_seen.contains(&id) {
+            look.state = crate::glyph::State::Idle;
         }
         Some(look)
     }
@@ -1178,86 +1212,141 @@ impl Workspace {
     }
 
     /// The same for a local session no pane shows.
-    fn session_otter(&self, session: u64) -> Option<OtterLook> {
-        self.session_status(session).map(OtterLook::of_status)
+    fn session_look(&self, session: u64) -> Option<StatusLook> {
+        let mut look = StatusLook::of_status(self.session_status(session)?);
+        if look.program.is_none() {
+            look.program = self.session_program(session).map(str::to_string);
+        }
+        Some(look)
     }
 
-    /// The frame an otter is on now.
-    fn otter_frame(&self, key: OtterKey, pose: crate::otter::Pose) -> usize {
-        pose.frame_at(self.otter_shown(key, pose), self.otter_still)
-            .0
+    /// How long a status has been showing as it is.
+    fn status_since(&self, key: StatusKey) -> std::time::Duration {
+        self.glyph_since
+            .get(&key)
+            .map(|(_, since)| since.elapsed())
+            .unwrap_or_default()
     }
 
-    /// How long a pose has been showing: since its `done` began, or since
-    /// the clock every looping icon shares, so they move together.
-    fn otter_shown(&self, key: OtterKey, pose: crate::otter::Pose) -> std::time::Duration {
-        let since = match pose {
-            crate::otter::Pose::Done => self.otter_done.get(&key).copied(),
-            _ => None,
-        };
-        since.unwrap_or(self.otter_epoch).elapsed()
+    /// The colours a status is drawn in, for its program.
+    fn glyph_colours(&self, program: Option<&str>) -> crate::glyph::Colours {
+        let theme = self.theme;
+        let accent = program.and_then(|program| crate::programs::accent(program, &self.accents));
+        crate::glyph::Colours {
+            accent: theme.accent_for(accent),
+            gold: theme.gold,
+            rose: theme.rose,
+            ink: theme.ink,
+            muted: theme.text_muted,
+        }
     }
 
-    /// Before drawing: note which otters have just become `done`, forget
-    /// looks at panes that have moved on, and set the one timer for the next
-    /// frame anything on screen needs: an otter's in the sidebar, or the
-    /// working arc on a tab. Nothing moving, motion reduced or the window not
-    /// drawn: no timer, and no wakeups.
-    fn tend_otters(&mut self, cx: &mut Context<Self>) {
-        use crate::otter::Pose;
-        self.otter_still = cx.reduce_motion();
+    /// A status's glyph now: on a tab it moves, in the sidebar (`still`)
+    /// it never does (D53).
+    fn glyph_of(&self, key: StatusKey, look: &StatusLook, still: bool) -> crate::glyph::Glyph {
+        crate::glyph::glyph(
+            look.state,
+            self.glyph_colours(look.program.as_deref()),
+            crate::glyph::Moment {
+                clock: self.glyph_epoch.elapsed(),
+                since: self.status_since(key),
+                steady: self.glyph_steady.contains(&key),
+                still: still || self.glyph_still,
+            },
+        )
+    }
+
+    /// A pane's glyph on a tab, idle when nothing has been said.
+    fn pane_glyph(&self, id: u64) -> crate::glyph::Glyph {
+        let key = StatusKey::Pane(id);
+        match self.pane_look(id) {
+            Some(look) => self.glyph_of(key, &look, false),
+            None => {
+                let program = self.pane(id).and_then(|pane| self.pane_program(pane));
+                crate::glyph::glyph(
+                    crate::glyph::State::Idle,
+                    self.glyph_colours(program),
+                    crate::glyph::Moment {
+                        clock: std::time::Duration::ZERO,
+                        since: std::time::Duration::ZERO,
+                        steady: true,
+                        still: true,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Before drawing: note what each status on screen shows and since when,
+    /// make a heartbeat steady once its pane is focused in a drawn window,
+    /// and set the one timer for the next change any tab glyph needs.
+    /// Sidebar glyphs never move. Nothing moving, motion reduced or the
+    /// window not drawn: no timer, and no wakeups.
+    fn tend_glyphs(&mut self, cx: &mut Context<Self>) {
+        use crate::glyph::State;
+        self.glyph_still = cx.reduce_motion();
         let finished: std::collections::HashSet<u64> = self
             .panes
             .iter()
-            .filter(|pane| self.claude_state(pane.id).map(Pose::of_claude) == Some(Pose::Done))
+            .filter(|pane| self.claude_state(pane.id).map(State::of_claude) == Some(State::Done))
             .map(|pane| pane.id)
             .collect();
         self.hook_done_seen.retain(|pane| finished.contains(pane));
-        let shown: Vec<(OtterKey, Pose)> = self
+        let shown: Vec<(StatusKey, State)> = self
             .panes
             .iter()
-            .filter_map(|pane| Some((OtterKey::Pane(pane.id), self.pane_otter(pane.id)?.pose)))
+            .filter_map(|pane| Some((StatusKey::Pane(pane.id), self.pane_look(pane.id)?.state)))
             .chain(self.local_sessions.iter().filter_map(|info| {
                 Some((
-                    OtterKey::Session(info.id),
-                    self.session_otter(info.id)?.pose,
+                    StatusKey::Session(info.id),
+                    self.session_look(info.id)?.state,
                 ))
             }))
             .collect();
         let now = std::time::Instant::now();
-        self.otter_done
-            .retain(|key, _| shown.contains(&(*key, Pose::Done)));
-        for (key, pose) in &shown {
-            if *pose == Pose::Done {
-                self.otter_done.entry(*key).or_insert(now);
+        self.glyph_since
+            .retain(|key, _| shown.iter().any(|(shown, _)| shown == key));
+        for (key, state) in &shown {
+            match self.glyph_since.get(key) {
+                Some((was, _)) if was == state => {}
+                _ => {
+                    self.glyph_since.insert(*key, (*state, now));
+                }
             }
         }
-        let otters: Vec<(Pose, std::time::Duration)> = shown
+        self.glyph_steady
+            .retain(|key| shown.contains(&(*key, State::NeedsYou)));
+        if self.window_seen
+            && let Some(focused) = self.focused().map(|pane| StatusKey::Pane(pane.id))
+            && shown.contains(&(focused, State::NeedsYou))
+        {
+            self.glyph_steady.insert(focused);
+        }
+        // Only the panes of tabs move: the tab strip shows each tab's
+        // focused pane's glyph, or its pane map.
+        let moving: Vec<(State, std::time::Duration, bool)> = shown
             .iter()
-            .map(|(key, pose)| (*pose, self.otter_shown(*key, *pose)))
+            .filter(|(key, _)| matches!(key, StatusKey::Pane(_)))
+            .map(|(key, state)| {
+                (
+                    *state,
+                    self.status_since(*key),
+                    self.glyph_steady.contains(key),
+                )
+            })
             .collect();
-        // A tab shows the arc for its focused pane while that works.
-        let arcs = shown
-            .iter()
-            .any(|(key, pose)| matches!(key, OtterKey::Pane(_)) && *pose == Pose::Working);
-        let next = crate::otter::next_wake(
-            &otters,
-            arcs,
-            self.otter_epoch.elapsed(),
-            self.otter_still,
+        let next = crate::glyph::next_wake(
+            &moving,
+            self.glyph_epoch.elapsed(),
+            self.glyph_still,
             self.window_seen,
         );
-        self.otter_timer = next.map(|wait| {
+        self.glyph_timer = next.map(|wait| {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(wait).await;
                 let _ = this.update(cx, |_, cx| cx.notify());
             })
         });
-    }
-
-    /// Where a tab's working arc is now.
-    fn arc_position(&self) -> usize {
-        crate::otter::arc_at(self.otter_epoch.elapsed(), self.otter_still).0
     }
 
     /// What a pane's Claude is doing, when its hooks have said.
@@ -1745,15 +1834,15 @@ impl Workspace {
     /// Whether an agent may be working in a session: its status says so, or
     /// an agent is there and nothing says what it is doing.
     fn agent_working(&self, target: &RowTarget) -> bool {
-        use crate::otter::Pose;
+        use crate::glyph::State;
         let pane = self.shown_in(target);
         let look = match (pane, target) {
-            (Some(pane), _) => self.pane_otter(pane),
-            (None, RowTarget::Local(session)) => self.session_otter(*session),
+            (Some(pane), _) => self.pane_look(pane),
+            (None, RowTarget::Local(session)) => self.session_look(*session),
             (None, _) => None,
         };
         if let Some(look) = look {
-            return look.pose == Pose::Working;
+            return look.state == State::Working;
         }
         let remote = match (pane.and_then(|p| self.pane(p)), target) {
             (Some(pane), _) => pane
@@ -2406,7 +2495,7 @@ mod tests {
         assert_eq!(title(None, None, Some(" "), None), None);
     }
 
-    /// A title is words on a tab and nothing more. The icon and the stone
+    /// A title is words on a tab and nothing more. The icon and the accent
     /// come from the process name alone, whatever a title claims.
     #[test]
     fn a_title_never_chooses_the_icon() {
@@ -2414,7 +2503,7 @@ mod tests {
         assert_eq!(claimed.as_deref(), Some("claude"), "shown as written");
         let program = crate::programs::lookup("vim");
         assert_eq!(program.icon, crate::icons::VIM);
-        assert_eq!(program.stone, crate::otter::Stone::Plain);
+        assert_eq!(program.accent, None);
     }
 
     #[test]
@@ -2435,7 +2524,7 @@ mod tests {
     #[test]
     fn a_status_is_seen_after_two_looks_running() {
         let mut looked = Looked::default();
-        let pane = OtterKey::Pane(3);
+        let pane = StatusKey::Pane(3);
         assert_eq!(looked.look(Some(pane)), None, "one look");
         assert_eq!(
             looked.look(Some(pane)),
@@ -2458,10 +2547,10 @@ mod tests {
         // A different pane in front is a different thing to see.
         let mut looked = Looked::default();
         assert_eq!(looked.look(Some(pane)), None);
-        assert_eq!(looked.look(Some(OtterKey::Session(3))), None);
+        assert_eq!(looked.look(Some(StatusKey::Session(3))), None);
         assert_eq!(
-            looked.look(Some(OtterKey::Session(3))),
-            Some(OtterKey::Session(3))
+            looked.look(Some(StatusKey::Session(3))),
+            Some(StatusKey::Session(3))
         );
     }
 

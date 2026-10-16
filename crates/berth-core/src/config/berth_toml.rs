@@ -1,8 +1,10 @@
-//! `~/.berth/berth.toml`: tags, groups, layouts and fan-out sets.
+//! `~/.berth/berth.toml`: tags, groups, layouts and fan-out sets, and the
+//! accent each program's status is drawn in (D53).
 //!
 //! This file is Berth's own; unlike ssh config it may be written back. It is
 //! intended to be committed to git, which is the only sync mechanism Berth has.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,10 @@ pub struct BerthConfig {
     pub layouts: Vec<Layout>,
     #[serde(default, rename = "fanout")]
     pub fanouts: Vec<Fanout>,
+    /// A program's status accent, by the name it runs under, as `#rrggbb`:
+    /// over Berth's own for that program, or for one it has none for.
+    #[serde(default, rename = "accent", skip_serializing_if = "BTreeMap::is_empty")]
+    pub accents: BTreeMap<String, String>,
 }
 
 fn default_version() -> u32 {
@@ -147,6 +153,11 @@ impl BerthConfig {
         Self::data_dir().map(|d| d.join("berth.toml"))
     }
 
+    /// Where it is read from: `BERTH_CONFIG`, else `~/.berth/berth.toml`.
+    pub fn path() -> Option<PathBuf> {
+        crate::env::config().or_else(Self::default_path)
+    }
+
     /// A missing file yields defaults, so a fresh install still starts.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
@@ -184,6 +195,13 @@ impl BerthConfig {
                 )));
             }
         }
+        for (name, colour) in &self.accents {
+            if parse_colour(colour).is_none() {
+                return Err(Error::Config(format!(
+                    "the accent for {name} is not a #rrggbb colour: {colour}"
+                )));
+            }
+        }
         for fanout in &self.fanouts {
             for alias in &fanout.hosts {
                 if !self.hosts.iter().any(|h| &h.alias == alias) {
@@ -207,6 +225,24 @@ impl BerthConfig {
     pub fn fanout(&self, name: &str) -> Option<&Fanout> {
         self.fanouts.iter().find(|f| f.name == name)
     }
+
+    /// The accent given for a program, by its name, case aside.
+    pub fn accent(&self, program: &str) -> Option<[u8; 3]> {
+        self.accents
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(program))
+            .and_then(|(_, colour)| parse_colour(colour))
+    }
+}
+
+/// `#rrggbb` as its three bytes.
+fn parse_colour(colour: &str) -> Option<[u8; 3]> {
+    let hex = colour.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
 #[cfg(test)]
@@ -275,6 +311,22 @@ hosts = ["web-1"]
             BerthConfig::parse("version = 1\n[[layout]]\nname = \"l\"\npanes = [{ host = \"a\" }]")
                 .unwrap();
         assert_eq!(c.layouts[0].panes[0].session, "main");
+    }
+
+    #[test]
+    fn accents_are_read_by_program_name() {
+        let c = BerthConfig::parse(
+            "version = 1\n[accent]\nclaude = \"#112233\"\nmy-tool = \"#AbCdEf\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.accent("claude"), Some([0x11, 0x22, 0x33]));
+        assert_eq!(c.accent("Claude"), Some([0x11, 0x22, 0x33]));
+        assert_eq!(c.accent("my-tool"), Some([0xab, 0xcd, 0xef]));
+        assert_eq!(c.accent("codex"), None);
+        for bad in ["red", "#12345", "#1234567", "112233", "#gg0000"] {
+            let text = format!("version = 1\n[accent]\nclaude = \"{bad}\"\n");
+            assert!(BerthConfig::parse(&text).is_err(), "{bad}");
+        }
     }
 
     #[test]

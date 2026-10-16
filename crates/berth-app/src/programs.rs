@@ -1,16 +1,19 @@
 //! What runs in a session, by name: one table from a foreground process name
-//! to the icon a tab shows and the stone the otter holds (D53).
+//! to the icon a tab shows and the accent its status is drawn in (D53).
 //!
 //! The name is the process's own, as the machine reports it: `claude`,
 //! `python3.12`, `-zsh`, `/usr/bin/nvim`. Anything not in the table, and any
-//! shell, gets the generic terminal icon and the plain stone.
+//! shell, gets the generic terminal icon and no accent of its own: its
+//! status is drawn in the theme's muted foreground. `berth.toml` can give
+//! any program an accent, over the table's.
 //!
 //! The icons of other projects are their marks. They say which program runs
 //! in a tab and nothing more, and are for dogfooding until each is cleared
 //! for release (`assets/icons/THIRD-PARTY.md`).
 
+use std::collections::BTreeMap;
+
 use crate::icons;
-use crate::otter::Stone;
 
 /// A program Berth knows by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,43 +21,46 @@ pub struct Program {
     /// How it is named in a title.
     pub name: &'static str,
     pub icon: &'static str,
-    pub stone: Stone,
+    /// The colour its status is drawn in, as `0xrrggbb`.
+    pub accent: Option<u32>,
 }
 
 /// What an unknown program and a plain shell look like.
 pub const GENERIC: Program = Program {
     name: "",
     icon: icons::TERMINAL,
-    stone: Stone::Plain,
+    accent: None,
 };
 
 const fn tool(name: &'static str, icon: &'static str) -> Program {
     Program {
         name,
         icon,
-        stone: Stone::Plain,
+        accent: None,
+    }
+}
+
+const fn agent(name: &'static str, icon: &'static str, accent: u32) -> Program {
+    Program {
+        name,
+        icon,
+        accent: Some(accent),
     }
 }
 
 /// Process names, lower case, to programs. A name with a version on its end
 /// (`python3.12`, `node22`) is looked up without it.
 const TABLE: &[(&str, Program)] = &[
-    (
-        "claude",
-        Program {
-            name: "claude",
-            icon: icons::CLAUDE,
-            stone: Stone::Claude,
-        },
-    ),
-    (
-        "codex",
-        Program {
-            name: "codex",
-            icon: icons::CODEX,
-            stone: Stone::Codex,
-        },
-    ),
+    // The agents, each in its brand's own colour (D53). Clashes between
+    // them are accepted; gold and rose are kept apart from all of them.
+    // Cursor has no brand colour and is drawn in the foreground.
+    ("claude", agent("claude", icons::CLAUDE, 0xd97757)),
+    ("codex", agent("codex", icons::CODEX, 0x2bc49b)),
+    ("copilot", agent("copilot", icons::TERMINAL, 0x8534f3)),
+    ("mistral", agent("mistral", icons::TERMINAL, 0xfa520f)),
+    ("qwen", agent("qwen", icons::TERMINAL, 0x615ced)),
+    ("gemini", agent("gemini", icons::TERMINAL, 0x4285f4)),
+    ("cursor-agent", tool("cursor", icons::TERMINAL)),
     ("node", tool("node", icons::NODE)),
     ("nodejs", tool("node", icons::NODE)),
     ("npm", tool("npm", icons::NODE)),
@@ -122,6 +128,26 @@ pub fn lookup(command: &str) -> Program {
         .unwrap_or(GENERIC)
 }
 
+/// The accent a program's status is drawn in: what `berth.toml` gives it
+/// (`overrides`, by name), else the table's, else none.
+pub fn accent(command: &str, overrides: &BTreeMap<String, [u8; 3]>) -> Option<gpui::Rgba> {
+    let name = display_name(command);
+    overrides
+        .get(&name)
+        .map(|[r, g, b]| (u32::from(*r) << 16) | (u32::from(*g) << 8) | u32::from(*b))
+        .or(lookup(command).accent)
+        .map(gpui::rgb)
+}
+
+/// Every accent the table has, by name.
+#[cfg(test)]
+pub fn accents() -> Vec<(&'static str, gpui::Rgba)> {
+    TABLE
+        .iter()
+        .filter_map(|(name, program)| Some((*name, gpui::rgb(program.accent?))))
+        .collect()
+}
+
 /// What to call a process in a title: the registry's name for it, else its
 /// own bare name, else nothing.
 pub fn display_name(command: &str) -> String {
@@ -138,10 +164,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_names_have_their_icon_and_stone() {
+    fn known_names_have_their_icon_and_accent() {
         assert_eq!(lookup("claude").icon, icons::CLAUDE);
-        assert_eq!(lookup("claude").stone, Stone::Claude);
-        assert_eq!(lookup("codex").stone, Stone::Codex);
+        assert_eq!(lookup("claude").accent, Some(0xd97757));
+        assert_eq!(lookup("codex").accent, Some(0x2bc49b));
+        assert_eq!(lookup("gemini").accent, Some(0x4285f4));
+        assert_eq!(lookup("copilot").accent, Some(0x8534f3));
+        assert_eq!(lookup("cursor-agent").accent, None);
         assert_eq!(lookup("node").icon, icons::NODE);
         assert_eq!(lookup("bun").icon, icons::BUN);
         assert_eq!(lookup("deno").icon, icons::DENO);
@@ -151,7 +180,20 @@ mod tests {
         assert_eq!(lookup("vim").icon, icons::VIM);
         assert_eq!(lookup("nvim").icon, icons::NEOVIM);
         assert_eq!(lookup("ssh").icon, icons::SSH);
-        assert_eq!(lookup("node").stone, Stone::Plain);
+        assert_eq!(lookup("node").accent, None);
+    }
+
+    /// `berth.toml` wins over the table, for a program in it or not.
+    #[test]
+    fn an_accent_from_berth_toml_comes_first() {
+        let none = BTreeMap::new();
+        assert_eq!(accent("claude", &none), Some(gpui::rgb(0xd97757)));
+        assert_eq!(accent("make", &none), None);
+        let mut given = BTreeMap::new();
+        given.insert("claude".to_string(), [1, 2, 3]);
+        given.insert("make".to_string(), [0xaa, 0xbb, 0xcc]);
+        assert_eq!(accent("/usr/bin/claude", &given), Some(gpui::rgb(0x010203)));
+        assert_eq!(accent("make", &given), Some(gpui::rgb(0xaabbcc)));
     }
 
     #[test]
@@ -164,7 +206,7 @@ mod tests {
             lookup("C:\\Program Files\\Git\\cmd\\git.exe").icon,
             icons::GIT
         );
-        assert_eq!(lookup("  claude\n").stone, Stone::Claude);
+        assert_eq!(lookup("  claude\n").name, "claude");
     }
 
     #[test]
@@ -181,7 +223,7 @@ mod tests {
         for shell in ["zsh", "-zsh", "bash", "/bin/sh", "fish", "pwsh.exe"] {
             let program = lookup(shell);
             assert_eq!(program.icon, icons::TERMINAL, "{shell}");
-            assert_eq!(program.stone, Stone::Plain, "{shell}");
+            assert_eq!(program.accent, None, "{shell}");
         }
         assert_eq!(display_name("-zsh"), "zsh");
     }

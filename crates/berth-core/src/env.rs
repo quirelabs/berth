@@ -12,6 +12,7 @@
 //! | `BERTH_SSH_CONFIG`   | read hosts from this file, not `~/.ssh/config`  |
 //! | `BERTH_KNOWN_HOSTS`  | trust and record keys here, not `~/.ssh/known_hosts` |
 //! | `BERTH_SETTINGS`     | remember settings here, not in the config directory |
+//! | `BERTH_CONFIG`       | read `berth.toml` from here, not `~/.berth/berth.toml` |
 //! | `BERTH_RESTORE`      | save local sessions here, not in the data directory |
 //! | `BERTH_DATA`         | keep the Claude plugin, the shim, and the local server's runtime files and binaries here |
 //! | `BERTH_SHELL`        | run this as the local shell                     |
@@ -70,6 +71,7 @@ use std::path::PathBuf;
 pub const SSH_CONFIG: &str = "BERTH_SSH_CONFIG";
 pub const KNOWN_HOSTS: &str = "BERTH_KNOWN_HOSTS";
 pub const SETTINGS: &str = "BERTH_SETTINGS";
+pub const CONFIG: &str = "BERTH_CONFIG";
 pub const RESTORE: &str = "BERTH_RESTORE";
 pub const DATA: &str = "BERTH_DATA";
 pub const PANE: &str = "BERTH_PANE";
@@ -108,6 +110,7 @@ const NAMES: &[&str] = &[
     SSH_CONFIG,
     KNOWN_HOSTS,
     SETTINGS,
+    CONFIG,
     RESTORE,
     DATA,
     PANE,
@@ -173,6 +176,12 @@ pub fn known_hosts() -> Option<PathBuf> {
 /// test never writes into the user's own.
 pub fn settings() -> Option<PathBuf> {
     path(SETTINGS)
+}
+
+/// Read `berth.toml` from here rather than `~/.berth/berth.toml`, so a test
+/// never depends on the user's own.
+pub fn config() -> Option<PathBuf> {
+    path(CONFIG)
 }
 
 /// Save local sessions here rather than in the platform's data directory, so a

@@ -2,11 +2,11 @@
 //! connection exists. The SSH transport lands on top of this shell.
 
 mod bench;
+mod glyph;
 mod icons;
 mod input;
 mod menu;
 mod metrics;
-mod otter;
 mod panes;
 mod programs;
 mod reconnect;

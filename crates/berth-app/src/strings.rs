@@ -106,11 +106,6 @@ pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it st
 pub const SPLIT_HINT: &str =
     "Cmd+D splits right, Cmd+Shift+D splits down, Cmd+] moves between panes";
 
-/// Says presence and nothing else. Berth does not know whether the agent is
-/// working, waiting or finished, and a tooltip that implied otherwise would be
-/// the first step towards pretending it does.
-pub const AGENT_TOOLTIP: &str = "An agent is running in this session.";
-
 /// Claude's state, from its own hooks (D48). Each says what Claude reported and
 /// nothing Berth inferred.
 pub const CLAUDE_WORKING: &str = "Claude is working.";
@@ -160,11 +155,50 @@ pub fn status_tooltip(
     text
 }
 
-/// What the status mark on a tab means (D53).
-pub const STATUS_NEEDS_YOU: &str = "Needs you.";
-pub const STATUS_DONE: &str = "Finished.";
-pub const STATUS_ERROR: &str = "Failed.";
-pub const STATUS_WORKING: &str = "Working.";
+/// A status in a word or two, as the glyph shows it (D53).
+pub fn state_word(state: crate::glyph::State) -> &'static str {
+    use crate::glyph::State;
+    match state {
+        State::Working => "working",
+        State::NeedsYou => "needs you",
+        State::Done => "done",
+        State::Error => "error",
+        State::Idle => "idle",
+    }
+}
+
+/// How long a status has been as it is.
+pub fn status_since(since: std::time::Duration) -> String {
+    let secs = since.as_secs();
+    if secs < 60 {
+        format!("for {secs} s")
+    } else if secs < 3600 {
+        format!("for {} min", secs / 60)
+    } else {
+        format!("for {} h", secs / 3600)
+    }
+}
+
+/// The focused pane's status in the status line: who, what, their message,
+/// and for how long.
+pub fn status_line(
+    provider: Option<&str>,
+    state: crate::glyph::State,
+    msg: Option<&str>,
+    since: std::time::Duration,
+) -> String {
+    let who = provider
+        .filter(|p| !p.is_empty())
+        .unwrap_or(STATUS_ANONYMOUS);
+    match msg.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(msg) => format!(
+            "{who} {}: {msg} ({})",
+            state_word(state),
+            status_since(since)
+        ),
+        None => format!("{who} {} ({})", state_word(state), status_since(since)),
+    }
+}
 
 /// Typed or pasted input the session's program did not take (D50).
 pub const INPUT_NOT_DELIVERED: &str = "Input not delivered: the program isn't reading.";

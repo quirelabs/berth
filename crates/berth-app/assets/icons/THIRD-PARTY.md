@@ -9,8 +9,6 @@ None is shown in a brand's own colours.
 | `programs/claude.svg`, `programs/codex.svg` (mono variants) | Lobe Icons, github.com/lobehub/lobe-icons, `packages/static-svg/icons` | `c385b2b8d1f9e19aa86e628d4e23c91ee1111a47` | MIT, see below |
 | `programs/node.svg` (`nodedotjs`), `programs/bun.svg`, `programs/deno.svg`, `programs/python.svg`, `programs/git.svg`, `programs/docker.svg`, `programs/vim.svg`, `programs/neovim.svg` | Simple Icons, github.com/simple-icons/simple-icons, `icons` | `98820a4dc8c363ca72fa2c0d294ea4a0a9bba75d` | CC0 1.0 |
 
-`otter.json` is Berth's own.
-
 ## Trademarks
 
 The licences above cover the drawings, not the marks. The Claude and Codex
