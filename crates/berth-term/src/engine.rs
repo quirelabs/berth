@@ -451,9 +451,42 @@ impl Terminal {
 
     /// Change the grid's size. Never waits; the next published screen has it.
     pub fn resize(&self, size: TermSize, cell_size: CellSize) {
+        self.send_resize(size, cell_size);
+    }
+
+    /// Resize, and wait up to `within` for the engine to publish the screen
+    /// reflowed to the new size, so the frame that asked for it can draw it
+    /// rather than the old one in new bounds. The screen as it stands if the
+    /// engine is busier than that, so a frame is never held up for long.
+    pub fn resize_within(
+        &self,
+        size: TermSize,
+        cell_size: CellSize,
+        within: Duration,
+    ) -> Arc<Snapshot> {
+        let Some(seq) = self.send_resize(size, cell_size) else {
+            return self.latest();
+        };
+        let deadline = Instant::now() + within;
+        let mut published = self.shared.lock();
+        while published.done < seq && !published.exited {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            published = match self.shared.progressed.wait_timeout(published, left) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        published.snapshot.clone()
+    }
+
+    /// Tell the engine of a new size, if it is one; the message's number.
+    fn send_resize(&self, size: TermSize, cell_size: CellSize) -> Option<u64> {
         let mut outbox = self.outbox();
         if outbox.size == size && outbox.cell_size == cell_size {
-            return;
+            return None;
         }
         outbox.size = size;
         outbox.cell_size = cell_size;
@@ -465,6 +498,7 @@ impl Terminal {
                 command: Command::Resize(size, cell_size),
             });
         }
+        Some(seq)
     }
 
     pub fn modes(&self) -> Modes {
@@ -1484,6 +1518,30 @@ mod tests {
             row.last().map(|cell| (cell.column, cell.c)),
             Some((11, ' '))
         );
+    }
+
+    /// A frame that resizes draws the reflowed screen, not the old one in
+    /// new bounds: the resize waits, briefly, for the engine to publish it.
+    #[test]
+    fn a_resize_can_wait_for_its_own_screen() {
+        let term = Terminal::new(TermSize::new(20, 4), CellSize::new(8.0, 16.0));
+        term.advance(b"one two three four five six");
+        let _ = term.snapshot();
+        let shown = term.resize_within(
+            TermSize::new(10, 6),
+            CellSize::new(8.0, 16.0),
+            Duration::from_millis(500),
+        );
+        assert_eq!(shown.size, TermSize::new(10, 6));
+        let text: String = shown.rows[0].iter().map(|cell| cell.c).collect();
+        assert!(text.starts_with("one two th"), "{text:?}");
+        // The same size again sends nothing and waits for nothing.
+        let again = term.resize_within(
+            TermSize::new(10, 6),
+            CellSize::new(8.0, 16.0),
+            Duration::from_secs(5),
+        );
+        assert_eq!(again.size, TermSize::new(10, 6));
     }
 
     proptest! {

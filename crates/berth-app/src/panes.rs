@@ -16,18 +16,32 @@ pub enum Axis {
 
 /// A tab's panes. Binary, because every split is one pane becoming two.
 ///
-/// There is no ratio here: splits are even. Dragging a divider is a real thing
-/// to want and it is deliberately not in this version, because a ratio that
-/// cannot be dragged is a field nobody can change.
+/// `share` is the first child's part of the split, in thousandths: 500 is
+/// even, and dragging the divider moves it. Whole numbers, so a layout can
+/// be compared and saved exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
     Leaf(u64),
     Split {
         axis: Axis,
+        share: u16,
         first: Box<Node>,
         second: Box<Node>,
     },
 }
+
+/// An even split.
+pub const EVEN: u16 = 500;
+/// The least either side of a split keeps when its divider is dragged, in
+/// thousandths, so a pane is never dragged out of existence.
+pub const LEAST_SHARE: u16 = 100;
+
+/// A rectangle: x, y, width, height.
+pub type Rect = (f32, f32, f32, f32);
+
+/// Which child to take at each split on the way down to one: false for the
+/// first, true for the second.
+pub type Path = Vec<bool>;
 
 impl Node {
     pub fn leaf(id: u64) -> Self {
@@ -71,6 +85,7 @@ impl Node {
             Node::Leaf(leaf) if *leaf == id => {
                 *self = Node::Split {
                     axis,
+                    share: EVEN,
                     first: Box::new(Node::Leaf(id)),
                     second: Box::new(Node::Leaf(other)),
                 };
@@ -94,6 +109,7 @@ impl Node {
             leaf @ Node::Leaf(_) => Some(leaf),
             Node::Split {
                 axis,
+                share,
                 first,
                 second,
             } => match (first.without(id), second.without(id)) {
@@ -101,11 +117,85 @@ impl Node {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (Some(a), Some(b)) => Some(Node::Split {
                     axis,
+                    share,
                     first: Box::new(a),
                     second: Box::new(b),
                 }),
             },
         }
+    }
+
+    /// Move the divider of the split at `path` so its first child has
+    /// `share` thousandths, kept between the least each side keeps. False
+    /// when there is no split there.
+    pub fn set_share(&mut self, path: &[bool], share: u16) -> bool {
+        match (self, path.split_first()) {
+            (Node::Split { share: at, .. }, None) => {
+                *at = share.clamp(LEAST_SHARE, 1000 - LEAST_SHARE);
+                true
+            }
+            (Node::Split { first, second, .. }, Some((go_second, rest))) => {
+                if *go_second {
+                    second.set_share(rest, share)
+                } else {
+                    first.set_share(rest, share)
+                }
+            }
+            (Node::Leaf(_), _) => false,
+        }
+    }
+
+    /// Where each pane sits inside `bounds`, by the real split geometry:
+    /// what a tab's pane map is drawn from.
+    pub fn rects(&self, bounds: Rect) -> Vec<(u64, Rect)> {
+        let mut out = Vec::new();
+        self.place(bounds, &mut out);
+        out
+    }
+
+    fn place(&self, (x, y, w, h): Rect, out: &mut Vec<(u64, Rect)>) {
+        match self {
+            Node::Leaf(id) => out.push((*id, (x, y, w, h))),
+            Node::Split {
+                axis,
+                share,
+                first,
+                second,
+            } => {
+                let part = f32::from(*share) / 1000.0;
+                match axis {
+                    Axis::Horizontal => {
+                        first.place((x, y, w * part, h), out);
+                        second.place((x + w * part, y, w * (1.0 - part), h), out);
+                    }
+                    Axis::Vertical => {
+                        first.place((x, y, w, h * part), out);
+                        second.place((x, y + h * part, w, h * (1.0 - part)), out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which of each pane's corners face the outer edge of the pane area,
+    /// in the order top left, top right, bottom right, bottom left: those
+    /// are rounded, and a corner where panes meet is square. A lone pane has
+    /// all four.
+    pub fn outer_corners(&self) -> Vec<(u64, [bool; 4])> {
+        const EDGE: f32 = 1e-4;
+        self.rects((0.0, 0.0, 1.0, 1.0))
+            .into_iter()
+            .map(|(id, (x, y, w, h))| {
+                let left = x < EDGE;
+                let top = y < EDGE;
+                let right = x + w > 1.0 - EDGE;
+                let bottom = y + h > 1.0 - EDGE;
+                (
+                    id,
+                    [top && left, top && right, bottom && right, bottom && left],
+                )
+            })
+            .collect()
     }
 
     /// The pane after `id` in reading order, wrapping at the end.
@@ -170,6 +260,7 @@ mod tests {
             node,
             Node::Split {
                 axis: Axis::Horizontal,
+                share: EVEN,
                 first: Box::new(Node::Leaf(1)),
                 second: Box::new(Node::Leaf(3)),
             },
@@ -220,6 +311,59 @@ mod tests {
         assert_eq!(node.next_after(1), Some(2));
         assert_eq!(node.next_after(2), Some(3));
         assert_eq!(node.next_after(3), Some(1));
+    }
+
+    /// A dragged divider moves, but never past the least each side keeps,
+    /// and survives the other side of a nest closing.
+    #[test]
+    fn a_divider_moves_within_bounds() {
+        let mut node = split_of(1, 2);
+        node.split(2, Axis::Vertical, 3);
+        assert!(node.set_share(&[], 700));
+        assert!(node.set_share(&[true], 50));
+        assert!(!node.set_share(&[false], 300), "a leaf has no divider");
+        let share = |node: &Node| match node {
+            Node::Split { share, .. } => *share,
+            Node::Leaf(_) => 0,
+        };
+        assert_eq!(share(&node), 700);
+        let Node::Split { second, .. } = &node else {
+            panic!("a split");
+        };
+        assert_eq!(share(second), LEAST_SHARE, "kept at a tenth");
+        let node = node.without(3).unwrap();
+        assert_eq!(share(&node), 700, "the outer divider stays put");
+    }
+
+    /// Corners are worked out from the tree: rounded where they face the
+    /// outside, square where panes meet, for any layout.
+    #[test]
+    fn corners_round_only_on_the_outside() {
+        assert_eq!(Node::leaf(1).outer_corners(), [(1, [true; 4])]);
+        let mut node = split_of(1, 2);
+        assert_eq!(
+            node.outer_corners(),
+            [
+                (1, [true, false, false, true]),
+                (2, [false, true, true, false])
+            ]
+        );
+        // 1 | 2 over 3: 2 keeps only its top right, 3 its bottom right.
+        node.split(2, Axis::Vertical, 3);
+        assert_eq!(
+            node.outer_corners(),
+            [
+                (1, [true, false, false, true]),
+                (2, [false, true, false, false]),
+                (3, [false, false, true, false]),
+            ]
+        );
+        // A dragged divider changes sizes, never which corners are outside.
+        node.set_share(&[], 200);
+        assert_eq!(node.outer_corners()[1], (2, [false, true, false, false]));
+        let rects = node.rects((0.0, 0.0, 100.0, 50.0));
+        assert_eq!(rects[0], (1, (0.0, 0.0, 20.0, 50.0)));
+        assert_eq!(rects[2], (3, (20.0, 25.0, 80.0, 25.0)));
     }
 
     #[test]

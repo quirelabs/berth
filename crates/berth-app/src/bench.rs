@@ -61,6 +61,9 @@ pub enum Bench {
     /// `cat` a 50 MB file in a local shell: no tmux, no ssh, so every byte
     /// reaches the parser and the renderer is actually loaded (D49 verdict).
     LocalCat,
+    /// Drag a split's divider and resize the window, in local shells full
+    /// of text, and hold every frame to the display rate (D53).
+    Resize,
 }
 
 impl Bench {
@@ -69,6 +72,7 @@ impl Bench {
             "cat" => Some(Bench::Cat),
             "keys" => Some(Bench::Keys),
             "local-cat" => Some(Bench::LocalCat),
+            "resize" => Some(Bench::Resize),
             other => {
                 eprintln!("unknown BERTH_BENCH={other}");
                 None
@@ -371,6 +375,86 @@ pub struct Outcome {
     pub passed: bool,
 }
 
+/// The display rate the resize benchmark holds frames to: 120 Hz, the
+/// fastest Mac display, so 8.3 ms a frame (D53).
+pub const RESIZE_FRAME: Duration = Duration::from_micros(8_333);
+
+/// How many steps each half of the resize benchmark drives: two seconds at
+/// 120 Hz.
+pub const RESIZE_STEPS: usize = 240;
+
+/// Where the divider is at step `i` of a drag: swept from side to side and
+/// back, as a hand does, never past a tenth from either edge.
+pub fn divider_at(i: usize) -> f32 {
+    let turn = i as f32 / RESIZE_STEPS as f32 * std::f32::consts::TAU;
+    0.5 + 0.35 * turn.sin()
+}
+
+/// What one pane did while the layout moved under it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ResizeRun {
+    pub frames: u64,
+    pub p99_ms: f64,
+    pub longest_gap: Duration,
+    pub resizes: u64,
+    pub stale: u64,
+}
+
+impl ResizeRun {
+    /// Every frame within 8.3 ms, at most one pty resize a frame and a final
+    /// one, and never a frame at the wrong size.
+    pub fn passed(&self) -> bool {
+        self.frames >= 2
+            && self.p99_ms < RESIZE_FRAME.as_secs_f64() * 1000.0
+            && self.resizes <= self.frames + 1
+            && self.stale == 0
+    }
+
+    pub fn line(&self, what: &str) -> String {
+        format!(
+            "{what}: {} frames, p99 {:.2} ms (under {:.1}), longest gap {:.1} ms, \
+             {} pty resizes (at most {}), {} frames at the wrong size: {}\n",
+            self.frames,
+            self.p99_ms,
+            RESIZE_FRAME.as_secs_f64() * 1000.0,
+            self.longest_gap.as_secs_f64() * 1000.0,
+            self.resizes,
+            self.frames + 1,
+            self.stale,
+            if self.passed() { "PASS" } else { "FAIL" }
+        )
+    }
+}
+
+/// Clear a view's frame counters before a measured run.
+pub fn reset_frames(view: &mut TerminalView) {
+    view.frames = crate::metrics::Histogram::new();
+    view.slow_frames.clear();
+    view.longest_gap = Duration::ZERO;
+    view.last_frame_at = Some(std::time::Instant::now());
+    view.resizes_sent = 0;
+    view.stale_frames = 0;
+}
+
+/// What a view measured since its counters were cleared.
+pub fn resize_run(view: &TerminalView) -> ResizeRun {
+    ResizeRun {
+        frames: view.frames.count(),
+        p99_ms: view.frames.percentile_ms(0.99),
+        longest_gap: view.longest_gap,
+        resizes: view.resizes_sent,
+        stale: view.stale_frames,
+    }
+}
+
+/// Only the first local shell starts the resize benchmark; the one its
+/// split opens does not.
+static RESIZE_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn start_resize_once() -> bool {
+    !RESIZE_STARTED.swap(true, Ordering::Relaxed)
+}
+
 /// Where the local heavy-output benchmark keeps its file.
 pub fn local_file() -> std::path::PathBuf {
     std::env::temp_dir().join("berth_bench_50mb_local.txt")
@@ -622,6 +706,42 @@ pub async fn run_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drag sweeps both ways and keeps clear of the edges.
+    #[test]
+    fn the_divider_sweeps_and_stays_inside() {
+        let at: Vec<f32> = (0..RESIZE_STEPS).map(divider_at).collect();
+        assert!(at.iter().all(|a| (0.1..=0.9).contains(a)));
+        assert!(at.iter().any(|a| *a > 0.8) && at.iter().any(|a| *a < 0.2));
+    }
+
+    #[test]
+    fn a_resize_run_passes_only_within_every_limit() {
+        let good = ResizeRun {
+            frames: 240,
+            p99_ms: 4.0,
+            longest_gap: Duration::from_millis(9),
+            resizes: 241,
+            stale: 0,
+        };
+        assert!(good.passed());
+        assert!(
+            !ResizeRun {
+                p99_ms: 9.0,
+                ..good
+            }
+            .passed()
+        );
+        assert!(
+            !ResizeRun {
+                resizes: 242,
+                ..good
+            }
+            .passed()
+        );
+        assert!(!ResizeRun { stale: 1, ..good }.passed());
+        assert!(!ResizeRun::default().passed());
+    }
 
     #[test]
     fn bench_mode_parses_from_the_environment() {

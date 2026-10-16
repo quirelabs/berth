@@ -18,6 +18,9 @@ use gpui::{
 };
 
 use crate::terminal_style::{CursorShape, TerminalStyle};
+
+/// The longest a frame waits for the engine to reflow a new size.
+const RESIZE_WAIT: Duration = Duration::from_millis(3);
 use berth_core::pty::Pty;
 use berth_term::size::{CellSize, TermSize};
 use berth_term::terminal::Selection;
@@ -214,6 +217,15 @@ pub struct TerminalView {
     /// draws nothing while the main thread is busy; this can.
     pub last_frame_at: Option<Instant>,
     pub longest_gap: Duration,
+    /// Size changes told to the pty, and frames drawn at a size other than
+    /// the one their bounds asked for, since the last reset: what the resize
+    /// benchmark holds to one per frame and to none (D53).
+    pub resizes_sent: u64,
+    pub stale_frames: u64,
+    /// The background's corners: rounded where the pane meets the edge of
+    /// the pane area, square where it meets another pane or its header
+    /// (D53). A plain rounded fill, never a mask.
+    pub corners: gpui::Corners<Pixels>,
     /// Last size announced to the remote, so window_change is sent once.
     last_sent_size: Option<TermSize>,
     /// Shared with the output pump: bytes in, and the keystroke and echo times
@@ -287,6 +299,9 @@ impl TerminalView {
             slow_frames: Vec::new(),
             last_frame_at: None,
             longest_gap: Duration::ZERO,
+            resizes_sent: 0,
+            stale_frames: 0,
+            corners: gpui::Corners::default(),
             last_sent_size: None,
             intake: Arc::new(Intake::default()),
             latency: crate::metrics::LatencyReport::new(),
@@ -412,6 +427,7 @@ impl TerminalView {
             return;
         }
         self.last_sent_size = Some(size);
+        self.resizes_sent += 1;
         let Some(pty) = self.pty.clone() else { return };
         crate::runtime::handle().spawn(async move {
             pty.resize(size.cols, size.rows).await;
@@ -819,11 +835,17 @@ impl Element for TerminalElement {
         // The latest screen the engine published, which never waits on the
         // parser. A resize reaches it for a later frame.
         let copy_started = Instant::now();
+        // A new size waits a few milliseconds for the engine to reflow, so
+        // this frame shows the content at its new size (D53): a divider or a
+        // window edge being dragged redraws every frame, never stretched and
+        // never blank. A busy engine gets no longer than that.
         let snapshot = {
             let terminal = &self.view.read(cx).terminal;
-            terminal.resize(size, cell);
-            terminal.latest()
+            terminal.resize_within(size, cell, RESIZE_WAIT)
         };
+        if snapshot.size != size {
+            self.view.update(cx, |view, _| view.stale_frames += 1);
+        }
         let copy = copy_started.elapsed();
 
         let selection = self.view.read(cx).selection;
@@ -859,7 +881,8 @@ impl Element for TerminalElement {
             bounds.origin.y + px(self.style.padding_y),
         );
 
-        window.paint_quad(fill(bounds, state.background));
+        let corners = self.view.read(cx).corners;
+        window.paint_quad(fill(bounds, state.background).corner_radii(corners));
 
         // Backgrounds first, as a separate pass, so glyphs are never clipped by
         // a neighbouring cell's fill.

@@ -16,10 +16,12 @@ pub fn layout_of(node: &Node, order: &[u64]) -> Option<Layout> {
         Node::Leaf(id) => Layout::Pane(order.iter().position(|o| o == id)?),
         Node::Split {
             axis,
+            share,
             first,
             second,
         } => Layout::Split {
             down: *axis == Axis::Vertical,
+            share: *share,
             first: Box::new(layout_of(first, order)?),
             second: Box::new(layout_of(second, order)?),
         },
@@ -33,9 +35,11 @@ pub fn node_of(layout: &Layout, ids: &[u64]) -> Option<Node> {
         Layout::Pane(index) => Node::leaf(*ids.get(*index)?),
         Layout::Split {
             down,
+            share,
             first,
             second,
         } => Node::Split {
+            share: *share,
             axis: if *down {
                 Axis::Vertical
             } else {

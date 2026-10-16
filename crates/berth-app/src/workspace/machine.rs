@@ -330,6 +330,107 @@ impl Workspace {
         cx.update(|cx| cx.quit());
     }
 
+    /// The resize benchmark (D53): two local shells full of text side by
+    /// side; the divider is dragged across and back, then the window is
+    /// resized, one step a display frame, and every frame of both panes is
+    /// held to 8.3 ms, one pty resize, and the size its bounds asked for.
+    pub(super) async fn run_resize_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        use crate::bench::{RESIZE_FRAME, RESIZE_STEPS};
+        if crate::bench::Bench::from_env() != Some(crate::bench::Bench::Resize)
+            || !crate::bench::start_resize_once()
+        {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        let wait = |ms: u64| executor.timer(Duration::from_millis(ms));
+        let fill = "seq 1 3000; ls -la /usr/bin | head -200\n";
+        wait(1500).await;
+        let _ = this.update(cx, |this, cx| {
+            if let Some(pty) = this.focused().and_then(|p| p.view.read(cx).pty()) {
+                crate::runtime::handle().spawn(async move { pty.write(fill).await });
+            }
+            this.split(Axis::Horizontal, cx);
+        });
+        wait(2000).await;
+        let Ok(Some((tab, views))) = this.update(cx, |this, cx| {
+            if let Some(pty) = this.focused().and_then(|p| p.view.read(cx).pty()) {
+                crate::runtime::handle().spawn(async move { pty.write(fill).await });
+            }
+            let tab = this.tab()?;
+            let views: Vec<_> = tab
+                .root
+                .panes()
+                .iter()
+                .filter_map(|id| Some(this.pane(*id)?.view.downgrade()))
+                .collect();
+            Some((tab.id, views))
+        }) else {
+            return;
+        };
+        wait(1500).await;
+        let reset = |cx: &mut AsyncApp| {
+            for view in &views {
+                let _ = view.update(cx, |view, _| crate::bench::reset_frames(view));
+            }
+        };
+        let measure = |cx: &mut AsyncApp| -> Vec<crate::bench::ResizeRun> {
+            views
+                .iter()
+                .filter_map(|view| {
+                    view.read_with(cx, |view, _| crate::bench::resize_run(view))
+                        .ok()
+                })
+                .collect()
+        };
+
+        reset(cx);
+        for i in 0..RESIZE_STEPS {
+            let share = crate::bench::divider_at(i);
+            let _ = this.update(cx, |this, cx| this.drag_divider(tab, &[], share, cx));
+            cx.background_executor().timer(RESIZE_FRAME).await;
+        }
+        wait(200).await;
+        let dragged = measure(cx);
+
+        let window = cx.update(|cx| cx.windows().first().copied());
+        let mut resized = Vec::new();
+        if let Some(window) = window {
+            let start = window.update(cx, |_, window, _| window.bounds().size).ok();
+            if let Some(start) = start {
+                reset(cx);
+                for i in 0..RESIZE_STEPS {
+                    let k = 0.6 + 0.4 * crate::bench::divider_at(i);
+                    let size = gpui::size(start.width * k, start.height * k);
+                    let _ = window.update(cx, |_, window, _| window.resize(size));
+                    cx.background_executor().timer(RESIZE_FRAME).await;
+                }
+                let _ = window.update(cx, |_, window, _| window.resize(start));
+                wait(200).await;
+                resized = measure(cx);
+            }
+        }
+
+        let mut text = String::from("resize benchmark (D53)\n");
+        let mut passed = dragged.len() == 2 && resized.len() == 2;
+        for (index, run) in dragged.iter().enumerate() {
+            text.push_str(&run.line(&format!("divider drag, pane {}", index + 1)));
+            passed &= run.passed();
+        }
+        for (index, run) in resized.iter().enumerate() {
+            text.push_str(&run.line(&format!("window resize, pane {}", index + 1)));
+            passed &= run.passed();
+        }
+        if !passed {
+            text.push_str("FAIL\n");
+        }
+        println!("\n{text}");
+        if !passed {
+            eprintln!("benchmark did not meet its criteria");
+            crate::bench::mark_failed();
+        }
+        cx.update(|cx| cx.quit());
+    }
+
     /// Drive the real render loop for a benchmark, then quit.
     pub(super) async fn run_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
         let Some(mode) = crate::bench::Bench::from_env() else {
@@ -373,7 +474,7 @@ impl Workspace {
                 crate::bench::run_keys(view, pty, 40, refresh_hz(), cx).await
             }
             // Local only; started from `run_local_benchmark`.
-            crate::bench::Bench::LocalCat => return,
+            crate::bench::Bench::LocalCat | crate::bench::Bench::Resize => return,
         };
         println!("\n{}", report.text);
         let _ = runtime::spawn(async move {

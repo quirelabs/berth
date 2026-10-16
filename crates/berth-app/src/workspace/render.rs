@@ -144,8 +144,6 @@ impl Workspace {
             .gap(px(6.0))
             .overflow_y_scroll()
             .bg(hsla(theme.surface))
-            .border_r(px(1.0))
-            .border_color(hsla(theme.border))
             .py(px(6.0))
             .child(list)
             .child(self.warnings())
@@ -467,9 +465,7 @@ impl Workspace {
             .h(px(26.0))
             .px(px(4.0))
             .overflow_x_scroll()
-            .bg(hsla(theme.surface))
-            .border_b(px(1.0))
-            .border_color(hsla(theme.border));
+            .bg(hsla(theme.surface));
 
         for (index, tab) in self.tabs.iter().enumerate() {
             // A tab is named by its focused pane, so a split tab still says
@@ -1051,7 +1047,14 @@ impl Workspace {
     /// The focused pane carries a border in the accent colour. With more than
     /// one terminal on screen and no cursor blinking to give it away, there has
     /// to be something that says where the keys are going.
-    fn render_node(&self, node: &Node, focus: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_node(
+        &self,
+        node: &Node,
+        focus: u64,
+        path: crate::panes::Path,
+        corners: &std::collections::HashMap<u64, [bool; 4]>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         match node {
             Node::Leaf(id) => {
                 let theme = self.theme;
@@ -1060,7 +1063,30 @@ impl Workspace {
                     return div().flex().flex_1().into_any_element();
                 };
                 let pane_id = *id;
-                div()
+                let outer = corners.get(id).copied().unwrap_or([true; 4]);
+                let split = self
+                    .tab_of(pane_id)
+                    .and_then(|index| self.tabs.get(index))
+                    .is_some_and(|tab| tab.root.panes().len() > 1);
+                let dropped = pane.view.read(cx).intake.input_dropped_recently();
+                // Rounded where a corner faces the edge of the pane area,
+                // square where it meets another pane, all as plain rounded
+                // fills (D53). Whatever sits on top of the terminal takes
+                // the top corners.
+                let topped = split || pane.direct.is_some() || dropped;
+                pane.view.update(cx, |view, _| {
+                    view.corners = gpui::Corners {
+                        top_left: px(corner(outer[0] && !topped)),
+                        top_right: px(corner(outer[1] && !topped)),
+                        bottom_right: px(corner(outer[2])),
+                        bottom_left: px(corner(outer[3])),
+                    }
+                });
+                let first_bar = |bar: gpui::Div, first: bool| {
+                    bar.rounded_tl(px(corner(outer[0] && first)))
+                        .rounded_tr(px(corner(outer[1] && first)))
+                };
+                let mut body = div()
                     .id(("pane", pane_id as usize))
                     // Clicking a pane focuses it, which is the only thing that
                     // makes several terminals on screen usable with a mouse.
@@ -1075,106 +1101,199 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(hsla(if focused { theme.accent } else { theme.border }))
-                    // In a split, each pane says what runs in it: the tab
-                    // can only speak for one of them.
-                    .when(
-                        self.tab_of(pane_id)
-                            .and_then(|index| self.tabs.get(index))
-                            .is_some_and(|tab| tab.root.panes().len() > 1),
-                        |this| {
-                            let program = crate::programs::lookup(
-                                self.pane_program(pane).unwrap_or_default(),
-                            );
-                            let title = self
-                                .pane_title(pane)
-                                .unwrap_or_else(|| pane.alias().to_string());
-                            this.child(
-                                div()
-                                    .flex()
+                    .overflow_hidden();
+                // In a split, each pane says what runs in it: the tab can
+                // only speak for one of them.
+                if split {
+                    let program =
+                        crate::programs::lookup(self.pane_program(pane).unwrap_or_default());
+                    let title = self
+                        .pane_title(pane)
+                        .unwrap_or_else(|| pane.alias().to_string());
+                    body = body.child(first_bar(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(5.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .text_xs()
+                            .bg(hsla(theme.background))
+                            .text_color(hsla(if focused {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }))
+                            .child(
+                                svg()
+                                    .path(program.icon)
                                     .flex_shrink_0()
-                                    .items_center()
-                                    .gap(px(5.0))
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .text_xs()
-                                    .bg(hsla(theme.surface))
-                                    .border_b(px(1.0))
-                                    .border_color(hsla(theme.border))
-                                    .text_color(hsla(if focused {
-                                        theme.text
-                                    } else {
-                                        theme.text_muted
-                                    }))
-                                    .child(
-                                        svg()
-                                            .path(program.icon)
-                                            .flex_shrink_0()
-                                            .size(px(PANE_ICON))
-                                            .text_color(hsla(theme.text_muted)),
-                                    )
-                                    .child(div().truncate().child(title)),
+                                    .size(px(PANE_ICON))
+                                    .text_color(hsla(theme.text_muted)),
                             )
-                        },
-                    )
-                    // Never a silent fallback: a local tab running its shell
-                    // outside the local server says so, and why (D50).
-                    .when_some(pane.direct.clone(), |this, reason| {
-                        this.child(
-                            div()
-                                .px(px(8.0))
-                                .py(px(3.0))
-                                .text_xs()
-                                .bg(hsla(theme.border))
-                                .text_color(hsla(theme.text_muted))
-                                .child(strings::local_direct_notice(&reason)),
-                        )
-                    })
-                    // Input the program did not take is said, not swallowed
-                    // (D50).
-                    .when(pane.view.read(cx).intake.input_dropped_recently(), |this| {
-                        this.child(
-                            div()
-                                .px(px(8.0))
-                                .py(px(3.0))
-                                .text_xs()
-                                .bg(hsla(theme.border))
-                                .text_color(hsla(theme.warning))
-                                .child(strings::INPUT_NOT_DELIVERED),
-                        )
-                    })
-                    .child(div().flex().flex_1().min_h_0().child(pane.view.clone()))
-                    .into_any_element()
+                            .child(div().truncate().child(title)),
+                        true,
+                    ));
+                }
+                // Never a silent fallback: a local tab running its shell
+                // outside the local server says so, and why (D50).
+                if let Some(reason) = pane.direct.clone() {
+                    body = body.child(first_bar(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .text_xs()
+                            .bg(hsla(theme.border))
+                            .text_color(hsla(theme.text_muted))
+                            .child(strings::local_direct_notice(&reason)),
+                        !split,
+                    ));
+                }
+                // Input the program did not take is said, not swallowed
+                // (D50).
+                if dropped {
+                    body = body.child(first_bar(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .text_xs()
+                            .bg(hsla(theme.border))
+                            .text_color(hsla(theme.warning))
+                            .child(strings::INPUT_NOT_DELIVERED),
+                        !split && pane.direct.is_none(),
+                    ));
+                }
+                // Unfocused panes in a split are dimmed, so the one taking
+                // keys needs no border to say so.
+                let dim = split && !focused;
+                body.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .when(dim, |view| view.opacity(UNFOCUSED_OPACITY))
+                        .child(pane.view.clone()),
+                )
+                .into_any_element()
             }
             Node::Split {
                 axis,
+                share,
                 first,
                 second,
             } => {
-                let row = div().flex().flex_1().min_w_0().min_h_0();
+                let theme = self.theme;
+                let axis = *axis;
+                let tab = self.tab().map(|t| t.id).unwrap_or_default();
+                let part = f32::from(*share) / 1000.0;
+                let child = |node: &Node, grow: f32, side: bool, cx: &mut Context<Self>| {
+                    let mut path = path.clone();
+                    path.push(side);
+                    div()
+                        .flex()
+                        .flex_basis(gpui::relative(0.0))
+                        .flex_grow(grow)
+                        .flex_shrink(1.0)
+                        .min_w_0()
+                        .min_h_0()
+                        .child(self.render_node(node, focus, path, corners, cx))
+                };
+                // The divider is the gap between the panes; its grip is the
+                // gap and a little of each neighbour, drawn over both, with
+                // a pill while it is hovered or dragged. The layout follows
+                // the pointer every frame; the grid reflows from what it
+                // holds and the pty hears of a new size at most once a frame
+                // (D53). A double click evens the split out.
+                let grip = DividerDrag {
+                    tab,
+                    path: path.clone(),
+                };
+                let held = self.dragging_divider.as_ref() == Some(&(tab, path.clone()));
+                let group: gpui::SharedString = format!("divider-{tab}-{path:?}").into();
+                let pill = div()
+                    .bg(hsla(theme.text))
+                    .rounded(px(1.0))
+                    .opacity(if held { PILL_OPACITY } else { 0.0 })
+                    .group_hover(group.clone(), |pill| pill.opacity(PILL_OPACITY));
+                let pill = match axis {
+                    Axis::Horizontal => pill.w(px(PILL.0)).h(px(PILL.1)),
+                    Axis::Vertical => pill.w(px(PILL.1)).h(px(PILL.0)),
+                };
+                let evened = path.clone();
+                let handle = div()
+                    .id(gpui::ElementId::Name(group.clone()))
+                    .group(group)
+                    .absolute()
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .on_drag(grip, |_, _, _, cx| cx.new(|_| gpui::EmptyView))
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        if event.click_count() >= 2 {
+                            this.drag_divider(tab, &evened, 0.5, cx);
+                        }
+                    }))
+                    .child(pill);
+                let handle = match axis {
+                    Axis::Horizontal => handle
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-GRIP_INTO))
+                        .w(px(GAP + 2.0 * GRIP_INTO))
+                        .cursor_ew_resize(),
+                    Axis::Vertical => handle
+                        .left_0()
+                        .right_0()
+                        .top(px(-GRIP_INTO))
+                        .h(px(GAP + 2.0 * GRIP_INTO))
+                        .cursor_ns_resize(),
+                };
+                // Deferred, so the grip is above the neighbour drawn after it
+                // and takes the pointer there too.
+                let divider = div()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(gpui::deferred(handle));
+                let divider = match axis {
+                    Axis::Horizontal => divider.w(px(GAP)).h_full(),
+                    Axis::Vertical => divider.h(px(GAP)).w_full(),
+                };
+                let here = path.clone();
+                let row = div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .on_drag_move(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<DividerDrag>, _, cx| {
+                            let grip = event.drag(cx);
+                            if grip.tab != tab || grip.path != here {
+                                return;
+                            }
+                            let bounds = event.bounds;
+                            let at = event.event.position;
+                            let share = match axis {
+                                Axis::Horizontal => {
+                                    (at.x - bounds.origin.x) / bounds.size.width.max(px(1.0))
+                                }
+                                Axis::Vertical => {
+                                    (at.y - bounds.origin.y) / bounds.size.height.max(px(1.0))
+                                }
+                            };
+                            this.drag_divider(tab, &here, share, cx);
+                        },
+                    ));
                 let row = match axis {
                     Axis::Horizontal => row.flex_row(),
                     Axis::Vertical => row.flex_col(),
                 };
-                row.child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .child(self.render_node(first, focus, cx)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .child(self.render_node(second, focus, cx)),
-                )
-                .into_any_element()
+                let first = child(first, part, false, cx);
+                let second = child(second, 1.0 - part, true, cx);
+                row.child(first)
+                    .child(divider)
+                    .child(second)
+                    .into_any_element()
             }
         }
     }
@@ -1193,8 +1312,6 @@ impl Workspace {
             .gap(px(12.0))
             .px(px(10.0))
             .bg(hsla(theme.surface))
-            .border_t(px(1.0))
-            .border_color(hsla(theme.border))
             .text_xs()
             .text_color(hsla(theme.text_muted))
             // The host actually on screen, which with warming is whichever
@@ -1231,6 +1348,9 @@ impl Render for Workspace {
         self.theme = Theme::for_appearance(window.appearance().into());
         let theme = self.theme;
         self.tend_otters(cx);
+        if !cx.has_active_drag() {
+            self.dragging_divider = None;
+        }
 
         // A modal takes the keyboard, so Escape and Enter reach it rather than
         // the terminal underneath.
@@ -1252,10 +1372,21 @@ impl Render for Workspace {
 
         let showing = self.tab().map(|t| (t.root.clone(), t.focus));
         let main = match showing {
-            Some((root, focus)) => div()
-                .flex()
-                .flex_1()
-                .child(self.render_node(&root, focus, cx)),
+            Some((root, focus)) => {
+                div()
+                    .flex()
+                    .flex_1()
+                    // The pane area sits on the chrome's colour, inset from
+                    // the window's edges, with gaps between panes (D53).
+                    .bg(hsla(theme.surface))
+                    .px(px(GAP))
+                    .pb(px(GAP))
+                    .child({
+                        let corners: std::collections::HashMap<u64, [bool; 4]> =
+                            root.outer_corners().into_iter().collect();
+                        self.render_node(&root, focus, Vec::new(), &corners, cx)
+                    })
+            }
             None => match &self.empty {
                 Empty::Connecting(alias) => centred(
                     div()
@@ -1347,6 +1478,25 @@ fn menu_label(action: crate::menu::Action) -> &'static str {
         Action::RenameHost => strings::MENU_RENAME_HOST,
         Action::Server => strings::MENU_SERVER,
     }
+}
+
+/// The gap between panes, and between the pane area and the window's
+/// edges (D53).
+const GAP: f32 = 6.0;
+/// How far a divider's grip reaches into each neighbour, past the gap.
+const GRIP_INTO: f32 = 3.0;
+/// The pill on a hovered or dragged divider: its length across the gap and
+/// along it, and how strongly it shows.
+const PILL: (f32, f32) = (2.0, 32.0);
+const PILL_OPACITY: f32 = 0.35;
+/// A pane corner facing the edge of the pane area.
+const PANE_RADIUS: f32 = 8.0;
+/// How far an unfocused pane in a split dims.
+const UNFOCUSED_OPACITY: f32 = 0.75;
+
+/// A pane corner's radius: rounded on the outside, square where panes meet.
+fn corner(outside: bool) -> f32 {
+    if outside { PANE_RADIUS } else { 0.0 }
 }
 
 /// The widest a tab's name gets before it is cut with an ellipsis.

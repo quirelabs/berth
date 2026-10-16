@@ -59,9 +59,17 @@ pub enum Layout {
     Split {
         /// Stacked rather than side by side.
         down: bool,
+        /// The first child's part, in thousandths; even in a file from
+        /// before dividers could be dragged.
+        #[serde(default = "even")]
+        share: u16,
         first: Box<Layout>,
         second: Box<Layout>,
     },
+}
+
+fn even() -> u16 {
+    500
 }
 
 impl Layout {
@@ -238,15 +246,38 @@ mod tests {
             focus: 1,
             layout: Layout::Split {
                 down: false,
+                share: 600,
                 first: Box::new(Layout::Pane(0)),
                 second: Box::new(Layout::Split {
                     down: true,
+                    share: 500,
                     first: Box::new(Layout::Pane(1)),
                     second: Box::new(Layout::Pane(2)),
                 }),
             },
             panes: vec![pane("/a"), pane("/b"), pane("/c")],
         }
+    }
+
+    /// A layout saved before dividers could be dragged has no share, and
+    /// loads as an even split.
+    #[test]
+    fn a_layout_without_a_share_is_even() {
+        #[derive(Deserialize)]
+        struct One {
+            layout: Layout,
+        }
+        let old = "[layout.Split]\ndown = true\nfirst = { Pane = 0 }\nsecond = { Pane = 1 }\n";
+        let one: One = toml::from_str(old).expect("an old layout parses");
+        assert_eq!(
+            one.layout,
+            Layout::Split {
+                down: true,
+                share: 500,
+                first: Box::new(Layout::Pane(0)),
+                second: Box::new(Layout::Pane(1)),
+            }
+        );
     }
 
     #[test]
@@ -310,6 +341,7 @@ mod tests {
         let mut twice = split_tab();
         twice.layout = Layout::Split {
             down: false,
+            share: 500,
             first: Box::new(Layout::Pane(0)),
             second: Box::new(Layout::Pane(0)),
         };

@@ -80,6 +80,13 @@ impl Render for RowDrag {
     }
 }
 
+/// A split's divider being dragged: which tab, and which split in it.
+#[derive(Clone)]
+struct DividerDrag {
+    tab: u64,
+    path: crate::panes::Path,
+}
+
 /// What the sidebar shows for one host.
 #[derive(Debug, Clone)]
 pub enum HostStatus {
@@ -333,6 +340,8 @@ pub struct Workspace {
     /// What runs in each remote session, by alias and slug: the foreground
     /// process's name from the same scan as `running`.
     programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// The divider being dragged, whose pill stays up while it is.
+    dragging_divider: Option<(u64, crate::panes::Path)>,
     /// The otter icons' clock (D53): when the looping poses began, when each
     /// pane's or session's `done` began (it plays for two seconds), whether
     /// motion is off, and the one timer every icon shares. The timer is only
@@ -515,6 +524,7 @@ impl Workspace {
             status_shown: Looked::default(),
             hook_done_seen: std::collections::HashSet::new(),
             programs: std::collections::BTreeMap::new(),
+            dragging_divider: None,
             otter_epoch: std::time::Instant::now(),
             otter_done: std::collections::HashMap::new(),
             otter_still: false,
@@ -977,6 +987,7 @@ impl Workspace {
                     if crate::bench::Bench::from_env() == Some(crate::bench::Bench::LocalCat) {
                         Self::run_local_benchmark(&this, cx).await;
                     }
+                    Self::run_resize_benchmark(&this, cx).await;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not open a local shell");
@@ -1817,6 +1828,18 @@ impl Workspace {
             cx.notify();
         } else {
             self.kill(alias, slug, pane, cx);
+        }
+    }
+
+    /// Move a split's divider to where the pointer is, as a share of the
+    /// split. Redrawn at once; nothing else waits on it.
+    fn drag_divider(&mut self, tab: u64, path: &[bool], share: f32, cx: &mut Context<Self>) {
+        let share = (share.clamp(0.0, 1.0) * 1000.0).round() as u16;
+        if let Some(found) = self.tabs.iter_mut().find(|t| t.id == tab)
+            && found.root.set_share(path, share)
+        {
+            self.dragging_divider = Some((tab, path.to_vec()));
+            cx.notify();
         }
     }
 
