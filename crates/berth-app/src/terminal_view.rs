@@ -222,6 +222,10 @@ pub struct TerminalView {
     /// benchmark holds to one per frame and to none (D53).
     pub resizes_sent: u64,
     pub stale_frames: u64,
+    /// When the view was first drawn, and first drawn with anything from
+    /// its session on it: what the feel benchmark times a new tab by (D53).
+    pub first_painted_at: Option<Instant>,
+    pub first_content_at: Option<Instant>,
     /// The background's corners: rounded where the pane meets the edge of
     /// the pane area, square where it meets another pane or its header
     /// (D53). A plain rounded fill, never a mask.
@@ -301,6 +305,8 @@ impl TerminalView {
             longest_gap: Duration::ZERO,
             resizes_sent: 0,
             stale_frames: 0,
+            first_painted_at: None,
+            first_content_at: None,
             corners: gpui::Corners::default(),
             last_sent_size: None,
             intake: Arc::new(Intake::default()),
@@ -987,6 +993,11 @@ impl Element for TerminalElement {
         let awaiting_echo = self.view.update(cx, |view, _| {
             view.frames.record(elapsed);
             view.note_frame(elapsed, copy);
+            let now = Instant::now();
+            view.first_painted_at.get_or_insert(now);
+            if view.bytes_in() > 0 {
+                view.first_content_at.get_or_insert(now);
+            }
             view.sync_remote_size(painted_size);
             view.geometry = Some(geometry);
             view.resolved_cell = Some(painted_cell);

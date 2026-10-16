@@ -64,6 +64,9 @@ pub enum Bench {
     /// Drag a split's divider and resize the window, in local shells full
     /// of text, and hold every frame to the display rate (D53).
     Resize,
+    /// Open, split, switch, focus, close and drag tabs, and time each from
+    /// the action to the frame that shows it (D53).
+    Feel,
 }
 
 impl Bench {
@@ -73,6 +76,7 @@ impl Bench {
             "keys" => Some(Bench::Keys),
             "local-cat" => Some(Bench::LocalCat),
             "resize" => Some(Bench::Resize),
+            "feel" => Some(Bench::Feel),
             other => {
                 eprintln!("unknown BERTH_BENCH={other}");
                 None
@@ -447,12 +451,61 @@ pub fn resize_run(view: &TerminalView) -> ResizeRun {
     }
 }
 
+/// The feel benchmark's limits (D53): a new tab's prompt within 50 ms at
+/// p95, and everything else in the next frame: one display frame, plus what
+/// building it takes, held to a frame at 120 Hz.
+pub const PROMPT_P95: Duration = Duration::from_millis(50);
+
+pub fn next_frame(refresh_hz: f64) -> Duration {
+    Duration::from_secs_f64(1.0 / refresh_hz.max(1.0)) + RESIZE_FRAME
+}
+
+/// One kind of action the feel benchmark times: every sample, and the limit
+/// its p95 is held to.
+pub struct FeelCase {
+    pub what: &'static str,
+    pub samples: Vec<Duration>,
+    pub limit: Duration,
+}
+
+impl FeelCase {
+    pub fn p95(&self) -> Duration {
+        let mut sorted = self.samples.clone();
+        sorted.sort();
+        let at = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        sorted.get(at).copied().unwrap_or(Duration::MAX)
+    }
+
+    pub fn passed(&self) -> bool {
+        !self.samples.is_empty() && self.p95() <= self.limit
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "{}: {} samples, p95 {:.1} ms (at most {:.1}): {}\n",
+            self.what,
+            self.samples.len(),
+            self.p95().as_secs_f64() * 1000.0,
+            self.limit.as_secs_f64() * 1000.0,
+            if self.passed() { "PASS" } else { "FAIL" }
+        )
+    }
+}
+
 /// Only the first local shell starts the resize benchmark; the one its
 /// split opens does not.
 static RESIZE_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub fn start_resize_once() -> bool {
     !RESIZE_STARTED.swap(true, Ordering::Relaxed)
+}
+
+/// The same for the feel benchmark, whose own new tabs must not start it
+/// again.
+static FEEL_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn start_feel_once() -> bool {
+    !FEEL_STARTED.swap(true, Ordering::Relaxed)
 }
 
 /// Where the local heavy-output benchmark keeps its file.
@@ -713,6 +766,23 @@ mod tests {
         let at: Vec<f32> = (0..RESIZE_STEPS).map(divider_at).collect();
         assert!(at.iter().all(|a| (0.1..=0.9).contains(a)));
         assert!(at.iter().any(|a| *a > 0.8) && at.iter().any(|a| *a < 0.2));
+    }
+
+    #[test]
+    fn a_feel_case_is_held_to_its_p95() {
+        let ms = Duration::from_millis;
+        let mut case = FeelCase {
+            what: "new tab",
+            samples: (1..=20).map(ms).collect(),
+            limit: ms(19),
+        };
+        assert_eq!(case.p95(), ms(19));
+        assert!(case.passed());
+        case.limit = ms(18);
+        assert!(!case.passed());
+        case.samples.clear();
+        assert!(!case.passed(), "no samples is no pass");
+        assert!(next_frame(120.0) < ms(17));
     }
 
     #[test]

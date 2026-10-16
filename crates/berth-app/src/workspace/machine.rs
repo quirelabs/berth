@@ -431,6 +431,194 @@ impl Workspace {
         cx.update(|cx| cx.quit());
     }
 
+    /// The feel benchmark (D53): in local shells, each action timed from
+    /// the moment it is asked for to the frame that shows it. A new tab's
+    /// pane in the next frame and its prompt within 50 ms at p95; a split,
+    /// a focus, a tab switch, a close and a tab drop in the next frame. A
+    /// remote prompt's 1 RTT plus 30 ms needs a host and is not here.
+    pub(super) async fn run_feel_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        use crate::bench::{FeelCase, PROMPT_P95};
+        use std::time::Instant;
+        if crate::bench::Bench::from_env() != Some(crate::bench::Bench::Feel)
+            || !crate::bench::start_feel_once()
+        {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        let next = crate::bench::next_frame(refresh_hz());
+        // Look every millisecond until `done` says so, for at most a
+        // second; the time it said so, if it did.
+        async fn until(
+            executor: &gpui::BackgroundExecutor,
+            cx: &mut AsyncApp,
+            this: &WeakEntity<Workspace>,
+            done: impl Fn(&Workspace, &gpui::App) -> Option<Instant>,
+        ) -> Option<Instant> {
+            for _ in 0..1000 {
+                if let Ok(Some(at)) = this.read_with(cx, |this, cx| done(this, cx)) {
+                    return Some(at);
+                }
+                executor.timer(Duration::from_millis(1)).await;
+            }
+            None
+        }
+        let rendered_after = |t0: Instant| {
+            move |this: &Workspace, _: &gpui::App| this.rendered_at.filter(|at| *at > t0)
+        };
+        executor.timer(Duration::from_millis(1500)).await;
+
+        let mut shown = FeelCase {
+            what: "new tab, pane shown",
+            samples: Vec::new(),
+            limit: next,
+        };
+        let mut prompt = FeelCase {
+            what: "new tab, local prompt",
+            samples: Vec::new(),
+            limit: PROMPT_P95,
+        };
+        for _ in 0..20 {
+            let Ok(before) = this.read_with(cx, |this, _| {
+                this.panes.iter().map(|p| p.id).collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.new_tab(cx));
+            let fresh = |this: &Workspace| {
+                this.panes
+                    .iter()
+                    .find(|p| !before.contains(&p.id))
+                    .map(|p| p.id)
+            };
+            let painted = until(&executor, cx, this, |this, cx| {
+                let id = fresh(this)?;
+                this.pane(id)?.view.read(cx).first_painted_at
+            })
+            .await;
+            let content = until(&executor, cx, this, |this, cx| {
+                let id = fresh(this)?;
+                this.pane(id)?.view.read(cx).first_content_at
+            })
+            .await;
+            shown
+                .samples
+                .push(painted.map_or(Duration::MAX, |at| at - t0));
+            prompt
+                .samples
+                .push(content.map_or(Duration::MAX, |at| at - t0));
+            let _ = this.update(cx, |this, cx| {
+                if let Some(id) = fresh(this) {
+                    this.close(id, cx);
+                }
+            });
+            executor.timer(Duration::from_millis(100)).await;
+        }
+
+        let mut split = FeelCase {
+            what: "split",
+            samples: Vec::new(),
+            limit: next,
+        };
+        let mut focus = FeelCase {
+            what: "focus pane",
+            samples: Vec::new(),
+            limit: next,
+        };
+        let mut switch = FeelCase {
+            what: "switch tab",
+            samples: Vec::new(),
+            limit: next,
+        };
+        let mut close = FeelCase {
+            what: "close pane",
+            samples: Vec::new(),
+            limit: next,
+        };
+        let mut drop = FeelCase {
+            what: "tab drop",
+            samples: Vec::new(),
+            limit: next,
+        };
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.split(Axis::Horizontal, cx));
+            let at = until(&executor, cx, this, rendered_after(t0)).await;
+            split.samples.push(at.map_or(Duration::MAX, |at| at - t0));
+            executor.timer(Duration::from_millis(300)).await;
+        }
+        for _ in 0..20 {
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.run(crate::input::Command::NextPane, cx));
+            let at = until(&executor, cx, this, rendered_after(t0)).await;
+            focus.samples.push(at.map_or(Duration::MAX, |at| at - t0));
+            executor.timer(Duration::from_millis(20)).await;
+        }
+        for _ in 0..3 {
+            let _ = this.update(cx, |this, cx| this.new_tab(cx));
+            executor.timer(Duration::from_millis(300)).await;
+        }
+        for i in 0..20 {
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.select_tab(1 + i % 3, cx));
+            let at = until(&executor, cx, this, rendered_after(t0)).await;
+            switch.samples.push(at.map_or(Duration::MAX, |at| at - t0));
+            executor.timer(Duration::from_millis(20)).await;
+        }
+        // A tab dragged across the strip a step a frame, then dropped.
+        let drag = this.read_with(cx, |this, _| {
+            let bounds = this.tab_bounds.borrow();
+            let tab = this.tabs.first()?.id;
+            let far = this
+                .tabs
+                .last()
+                .and_then(|t| bounds.get(&t.id))
+                .map(|b| f32::from(b.origin.x + b.size.width))?;
+            Some((tab, far))
+        });
+        if let Ok(Some((tab, far))) = drag {
+            for step in 0..=60 {
+                let x = far * step as f32 / 60.0;
+                let _ = this.update(cx, |this, cx| this.drag_tab_to(tab, x, cx));
+                executor.timer(crate::bench::RESIZE_FRAME).await;
+            }
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.drop_tab(tab, cx));
+            let at = until(&executor, cx, this, rendered_after(t0)).await;
+            drop.samples.push(at.map_or(Duration::MAX, |at| at - t0));
+        }
+        loop {
+            let Ok(Some(pane)) = this.read_with(cx, |this, _| {
+                this.tab()
+                    .filter(|t| t.root.panes().len() > 1)
+                    .map(|t| t.focus)
+            }) else {
+                break;
+            };
+            let t0 = Instant::now();
+            let _ = this.update(cx, |this, cx| this.close(pane, cx));
+            let at = until(&executor, cx, this, rendered_after(t0)).await;
+            close.samples.push(at.map_or(Duration::MAX, |at| at - t0));
+            executor.timer(Duration::from_millis(50)).await;
+        }
+
+        let cases = [shown, prompt, split, focus, switch, close, drop];
+        let mut text = String::from("feel benchmark (D53)\n");
+        for case in &cases {
+            text.push_str(&case.line());
+        }
+        let passed = cases.iter().all(FeelCase::passed);
+        if !passed {
+            text.push_str("FAIL\n");
+        }
+        println!("\n{text}");
+        if !passed {
+            eprintln!("benchmark did not meet its criteria");
+            crate::bench::mark_failed();
+        }
+        cx.update(|cx| cx.quit());
+    }
+
     /// Drive the real render loop for a benchmark, then quit.
     pub(super) async fn run_benchmark(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
         let Some(mode) = crate::bench::Bench::from_env() else {
@@ -474,7 +662,9 @@ impl Workspace {
                 crate::bench::run_keys(view, pty, 40, refresh_hz(), cx).await
             }
             // Local only; started from `run_local_benchmark`.
-            crate::bench::Bench::LocalCat | crate::bench::Bench::Resize => return,
+            crate::bench::Bench::LocalCat
+            | crate::bench::Bench::Resize
+            | crate::bench::Bench::Feel => return,
         };
         println!("\n{}", report.text);
         let _ = runtime::spawn(async move {

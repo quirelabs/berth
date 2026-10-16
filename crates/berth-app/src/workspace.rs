@@ -387,6 +387,8 @@ pub struct Workspace {
     /// What runs in each remote session, by alias and slug: the foreground
     /// process's name from the same scan as `running`.
     programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// When the window was last built: the feel benchmark's "next frame".
+    rendered_at: Option<std::time::Instant>,
     /// Where each status bar count last went, so the next click goes on.
     status_cycle: std::collections::HashMap<crate::glyph::State, usize>,
     /// The divider being dragged, whose pill stays up while it is.
@@ -619,6 +621,7 @@ impl Workspace {
             programs: std::collections::BTreeMap::new(),
             dragging_divider: None,
             status_cycle: std::collections::HashMap::new(),
+            rendered_at: None,
             tab_bounds: Default::default(),
             tab_dragging: None,
             tab_slides: std::collections::HashMap::new(),
@@ -1094,6 +1097,7 @@ impl Workspace {
                         Self::run_local_benchmark(&this, cx).await;
                     }
                     Self::run_resize_benchmark(&this, cx).await;
+                    Self::run_feel_benchmark(&this, cx).await;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not open a local shell");

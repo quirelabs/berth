@@ -1767,6 +1767,7 @@ impl Render for Workspace {
         }
         let theme = self.theme;
         self.tend_glyphs(cx);
+        self.rendered_at = Some(std::time::Instant::now());
         if !cx.has_active_drag() {
             self.dragging_divider = None;
             // A tab drag that ended anywhere but the strip changes nothing.
