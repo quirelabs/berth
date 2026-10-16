@@ -638,6 +638,10 @@ mod tests {
             .await
             .expect("a local shell should open");
 
+        // Typed only once the shell is up: input before its first prompt
+        // lets macOS's bash set the size back as it starts, which a worker
+        // mends at its next look, not at once.
+        read_until(&mut events, "$ ").await;
         // Ask before resizing as well, so a test that stopped being able to
         // tell the two apart fails here rather than passing on both.
         assert!(pty.write("stty size\n").await);
