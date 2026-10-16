@@ -62,7 +62,7 @@ async fn what_survives_tmux() {
 
     // Put the snippet on the host.
     let push = format!(
-        "cat > /tmp/berth_si.sh <<'BERTH_EOF'\n{}\nBERTH_EOF",
+        "mkdir -p ~/berth-bench && cat > ~/berth-bench/berth_si.sh <<'BERTH_EOF'\n{}\nBERTH_EOF",
         berth_probe::SHELL_INTEGRATION
             .replace("\r\n", "\n")
             .trim_end()
@@ -74,7 +74,7 @@ async fn what_survives_tmux() {
     let plain = Terminal::new(TermSize::new(100, 30), CellSize::new(8.0, 16.0));
     pty.write("bash --norc --noprofile -i\n").await;
     pump(&plain, &mut rx, 1200).await;
-    pty.write("source /tmp/berth_si.sh\n").await;
+    pty.write("source ~/berth-bench/berth_si.sh\n").await;
     pump(&plain, &mut rx, 1200).await;
     plain.drain_shell_events();
     let alt_before_plain = plain.alternate_screen();
@@ -97,7 +97,7 @@ async fn what_survives_tmux() {
     let alt_after_attach = through.alternate_screen();
     pty2.write("bash --norc --noprofile -i\n").await;
     pump(&through, &mut rx2, 1200).await;
-    pty2.write("source /tmp/berth_si.sh\n").await;
+    pty2.write("source ~/berth-bench/berth_si.sh\n").await;
     pump(&through, &mut rx2, 1200).await;
     through.drain_shell_events();
     pty2.write("(exit 7)\n").await;
@@ -124,7 +124,7 @@ async fn what_survives_tmux() {
     println!("=========================================================\n");
 
     let _ = conn.exec("tmux kill-session -t 'berth/abdiag'").await;
-    let _ = conn.exec("rm -f /tmp/berth_si.sh").await;
+    let _ = conn.exec("rm -f ~/berth-bench/berth_si.sh").await;
     conn.disconnect().await.unwrap();
 
     // The plain case is the control: if this fails, the snippet or the parser

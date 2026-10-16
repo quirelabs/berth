@@ -150,7 +150,8 @@ async fn vim_takes_and_releases_the_alternate_screen() {
     screen.until(&mut rx, "a shell prompt", has_prompt).await;
     assert!(!screen.terminal.alternate_screen());
 
-    pty.write("vim -u NONE /tmp/berth_vim_test.txt\n").await;
+    pty.write("mkdir -p ~/berth-bench && vim -u NONE ~/berth-bench/berth_vim_test.txt\n")
+        .await;
     screen
         .until(&mut rx, "vim to take the alternate screen", |t| {
             t.alternate_screen()
@@ -173,7 +174,7 @@ async fn vim_takes_and_releases_the_alternate_screen() {
         .await;
 
     pty.close().await;
-    let _ = conn.exec("rm -f /tmp/berth_vim_test.txt").await;
+    let _ = conn.exec("rm -f ~/berth-bench/berth_vim_test.txt").await;
     conn.disconnect().await.unwrap();
 }
 
@@ -392,7 +393,7 @@ async fn the_shell_integration_emits_all_four_markers_through_tmux() {
     let mut screen = Screen::new(100, 30);
 
     let push = format!(
-        "cat > /tmp/berth_shell_integration.sh <<'BERTH_EOF'\n{}\nBERTH_EOF",
+        "mkdir -p ~/berth-bench && cat > ~/berth-bench/berth_shell_integration.sh <<'BERTH_EOF'\n{}\nBERTH_EOF",
         berth_probe::SHELL_INTEGRATION
             .replace("\r\n", "\n")
             .trim_end()
@@ -401,7 +402,8 @@ async fn the_shell_integration_emits_all_four_markers_through_tmux() {
 
     pty.write("bash --norc --noprofile -i\n").await;
     settle(1000).await;
-    pty.write("source /tmp/berth_shell_integration.sh\n").await;
+    pty.write("source ~/berth-bench/berth_shell_integration.sh\n")
+        .await;
     settle(1000).await;
     screen.until(&mut rx, "the sourced shell", has_prompt).await;
     screen.drain(&mut rx, 400).await;
@@ -435,7 +437,9 @@ async fn the_shell_integration_emits_all_four_markers_through_tmux() {
 
     pty.write("exit\n").await;
     pty.close().await;
-    let _ = conn.exec("rm -f /tmp/berth_shell_integration.sh").await;
+    let _ = conn
+        .exec("rm -f ~/berth-bench/berth_shell_integration.sh")
+        .await;
     kill_session(&conn, &session).await;
     conn.disconnect().await.unwrap();
 }
