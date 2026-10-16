@@ -1224,8 +1224,9 @@ impl Workspace {
                     view.corners = gpui::Corners {
                         top_left: px(corner(outer[0] && !topped)),
                         top_right: px(corner(outer[1] && !topped)),
-                        bottom_right: px(corner(outer[2])),
-                        bottom_left: px(corner(outer[3])),
+                        // The pane's status line takes the bottom corners.
+                        bottom_right: px(0.0),
+                        bottom_left: px(0.0),
                     }
                 });
                 let first_bar = |bar: gpui::Div, first: bool| {
@@ -1248,37 +1249,69 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .overflow_hidden();
-                // In a split, each pane says what runs in it: the tab can
-                // only speak for one of them.
+                // In a split, each pane says what runs in it: its glyph, its
+                // program and directory, and its message on the right. One
+                // that needs the user is tinted gold (D53).
+                let look = self.pane_look(pane_id);
+                let program = self
+                    .pane_program(pane)
+                    .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                    .map(crate::programs::display_name);
+                let directory = pane
+                    .session
+                    .and_then(|session| self.local_sessions.iter().find(|i| i.id == session))
+                    .and_then(|info| info.cwd.as_deref())
+                    .map(|cwd| short_directory(cwd, dirs_home().as_deref()));
+                let needs_you =
+                    look.as_ref().map(|l| l.state) == Some(crate::glyph::State::NeedsYou);
                 if split {
-                    let program =
-                        crate::programs::lookup(self.pane_program(pane).unwrap_or_default());
-                    let title = self
-                        .pane_title(pane)
-                        .unwrap_or_else(|| pane.alias().to_string());
+                    let glyph = match &look {
+                        Some(look) => self.glyph_of(StatusKey::Pane(pane_id), look, true),
+                        None => self.pane_glyph(pane_id),
+                    };
+                    let message = look
+                        .as_ref()
+                        .and_then(|l| l.msg.clone())
+                        .unwrap_or_default();
+                    let named = [program.clone(), directory.clone()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     body = body.child(first_bar(
                         div()
                             .flex()
                             .flex_shrink_0()
                             .items_center()
-                            .gap(px(5.0))
-                            .px(px(6.0))
-                            .py(px(2.0))
+                            .gap(px(6.0))
+                            .px(px(8.0))
+                            .py(px(3.0))
                             .text_xs()
-                            .bg(hsla(theme.background))
+                            .font_family(self.chrome_font())
+                            .bg(hsla(if needs_you {
+                                crate::theme::mix(theme.background, theme.gold, NEEDS_YOU_TINT)
+                            } else {
+                                theme.background
+                            }))
                             .text_color(hsla(if focused {
                                 theme.text
                             } else {
                                 theme.text_muted
                             }))
+                            .child(crate::glyph::render(glyph, crate::glyph::SIDEBAR))
+                            .child(div().flex_shrink_0().child(if named.is_empty() {
+                                pane.alias().to_string()
+                            } else {
+                                named
+                            }))
                             .child(
-                                svg()
-                                    .path(program.icon)
-                                    .flex_shrink_0()
-                                    .size(px(PANE_ICON))
-                                    .text_color(hsla(theme.text_muted)),
-                            )
-                            .child(div().truncate().child(title)),
+                                div()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_right()
+                                    .text_color(hsla(theme.text_muted))
+                                    .child(message),
+                            ),
                         true,
                     ));
                 }
@@ -1311,15 +1344,44 @@ impl Workspace {
                     ));
                 }
                 // Unfocused panes in a split are dimmed, so the one taking
-                // keys needs no border to say so.
+                // keys needs no border to say so; how far is berth.toml's.
                 let dim = split && !focused;
+                let opacity = self.unfocused_opacity;
+                // Each pane's own status line: its state and for how long.
+                let line = match &look {
+                    Some(look) => format!(
+                        "{} {}",
+                        strings::state_word(look.state),
+                        strings::status_since(self.status_since(StatusKey::Pane(pane_id)))
+                    ),
+                    None => strings::state_word(crate::glyph::State::Idle).to_string(),
+                };
+                let tone = match look.as_ref().map(|l| l.state) {
+                    Some(crate::glyph::State::NeedsYou) => theme.gold,
+                    Some(crate::glyph::State::Error) => theme.rose_text,
+                    _ => theme.text_muted,
+                };
                 body.child(
                     div()
                         .flex()
                         .flex_1()
                         .min_h_0()
-                        .when(dim, |view| view.opacity(UNFOCUSED_OPACITY))
+                        .when(dim, |view| view.opacity(opacity))
                         .child(pane.view.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .text_xs()
+                        .font_family(self.chrome_font())
+                        .bg(hsla(theme.background))
+                        .rounded_bl(px(corner(outer[3])))
+                        .rounded_br(px(corner(outer[2])))
+                        .text_color(hsla(tone))
+                        .when(dim, |line| line.opacity(opacity))
+                        .child(line),
                 )
                 .into_any_element()
             }
@@ -1711,8 +1773,8 @@ const PILL: (f32, f32) = (2.0, 32.0);
 const PILL_OPACITY: f32 = 0.35;
 /// A pane corner facing the edge of the pane area.
 const PANE_RADIUS: f32 = 8.0;
-/// How far an unfocused pane in a split dims.
-const UNFOCUSED_OPACITY: f32 = 0.75;
+/// How much gold tints the header of a pane that needs the user.
+const NEEDS_YOU_TINT: f32 = 0.18;
 
 /// A pane corner's radius: rounded on the outside, square where panes meet.
 fn corner(outside: bool) -> f32 {
@@ -1745,9 +1807,6 @@ pub(super) fn local_label() -> String {
         name
     }
 }
-
-/// The size of a program's icon in a split pane's header.
-const PANE_ICON: f32 = 12.0;
 
 /// The longest message shown in a tooltip; a record's may run to 2 KB.
 const STATUS_MSG_SHOWN: usize = 160;

@@ -51,6 +51,17 @@ pub struct Settings {
     pub timeline_max_gb: f64,
     #[serde(default)]
     pub predictive_echo: PredictiveEcho,
+    /// How visible an unfocused pane in a split is, from 0.5 to 1.0
+    /// (D53), as Ghostty's unfocused split opacity.
+    #[serde(default = "default_unfocused_opacity")]
+    pub unfocused_opacity: f32,
+}
+
+/// The least and most an unfocused pane may be dimmed to.
+pub const UNFOCUSED_OPACITY: (f32, f32) = (0.5, 1.0);
+
+fn default_unfocused_opacity() -> f32 {
+    0.75
 }
 
 fn default_font() -> String {
@@ -75,6 +86,7 @@ impl Default for Settings {
             timeline_retention_days: default_retention_days(),
             timeline_max_gb: default_max_gb(),
             predictive_echo: PredictiveEcho::default(),
+            unfocused_opacity: default_unfocused_opacity(),
         }
     }
 }
@@ -222,6 +234,17 @@ impl BerthConfig {
         self.layouts.iter().find(|l| l.name == name)
     }
 
+    /// The unfocused pane opacity, kept within its bounds.
+    pub fn unfocused_opacity(&self) -> f32 {
+        let (least, most) = UNFOCUSED_OPACITY;
+        let value = self.settings.unfocused_opacity;
+        if value.is_finite() {
+            value.clamp(least, most)
+        } else {
+            default_unfocused_opacity()
+        }
+    }
+
     pub fn fanout(&self, name: &str) -> Option<&Fanout> {
         self.fanouts.iter().find(|f| f.name == name)
     }
@@ -327,6 +350,15 @@ hosts = ["web-1"]
             let text = format!("version = 1\n[accent]\nclaude = \"{bad}\"\n");
             assert!(BerthConfig::parse(&text).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn unfocused_opacity_is_kept_between_half_and_whole() {
+        let at = |text: &str| BerthConfig::parse(text).unwrap().unfocused_opacity();
+        assert_eq!(at("version = 1"), 0.75);
+        assert_eq!(at("version = 1\n[settings]\nunfocused_opacity = 0.6"), 0.6);
+        assert_eq!(at("version = 1\n[settings]\nunfocused_opacity = 0.1"), 0.5);
+        assert_eq!(at("version = 1\n[settings]\nunfocused_opacity = 3.0"), 1.0);
     }
 
     #[test]

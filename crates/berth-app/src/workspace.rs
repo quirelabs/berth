@@ -29,7 +29,6 @@ use crate::terminal_view::TerminalView;
 use crate::text_field::{Outcome, TextField};
 use crate::theme::{Theme, hsla};
 use crate::{runtime, session};
-use gpui::svg;
 
 /// How long output may go undrawn before the window is taken to be hidden,
 /// and how often that is checked.
@@ -416,8 +415,10 @@ pub struct Workspace {
     glyph_steady: std::collections::HashSet<StatusKey>,
     glyph_still: bool,
     glyph_timer: Option<gpui::Task<()>>,
-    /// The accents `berth.toml` gives programs, by name in lower case.
+    /// The accents `berth.toml` gives programs, by name in lower case, and
+    /// how far unfocused panes in a split dim.
     accents: std::collections::BTreeMap<String, [u8; 3]>,
+    unfocused_opacity: f32,
     /// The terminal's font, which the chrome is set in too (D53): found
     /// once, as a terminal finds it.
     chrome_font: Option<gpui::SharedString>,
@@ -540,24 +541,26 @@ impl StatusLook {
     }
 }
 
-/// The accents `berth.toml` gives programs (D53). Read once, at start; a
-/// file that does not parse is said in the log and changes nothing.
-fn load_accents() -> std::collections::BTreeMap<String, [u8; 3]> {
+/// What `berth.toml` sets that the window uses (D53): accents by program
+/// name in lower case, and how far unfocused panes dim. Read once, at
+/// start; a file that does not parse is said in the log and changes
+/// nothing.
+fn load_config() -> (std::collections::BTreeMap<String, [u8; 3]>, f32) {
     use berth_core::config::BerthConfig;
-    let Some(path) = BerthConfig::path() else {
-        return Default::default();
-    };
-    match BerthConfig::load_or_default(&path) {
-        Ok(config) => config
-            .accents
-            .keys()
-            .filter_map(|name| Some((name.to_ascii_lowercase(), config.accent(name)?)))
-            .collect(),
-        Err(error) => {
+    let config = match BerthConfig::path().map(|path| (BerthConfig::load_or_default(&path), path)) {
+        Some((Ok(config), _)) => config,
+        Some((Err(error), path)) => {
             tracing::warn!(path = %path.display(), %error, "berth.toml was not read");
-            Default::default()
+            BerthConfig::default()
         }
-    }
+        None => BerthConfig::default(),
+    };
+    let accents = config
+        .accents
+        .keys()
+        .filter_map(|name| Some((name.to_ascii_lowercase(), config.accent(name)?)))
+        .collect();
+    (accents, config.unfocused_opacity())
 }
 
 impl Workspace {
@@ -583,6 +586,7 @@ impl Workspace {
         };
         tracing::info!(hosts = hosts.len(), "loaded ssh config");
 
+        let (accents, unfocused_opacity) = load_config();
         let mut this = Self {
             hosts,
             warnings,
@@ -625,7 +629,8 @@ impl Workspace {
             glyph_steady: std::collections::HashSet::new(),
             glyph_still: false,
             glyph_timer: None,
-            accents: load_accents(),
+            accents,
+            unfocused_opacity,
             chrome_font: None,
             claude_reports: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
