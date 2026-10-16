@@ -378,6 +378,9 @@ impl Worker {
     pub fn refresh(&self) -> Option<v1::SessionInfo> {
         let pid = self.pty.foreground_pid()?;
         self.note_foreground(pid);
+        if self.pty.local_pid() == Some(pid) {
+            self.reassert_size();
+        }
         let now = Live {
             program: crate::local::program_of(pid),
             cwd: crate::local::cwd_of(pid).map(|d| d.to_string_lossy().to_string()),
@@ -428,6 +431,20 @@ impl Worker {
         if back_at_the_shell {
             self.status_change(crate::status::Records::program_ended);
         }
+    }
+
+    /// Tell the pty its size again. A shell that is still starting can
+    /// set the terminal back to the size it started at (seen with macOS's
+    /// bash 3.2 when input arrives before its first prompt), and nothing
+    /// would ever say so; so while the shell has the terminal, each look
+    /// sets it again. The same size sends no SIGWINCH, so this costs one
+    /// ioctl and changes nothing when nothing is wrong.
+    fn reassert_size(&self) {
+        let (cols, rows) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = self
+            .pty
+            .input
+            .try_send(crate::pty::PtyInput::Resize { cols, rows });
     }
 
     async fn resize(&self, cols: u16, rows: u16) {
@@ -965,6 +982,10 @@ mod tests {
     #[tokio::test]
     async fn attaching_resizes_the_session() {
         let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
+        // Typed only once the shell is up: input before its first prompt
+        // lets macOS's bash set the size back as it starts, which the
+        // worker mends at its next look (`reassert_size`), not at once.
+        until(&mut rx, "$ ").await;
         worker
             .handle(ToServer::Input {
                 session: 1,
