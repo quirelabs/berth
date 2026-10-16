@@ -432,8 +432,27 @@ impl Workspace {
             theme,
         );
 
+        let spoken = strings::status_label(
+            &name,
+            match &folder {
+                crate::sidebar::Folder::Host(alias) => Some(self.host_label(alias)),
+                crate::sidebar::Folder::Local => None,
+            }
+            .as_deref(),
+            program
+                .as_deref()
+                .or(look.as_ref().and_then(|(_, l)| l.program.as_deref()))
+                .map(crate::programs::display_name)
+                .as_deref(),
+            look.as_ref()
+                .map_or(crate::glyph::State::Idle, |(_, l)| l.state),
+            look.as_ref().and_then(|(_, l)| l.msg.as_deref()),
+            tab_number,
+        );
         let mut row = div()
             .id(("session", index))
+            .role(gpui::Role::ListItem)
+            .aria_label(spoken)
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -672,9 +691,23 @@ impl Workspace {
                 None => format!("{number} {title}").into(),
             };
 
+            let look = self.pane_look(id);
+            let spoken = strings::status_label(
+                &title,
+                host.as_deref(),
+                self.pane_program(pane)
+                    .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                    .map(crate::programs::display_name)
+                    .as_deref(),
+                look.as_ref().map_or(crate::glyph::State::Idle, |l| l.state),
+                look.as_ref().and_then(|l| l.msg.as_deref()),
+                Some(number),
+            );
             let bounds = self.tab_bounds.clone();
             let mut row = div()
                 .id(("tab", tab_id as usize))
+                .role(gpui::Role::Tab)
+                .aria_label(spoken)
                 .on_mouse_down(
                     gpui::MouseButton::Right,
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
@@ -2089,6 +2122,29 @@ mod tests {
         assert_eq!(
             strings::row_meta(Some(State::NeedsYou), s(7200), None),
             "2h"
+        );
+    }
+
+    /// A label reads "name, host, provider, state, message, tab N", leaving
+    /// out what is not known, so a screen reader hears the status without
+    /// the colour.
+    #[test]
+    fn a_label_says_who_where_what_and_which_tab() {
+        use crate::glyph::State;
+        assert_eq!(
+            strings::status_label(
+                "api",
+                Some("web-1"),
+                Some("claude"),
+                State::NeedsYou,
+                Some("Allow edit?"),
+                Some(2)
+            ),
+            "api, web-1, claude, needs you, Allow edit?, tab 2"
+        );
+        assert_eq!(
+            strings::status_label("zsh", None, None, State::Idle, Some("  "), None),
+            "zsh, idle"
         );
     }
 

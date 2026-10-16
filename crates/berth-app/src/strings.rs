@@ -135,6 +135,34 @@ pub fn status_tooltip(
     text
 }
 
+/// What a tab or a sidebar row is called for a screen reader (D53):
+/// "name, host, provider, state, message, tab N", leaving out what is not
+/// known. The message is the program's own words.
+pub fn status_label(
+    name: &str,
+    host: Option<&str>,
+    provider: Option<&str>,
+    state: crate::glyph::State,
+    msg: Option<&str>,
+    tab: Option<usize>,
+) -> String {
+    let tab = tab.map(|n| format!("tab {n}"));
+    [
+        Some(name),
+        host,
+        provider,
+        Some(state_word(state)),
+        msg,
+        tab.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// A status bar count, as a screen reader says it.
 pub fn status_count(state: crate::glyph::State, count: usize) -> String {
     use crate::glyph::State;
