@@ -86,21 +86,6 @@ pub fn changed_key(line: usize, fingerprint: &str) -> String {
 pub const FORWARD_BIND_TOOLTIP: &str = "While Berth holds this port, a plain ssh to the same host will report \
      \"bind: Address already in use\" for it. Harmless: the forward is already up.";
 
-/// Closing a tab and ending a session are different actions with different
-/// costs, so they never share a word.
-pub const TAB_DETACH: &str = "\u{00d7}";
-pub const TAB_DETACH_TOOLTIP: &str = "Detach. The connection closes and the tab goes, but the tmux \
-     session keeps running on the server with everything in it. Opening the \
-     host again re-attaches to the same shell.";
-/// A local shell has nothing running behind it once its window goes, so its
-/// control says close rather than detach. Same glyph, honest word.
-pub const TAB_CLOSE: &str = "\u{00d7}";
-pub const TAB_CLOSE_TOOLTIP: &str =
-    "Close. A local shell ends with its pane; there is nothing to reattach to.";
-pub const TAB_KILL: &str = "\u{25a0}";
-pub const TAB_KILL_TOOLTIP: &str = "End the session. Everything running in it stops and its scrollback \
-     is gone. Asks first.";
-
 /// Shown once, under an unsplit tab, because a split that nobody can find is
 /// a feature that does not exist.
 pub const SPLIT_HINT: &str =
@@ -153,6 +138,21 @@ pub fn status_tooltip(
         text.push_str(msg);
     }
     text
+}
+
+/// A tab's hover panel heading: its number, how many panes, and the key
+/// that reaches it.
+pub fn tab_panel_header(number: usize, panes: usize) -> String {
+    let panes = if panes == 1 {
+        "1 pane".to_string()
+    } else {
+        format!("{panes} panes")
+    };
+    if number <= 9 {
+        format!("tab {number} · {panes} · ⌘{number}")
+    } else {
+        format!("tab {number} · {panes}")
+    }
 }
 
 /// A status in a word or two, as the glyph shows it (D53).

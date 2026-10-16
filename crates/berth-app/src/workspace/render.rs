@@ -442,30 +442,50 @@ impl Workspace {
         row.into_any_element()
     }
 
-    /// One tab per open session.
-    ///
-    /// Each carries the host's own colour, and a state dot only while its
-    /// connection is not up, so a row of tabs answers "which host" and "is
-    /// anything wrong" without being read word by word. The close and kill actions are on the active tab only: an inactive
-    /// tab is a place to go, and putting a destructive control on it invites
-    /// hitting one while aiming for the other.
+    /// The tab strip (D53, "cursor"): each tab is its number, its glyph or
+    /// pane map, and its title, in the terminal's font. The selected one is
+    /// a pill of the terminal's background on the chrome; the others are
+    /// the same shape unfilled. A prod host keeps its warning bar and a
+    /// connection in trouble its dot; nothing else is on a tab. A tab can be
+    /// dragged along the strip, and resting on one opens its panel.
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let font = self.chrome_font();
         // One row that scrolls sideways rather than squeezing: a tab too narrow
-        // to read its host is worse than one you scroll to.
+        // to read is worse than one you scroll to.
         let mut strip = div()
             .id("tabs")
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(1.0))
-            .h(px(26.0))
-            .px(px(4.0))
+            .gap(px(TAB_GAP))
+            .h(px(TAB_BAR))
+            .px(px(GAP))
             .overflow_x_scroll()
-            .font_family(self.chrome_font())
-            .bg(hsla(theme.chrome));
+            .font_family(font.clone())
+            .bg(hsla(theme.chrome))
+            .on_drag_move(
+                cx.listener(|this, event: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                    let tab = event.drag(cx).tab;
+                    this.drag_tab_to(tab, f32::from(event.event.position.x), cx);
+                }),
+            )
+            .on_drop(cx.listener(|this, drag: &TabDrag, _, cx| this.drop_tab(drag.tab, cx)));
 
-        for (index, tab) in self.tabs.iter().enumerate() {
+        // Shown order: with a tab being dragged, it is held where it would
+        // land, as an empty space its own width.
+        let mut order: Vec<usize> = (0..self.tabs.len()).collect();
+        if let Some(dragging) = self.tab_dragging
+            && dragging.from < order.len()
+        {
+            let held = order.remove(dragging.from);
+            order.insert(dragging.to.min(order.len()), held);
+        }
+        let still = self.glyph_still;
+        for index in order {
+            let Some(tab) = self.tabs.get(index) else {
+                continue;
+            };
             // A tab is named by its focused pane, so a split tab still says
             // which host you are looking at rather than which one it started
             // as.
@@ -475,37 +495,22 @@ impl Workspace {
             let id = pane.id;
             let tab_id = tab.id;
             let focus = tab.focus;
+            let number = index + 1;
             let active = index == self.active;
-            let split_count = tab.root.panes().len();
+            let others = tab.root.panes().len().saturating_sub(1);
             let local = pane.is_local();
             let state = self.state_of(id);
-            // A named session says its name; an unnamed one is just its host,
-            // because `web-1/main` on every tab is noise.
-            let named = if !local && pane.slug != berth_core::session::DEFAULT_SLUG {
-                format!("{}/{}", self.host_label(pane.alias()), pane.slug)
-            } else if local {
-                pane.alias().to_string()
-            } else {
-                self.host_label(pane.alias())
-            };
-            // What the program says of itself comes first (D53): its status
-            // message, its terminal title, its name and directory. A remote
-            // session says its host before it, since the tab is also how
-            // one tells hosts apart.
-            let label = match self.pane_title(pane) {
-                Some(title) if local => title,
-                Some(title) => format!("{named}: {title}"),
-                None => named,
-            };
+            let host = (!local).then(|| self.host_label(pane.alias()));
+            let title = self.tab_title(pane);
             // The title turns gold when any pane in the tab needs the user,
-            // light rose on an error.
+            // light rose on an error in the focused one.
             let states: Vec<crate::glyph::State> = tab
                 .root
                 .panes()
                 .iter()
                 .filter_map(|pane| Some(self.pane_look(*pane)?.state))
                 .collect();
-            let title = if states.contains(&crate::glyph::State::NeedsYou) {
+            let tone = if states.contains(&crate::glyph::State::NeedsYou) {
                 Some(theme.gold)
             } else if self.pane_look(id).map(|look| look.state) == Some(crate::glyph::State::Error)
             {
@@ -514,7 +519,7 @@ impl Workspace {
                 None
             };
             // The focused pane's glyph, or a map of every pane's.
-            let glyph = if split_count > 1 {
+            let glyph = if others > 0 {
                 crate::glyph::render_map(crate::glyph::pane_map(&tab.root, |pane| {
                     self.pane_glyph(pane)
                 }))
@@ -529,11 +534,16 @@ impl Workspace {
                     crate::glyph::tab_size(cell, self.settings.font_size),
                 )
             };
+            let held = self.tab_dragging.is_some_and(|d| d.tab == tab_id);
+            let offset = self.tab_slides.get(&tab_id).map_or(0.0, |(start, at)| {
+                crate::tabs::slide(*start, at.elapsed(), still)
+            });
+            let dragged_label: gpui::SharedString = match &host {
+                Some(host) => format!("{number} {host}:{title}").into(),
+                None => format!("{number} {title}").into(),
+            };
 
-            // The cut name is still readable, on hover.
-            let full: Option<gpui::SharedString> =
-                (label.chars().count() > TAB_LABEL_CHARS).then(|| label.clone().into());
-
+            let bounds = self.tab_bounds.clone();
             let mut row = div()
                 .id(("tab", tab_id as usize))
                 .on_mouse_down(
@@ -543,21 +553,65 @@ impl Workspace {
                     }),
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.activate(tab_id, cx)))
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    // Renaming is a double click, as it is on a tab everywhere
+                    // else. A single click switches, and that must stay the
+                    // cheap one.
+                    if event.click_count() >= 2 {
+                        this.ask_rename(id, cx);
+                    } else {
+                        this.tab_panel = None;
+                        this.activate(tab_id, cx);
+                    }
+                }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.hover_tab(tab_id, *hovered, cx)
+                }))
+                .on_drag(
+                    TabDrag {
+                        tab: tab_id,
+                        label: dragged_label,
+                        theme,
+                        font: font.clone(),
+                    },
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
                 // A sidebar row dropped here splits into this tab.
                 .drag_over::<RowDrag>(move |style, _, _, _| style.bg(hsla(theme.border)))
                 .on_drop(cx.listener(move |this, drag: &RowDrag, _, cx| {
                     this.split_in(drag.target.clone(), Some(focus), cx)
                 }))
+                .relative()
+                .left(px(offset))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
-                .gap(px(5.0))
-                .px(px(6.0))
-                .py(px(2.0))
-                .rounded(px(3.0))
+                .gap(px(6.0))
+                .h(px(TAB_BAR - 2.0 * TAB_INSET))
+                .px(px(10.0))
+                .rounded(px(TAB_RADIUS))
                 .text_xs()
-                .hover(|t| t.bg(hsla(theme.border)))
+                .when(held, |row| row.opacity(0.0))
+                .when(active, |row| row.bg(hsla(theme.background)))
+                .when(!active, |row| row.hover(|t| t.bg(hsla(theme.surface))))
+                // Where it was drawn, for a drag's landing and the panel.
+                .child(
+                    gpui::canvas(
+                        move |at, _, _| {
+                            bounds.borrow_mut().insert(tab_id, at);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                // Its number, as ⌘N reaches it, muted like tmux's.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(hsla(theme.text_muted))
+                        .child(number.to_string()),
+                )
                 // Production says so on its tabs, the one colour that is not
                 // a program's status.
                 .when(pane.is_prod(), |row| {
@@ -573,47 +627,39 @@ impl Workspace {
                 .child(glyph)
                 .child(
                     div()
-                        .id(("label", tab_id as usize))
-                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                            // Renaming is a double click, as it is on a tab
-                            // everywhere else. A single click switches, and
-                            // that must stay the cheap one.
-                            if event.click_count() >= 2 {
-                                this.ask_rename(id, cx);
-                            }
-                        }))
-                        // Capped, so one long session name cannot push every
-                        // other tab off the strip.
+                        .flex()
+                        // Capped, so one long name cannot push every other
+                        // tab off the strip.
                         .max_w(px(TAB_LABEL_MAX))
-                        .truncate()
-                        .text_color(hsla(title.unwrap_or(if active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })))
-                        .child(label),
+                        .overflow_hidden()
+                        .when_some(host, |label, host| {
+                            label.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(hsla(theme.text_muted))
+                                    .child(format!("{host}:")),
+                            )
+                        })
+                        .child(
+                            div()
+                                .truncate()
+                                .text_color(hsla(tone.unwrap_or(if active {
+                                    theme.text
+                                } else {
+                                    theme.text_muted
+                                })))
+                                .child(title),
+                        ),
                 );
-
-            // Split tabs say how many panes they hold, since only one of them
-            // can be named.
-            if split_count > 1 {
+            // The other panes of a split, counted.
+            if others > 0 {
                 row = row.child(
                     div()
+                        .flex_shrink_0()
                         .text_color(hsla(theme.text_muted))
-                        .child(format!("{split_count}")),
+                        .child(format!("+{others}")),
                 );
             }
-
-            if let Some(full) = full {
-                row = row.tooltip(move |_, cx| {
-                    cx.new(|_| Note {
-                        text: full.clone(),
-                        theme,
-                    })
-                    .into()
-                });
-            }
-
             if shows_state(local, state) {
                 row = row.child(
                     div()
@@ -624,61 +670,137 @@ impl Workspace {
                         .bg(hsla(theme.state_colour(state))),
                 );
             }
-
-            if active {
-                row = row.bg(hsla(theme.background)).child(
-                    div()
-                        .id(("detach", tab_id as usize))
-                        .cursor_pointer()
-                        .px(px(2.0))
-                        .text_color(hsla(theme.text_muted))
-                        .hover(|b| b.text_color(hsla(theme.text)))
-                        .on_click(cx.listener(move |this, _, _, cx| this.close(id, cx)))
-                        .tooltip(move |_, cx| {
-                            cx.new(|_| Note {
-                                text: if local {
-                                    strings::TAB_CLOSE_TOOLTIP.into()
-                                } else {
-                                    strings::TAB_DETACH_TOOLTIP.into()
-                                },
-                                theme,
-                            })
-                            .into()
-                        })
-                        .child(if local {
-                            strings::TAB_CLOSE
-                        } else {
-                            strings::TAB_DETACH
-                        }),
-                );
-                // A local shell has no tmux session behind it, so closing it
-                // ends it. Offering a separate kill would confirm an action
-                // that does nothing the close did not already do.
-                if !local {
-                    row = row.child(
-                        div()
-                            .id(("kill", tab_id as usize))
-                            .cursor_pointer()
-                            .px(px(2.0))
-                            .text_color(hsla(theme.text_muted))
-                            .hover(|b| b.text_color(hsla(theme.warning)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.end_session(RowTarget::Pane(id), cx)
-                            }))
-                            .tooltip(move |_, cx| {
-                                cx.new(|_| Note {
-                                    text: strings::TAB_KILL_TOOLTIP.into(),
-                                    theme,
-                                })
-                                .into()
-                            })
-                            .child(strings::TAB_KILL),
-                    );
-                }
-            }
             strip = strip.child(row);
         }
         strip
+    }
+
+    /// What a tab is called: the focused pane's title as its program gives
+    /// it, else its session's name.
+    fn tab_title(&self, pane: &Pane) -> String {
+        self.pane_title(pane).unwrap_or_else(|| {
+            if pane.is_local() {
+                pane.alias().to_string()
+            } else {
+                pane.slug.clone()
+            }
+        })
+    }
+
+    /// A tab's hover panel (D53): flat, in the terminal's colours and font,
+    /// under its tab. A row per pane, chosen with the arrows and Enter or a
+    /// click.
+    fn tab_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let theme = self.theme;
+        let panel = self.tab_panel?;
+        let index = self.tabs.iter().position(|t| t.id == panel.tab)?;
+        let tab = self.tabs.get(index)?;
+        let at = self.tab_bounds.borrow().get(&panel.tab).copied()?;
+        let panes = tab.root.panes();
+        let mut list = div()
+            .id("tab-panel")
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.over_panel = *hovered;
+                if !*hovered && this.tab_hover.is_none() {
+                    this.close_panel_soon(cx);
+                }
+            }))
+            .flex()
+            .flex_col()
+            .min_w(px(280.0))
+            .max_w(px(480.0))
+            .p(px(6.0))
+            .gap(px(2.0))
+            .rounded(px(TAB_RADIUS))
+            .bg(hsla(theme.background))
+            .font_family(self.chrome_font())
+            .text_xs()
+            .text_color(hsla(theme.text))
+            .child(
+                div()
+                    .px(px(6.0))
+                    .pb(px(4.0))
+                    .text_color(hsla(theme.text_muted))
+                    .child(strings::tab_panel_header(index + 1, panes.len())),
+            );
+        for (row_index, pane_id) in panes.iter().enumerate() {
+            let Some(pane) = self.pane(*pane_id) else {
+                continue;
+            };
+            let pane_id = *pane_id;
+            let look = self.pane_look(pane_id);
+            let program = self
+                .pane_program(pane)
+                .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                .map(crate::programs::display_name);
+            let who = match (&program, pane.is_local()) {
+                (Some(program), true) => program.clone(),
+                (Some(program), false) => format!("{program} · {}", self.host_label(pane.alias())),
+                (None, true) => strings::LOCAL_ALIAS.to_string(),
+                (None, false) => self.host_label(pane.alias()),
+            };
+            let directory = pane
+                .session
+                .and_then(|session| self.local_sessions.iter().find(|i| i.id == session))
+                .and_then(|info| info.cwd.as_deref())
+                .map(|cwd| short_directory(cwd, dirs_home().as_deref()));
+            let what = [look.as_ref().and_then(|l| l.msg.clone()), directory]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let since = look
+                .as_ref()
+                .map(|_| strings::status_since(self.status_since(StatusKey::Pane(pane_id))))
+                .unwrap_or_default();
+            let chosen = row_index == panel.selected;
+            list = list.child(
+                div()
+                    .id(("tab-panel-row", pane_id as usize))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab_panel = None;
+                        this.focus_pane(pane_id, cx);
+                    }))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .when(chosen, |row| row.bg(hsla(theme.surface)))
+                    .hover(|row| row.bg(hsla(theme.surface)))
+                    .child(crate::glyph::render(
+                        self.pane_glyph(pane_id),
+                        crate::glyph::SIDEBAR,
+                    ))
+                    .child(div().flex_shrink_0().child(who))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_color(hsla(theme.text_muted))
+                            .child(what),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(hsla(theme.text_muted))
+                            .child(since),
+                    ),
+            );
+        }
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(gpui::point(
+                        at.origin.x,
+                        at.origin.y + at.size.height + px(4.0),
+                    ))
+                    .child(list),
+            )
+            .into_any_element(),
+        )
     }
 
     fn first_run(&self) -> impl IntoElement {
@@ -972,6 +1094,13 @@ impl Workspace {
             .left_0()
             .size_full()
             .track_focus(&self.modal_focus)
+            // A tab's hover panel takes the arrows, Enter and Escape before
+            // the terminal sees them.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.modal.is_none() && this.panel_key(&event.keystroke.key, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 let key = event.keystroke.key.as_str();
                 let m = &event.keystroke.modifiers;
@@ -1414,7 +1543,21 @@ impl Render for Workspace {
         self.tend_glyphs(cx);
         if !cx.has_active_drag() {
             self.dragging_divider = None;
+            // A tab drag that ended anywhere but the strip changes nothing.
+            if self.tab_dragging.take().is_some() {
+                self.tab_slides.clear();
+            }
         }
+        // Tabs sliding aside move every frame until they are in place.
+        let still = cx.reduce_motion();
+        self.tab_slides
+            .retain(|_, (_, at)| !still && at.elapsed() < crate::tabs::SLIDE);
+        self.slide_timer = (!self.tab_slides.is_empty()).then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SLIDE_FRAME).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
 
         // A modal takes the keyboard, so Escape and Enter reach it rather than
         // the terminal underneath.
@@ -1480,6 +1623,13 @@ impl Render for Workspace {
             // because they are about the window and not about the shell. Every
             // one is a Cmd chord, which berth-term already refuses to send to
             // the remote, so the shell loses nothing.
+            // A tab's hover panel takes the arrows, Enter and Escape before
+            // the terminal sees them.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.modal.is_none() && this.panel_key(&event.keystroke.key, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.modal.is_some() {
                     return;
@@ -1499,6 +1649,9 @@ impl Render for Workspace {
             .child(div().flex().flex_1().child(self.sidebar(cx)).child(pane))
             .child(self.status_bar());
 
+        if let Some(panel) = self.tab_panel(cx) {
+            root = root.child(panel);
+        }
         if self.menu.is_some() {
             root = root.child(self.menu_overlay(cx));
         }
@@ -1544,6 +1697,9 @@ fn menu_label(action: crate::menu::Action) -> &'static str {
     }
 }
 
+/// How often a sliding tab is redrawn: every frame at 120 Hz.
+const SLIDE_FRAME: Duration = Duration::from_micros(8_333);
+
 /// The gap between panes, and between the pane area and the window's
 /// edges (D53).
 const GAP: f32 = 6.0;
@@ -1564,10 +1720,12 @@ fn corner(outside: bool) -> f32 {
 }
 
 /// The widest a tab's name gets before it is cut with an ellipsis.
-const TAB_LABEL_MAX: f32 = 160.0;
-/// Roughly where that cut falls in the UI's small text, so only a name that
-/// was actually cut gets a tooltip.
-const TAB_LABEL_CHARS: usize = 22;
+const TAB_LABEL_MAX: f32 = 200.0;
+/// The tab bar's height, how far a tab sits in from its top and bottom, and
+/// a tab's corner (D53).
+const TAB_BAR: f32 = 34.0;
+const TAB_INSET: f32 = 5.0;
+const TAB_RADIUS: f32 = 7.0;
 
 /// How far a session sits in from its folder: past the caret and the dot.
 const INDENT: f32 = 36.0;
@@ -1690,6 +1848,13 @@ mod tests {
             ),
             "A program working: Building (for 5 s)"
         );
+    }
+
+    #[test]
+    fn a_tab_panel_says_its_tab_panes_and_key() {
+        assert_eq!(strings::tab_panel_header(2, 3), "tab 2 · 3 panes · ⌘2");
+        assert_eq!(strings::tab_panel_header(1, 1), "tab 1 · 1 pane · ⌘1");
+        assert_eq!(strings::tab_panel_header(12, 2), "tab 12 · 2 panes");
     }
 
     /// The tooltip gives the program's own words, as a report, named by its

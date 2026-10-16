@@ -80,6 +80,54 @@ impl Render for RowDrag {
     }
 }
 
+/// A tab being dragged, as it shows under the pointer.
+#[derive(Clone)]
+struct TabDrag {
+    tab: u64,
+    label: gpui::SharedString,
+    theme: Theme,
+    font: gpui::SharedString,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .rounded(px(7.0))
+            .bg(hsla(self.theme.background))
+            .font_family(self.font.clone())
+            .text_xs()
+            .text_color(hsla(self.theme.text))
+            .child(self.label.clone())
+    }
+}
+
+/// Where a dragged tab started and where it would land now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabDragging {
+    tab: u64,
+    from: usize,
+    to: usize,
+}
+
+/// A tab's hover panel: which tab, and which pane's row is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabPanel {
+    tab: u64,
+    selected: usize,
+}
+
+/// The space between two tabs on the strip.
+const TAB_GAP: f32 = 2.0;
+
+/// How long the pointer rests on a tab before its panel opens, and how long
+/// it may be off both tab and panel before the panel closes.
+const PANEL_AFTER: Duration = Duration::from_millis(350);
+const PANEL_GRACE: Duration = Duration::from_millis(150);
+
 /// A split's divider being dragged: which tab, and which split in it.
 #[derive(Clone)]
 struct DividerDrag {
@@ -342,6 +390,22 @@ pub struct Workspace {
     programs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// The divider being dragged, whose pill stays up while it is.
     dragging_divider: Option<(u64, crate::panes::Path)>,
+    /// Where each tab was last drawn, for a dragged tab's landing place and
+    /// the hover panel's anchor.
+    tab_bounds:
+        std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, gpui::Bounds<gpui::Pixels>>>>,
+    /// A tab being dragged: from where, to where it would land.
+    tab_dragging: Option<TabDragging>,
+    /// Tabs sliding aside for a dragged one: how far off their place each
+    /// began, and when.
+    tab_slides: std::collections::HashMap<u64, (f32, std::time::Instant)>,
+    slide_timer: Option<gpui::Task<()>>,
+    /// The tab under the pointer and since when, its hover panel once that
+    /// has lasted, and whether the pointer is over the panel.
+    tab_hover: Option<(u64, std::time::Instant)>,
+    tab_panel: Option<TabPanel>,
+    over_panel: bool,
+    hover_timer: Option<gpui::Task<()>>,
     /// The glyphs' clock (D53): what every blink keeps time by, what each
     /// pane or session shows and since when, the panes needing the user
     /// that have been focused since (their heartbeat is steady), whether
@@ -548,6 +612,14 @@ impl Workspace {
             hook_done_seen: std::collections::HashSet::new(),
             programs: std::collections::BTreeMap::new(),
             dragging_divider: None,
+            tab_bounds: Default::default(),
+            tab_dragging: None,
+            tab_slides: std::collections::HashMap::new(),
+            slide_timer: None,
+            tab_hover: None,
+            tab_panel: None,
+            over_panel: false,
+            hover_timer: None,
             glyph_epoch: std::time::Instant::now(),
             glyph_since: std::collections::HashMap::new(),
             glyph_steady: std::collections::HashSet::new(),
@@ -1918,6 +1990,138 @@ impl Workspace {
         } else {
             self.kill(alias, slug, pane, cx);
         }
+    }
+
+    /// A tab dragged along the strip: where it would land, and the others
+    /// sliding aside to make room, each from where it was.
+    fn drag_tab_to(&mut self, tab: u64, x: f32, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|t| t.id == tab) else {
+            return;
+        };
+        let (middles, width) = {
+            let bounds = self.tab_bounds.borrow();
+            let middles: Vec<f32> = self
+                .tabs
+                .iter()
+                .map(|t| {
+                    bounds
+                        .get(&t.id)
+                        .map(|b| f32::from(b.origin.x + b.size.width / 2.0))
+                        .unwrap_or_default()
+                })
+                .collect();
+            let width = bounds
+                .get(&tab)
+                .map(|b| f32::from(b.size.width) + TAB_GAP)
+                .unwrap_or_default();
+            (middles, width)
+        };
+        let to = crate::tabs::landing(&middles, from, x);
+        let was = self.tab_dragging.map_or(from, |d| d.to);
+        if to != was {
+            let place = |held: usize, at: usize| {
+                // A tab's place among the others with the dragged one held
+                // at `held`.
+                let others = if at > from { at - 1 } else { at };
+                if others >= held { others + 1 } else { others }
+            };
+            let now = std::time::Instant::now();
+            let still = cx.reduce_motion();
+            for (at, t) in self.tabs.iter().enumerate() {
+                if at == from {
+                    continue;
+                }
+                let moved = place(to, at) as f32 - place(was, at) as f32;
+                if moved != 0.0 && !still {
+                    self.tab_slides.insert(t.id, (-moved * width, now));
+                }
+            }
+        }
+        self.tab_dragging = Some(TabDragging { tab, from, to });
+        cx.notify();
+    }
+
+    /// The drop: the tab is where it was shown landing, at once.
+    fn drop_tab(&mut self, tab: u64, cx: &mut Context<Self>) {
+        if let Some(dragging) = self.tab_dragging.take()
+            && dragging.tab == tab
+        {
+            crate::tabs::reorder(&mut self.tabs, &mut self.active, dragging.from, dragging.to);
+        }
+        self.tab_slides.clear();
+        cx.notify();
+    }
+
+    /// The pointer came onto a tab or left it. Resting on one for a moment
+    /// opens its panel; leaving both tab and panel closes it.
+    fn hover_tab(&mut self, tab: u64, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            self.tab_hover = Some((tab, std::time::Instant::now()));
+            if self.tab_panel.is_some_and(|p| p.tab != tab) {
+                self.tab_panel = None;
+            }
+            self.hover_timer = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PANEL_AFTER).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.tab_hover.map(|(t, _)| t) == Some(tab) && this.tab_dragging.is_none() {
+                        let selected = this
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == tab)
+                            .and_then(|t| t.root.panes().iter().position(|p| *p == t.focus))
+                            .unwrap_or(0);
+                        this.tab_panel = Some(TabPanel { tab, selected });
+                        cx.notify();
+                    }
+                });
+            }));
+        } else if self.tab_hover.map(|(t, _)| t) == Some(tab) {
+            self.tab_hover = None;
+            self.close_panel_soon(cx);
+        }
+    }
+
+    /// Close the hover panel unless the pointer is back on its tab or on
+    /// the panel by then.
+    fn close_panel_soon(&mut self, cx: &mut Context<Self>) {
+        self.hover_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PANEL_GRACE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.tab_hover.is_none() && !this.over_panel && this.tab_panel.take().is_some() {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// A key while a hover panel is open: the arrows choose a pane, Enter
+    /// focuses it, Escape closes. True if the key was the panel's.
+    fn panel_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(panel) = self.tab_panel else {
+            return false;
+        };
+        let panes = self
+            .tabs
+            .iter()
+            .find(|t| t.id == panel.tab)
+            .map(|t| t.root.panes())
+            .unwrap_or_default();
+        match key {
+            "down" | "up" => {
+                let selected = crate::tabs::step(panel.selected, panes.len(), key == "down");
+                self.tab_panel = Some(TabPanel { selected, ..panel });
+            }
+            "enter" => {
+                self.tab_panel = None;
+                if let Some(pane) = panes.get(panel.selected) {
+                    self.focus_pane(*pane, cx);
+                }
+            }
+            "escape" => self.tab_panel = None,
+            _ => return false,
+        }
+        cx.notify();
+        true
     }
 
     /// Move a split's divider to where the pointer is, as a share of the
