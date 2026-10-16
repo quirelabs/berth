@@ -17,6 +17,7 @@ mod servers;
 mod session;
 mod sidebar;
 mod strings;
+mod tabs;
 mod terminal_style;
 mod terminal_view;
 mod text_field;

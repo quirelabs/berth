@@ -46,10 +46,29 @@ pub enum Command {
     /// Quit Berth. Remote sessions keep running in tmux and local tabs are
     /// saved on the way out (D46).
     Quit,
+    /// A new tab, with a fresh session on the focused pane's host, or on this
+    /// machine.
+    NewTab,
+    /// Go to tab N, 1 to 9; 9 is the last.
+    SelectTab(usize),
+    /// End the focused pane's session: Cmd+Shift+Backspace, Ctrl+Shift+
+    /// Backspace on Windows and Linux. Not one key from Cmd+W, which only
+    /// detaches; it asks first while an agent is working.
+    EndSession,
 }
 
 pub fn command(keystroke: &Keystroke) -> Option<Command> {
     let m = &keystroke.modifiers;
+    // The one chord that is Control on the other platforms, since Cmd is
+    // the Windows key there.
+    let primary = if cfg!(target_os = "macos") {
+        m.platform && !m.control
+    } else {
+        m.control && !m.platform
+    };
+    if keystroke.key == "backspace" && m.shift && !m.alt && primary {
+        return Some(Command::EndSession);
+    }
     if !m.platform || m.control || m.alt {
         return None;
     }
@@ -67,6 +86,10 @@ pub fn command(keystroke: &Keystroke) -> Option<Command> {
         ("-", _) => Some(Command::FontSmaller),
         ("0", false) => Some(Command::FontReset),
         ("q", false) => Some(Command::Quit),
+        ("t", false) => Some(Command::NewTab),
+        (digit, false) if digit.len() == 1 && ("1"..="9").contains(&digit) => {
+            digit.parse().ok().map(Command::SelectTab)
+        }
         _ => None,
     }
 }
@@ -538,6 +561,25 @@ mod tests {
     }
 
     /// Copy and paste keep Cmd+C and Cmd+V; a command must not shadow them.
+    #[test]
+    fn tabs_have_their_numbers_and_ending_is_far_from_closing() {
+        assert_eq!(command(&cmd("t", false)), Some(Command::NewTab));
+        assert_eq!(command(&cmd("1", false)), Some(Command::SelectTab(1)));
+        assert_eq!(command(&cmd("9", false)), Some(Command::SelectTab(9)));
+        assert_eq!(command(&cmd("0", false)), Some(Command::FontReset));
+        assert_eq!(command(&cmd("backspace", false)), None);
+        let end = if cfg!(target_os = "macos") {
+            cmd("backspace", true)
+        } else {
+            let mut k = cmd("backspace", true);
+            k.modifiers.platform = false;
+            k.modifiers.control = true;
+            k
+        };
+        assert_eq!(command(&end), Some(Command::EndSession));
+        assert_eq!(command(&cmd("w", false)), Some(Command::ClosePane));
+    }
+
     #[test]
     fn commands_and_the_clipboard_do_not_overlap() {
         for key in ["c", "v"] {

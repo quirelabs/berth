@@ -56,6 +56,30 @@ impl Render for Note {
     }
 }
 
+/// A sidebar row being dragged: what it names, and how it looks under the
+/// pointer.
+#[derive(Clone)]
+struct RowDrag {
+    target: RowTarget,
+    name: gpui::SharedString,
+    theme: Theme,
+}
+
+impl Render for RowDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(2.0))
+            .rounded(px(3.0))
+            .bg(hsla(self.theme.surface))
+            .border_1()
+            .border_color(hsla(self.theme.border))
+            .text_xs()
+            .text_color(hsla(self.theme.text))
+            .child(self.name.clone())
+    }
+}
+
 /// What the sidebar shows for one host.
 #[derive(Debug, Clone)]
 pub enum HostStatus {
@@ -183,15 +207,15 @@ enum Place {
     Beside { pane: u64, axis: Axis },
 }
 
-/// A tab: a tree of panes, and which one has the keyboard.
-///
-/// The spec called for one tab per session. With splits that is the same thing
-/// read a level up: a tab holds a tree, an unsplit tab is one session, and the
-/// tab's label follows whichever pane is focused.
-struct Tab {
-    id: u64,
-    root: Node,
-    focus: u64,
+use crate::tabs::Tab;
+
+/// A session as a sidebar row names it: shown in a pane, or running with no
+/// pane, on a host or on the local server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowTarget {
+    Pane(u64),
+    Remote { alias: String, slug: String },
+    Local(u64),
 }
 
 /// A host key the user is being asked about.
@@ -755,7 +779,7 @@ impl Workspace {
 
     /// The tab holding a pane, by index.
     fn tab_of(&self, pane: u64) -> Option<usize> {
-        self.tabs.iter().position(|t| t.root.contains(pane))
+        crate::tabs::tab_of(&self.tabs, pane)
     }
 
     /// A pane already showing this host, if there is one.
@@ -966,8 +990,8 @@ impl Workspace {
         .detach();
     }
 
-    /// Show a local server session that no tab shows, in a tab of its own.
-    fn attach_local(&mut self, session_id: u64, cx: &mut Context<Self>) {
+    /// Show a local server session that no tab shows, where `place` says.
+    fn attach_local(&mut self, session_id: u64, place: Place, cx: &mut Context<Self>) {
         if let Some(pane) = self.panes.iter().find(|p| p.session == Some(session_id)) {
             let id = pane.id;
             self.focus_pane(id, cx);
@@ -999,7 +1023,7 @@ impl Workspace {
                         local.pty,
                         local.events,
                         installed,
-                        Place::Tab { show: true },
+                        place,
                         cx,
                     );
                     if let Some(pane) = this.pane_mut(id) {
@@ -1277,36 +1301,27 @@ impl Workspace {
             direct: None,
         });
 
-        match place {
-            Place::Tab { show } => {
-                self.next_tab_id += 1;
-                self.tabs.push(Tab {
-                    id: self.next_tab_id,
-                    root: Node::leaf(id),
-                    focus: id,
-                });
-                // The first session to land is shown whether or not it was
-                // asked for by name. Sitting on the first-run screen with a
-                // live session behind it would be wrong, and whichever host
-                // answered first is the one the user can type into soonest.
-                if show || self.tabs.len() == 1 {
-                    self.active = self.tabs.len() - 1;
-                }
-            }
+        // The first session to land is shown whether or not it was asked for
+        // by name. Sitting on the first-run screen with a live session behind
+        // it would be wrong, and whichever host answered first is the one the
+        // user can type into soonest. A split takes the keyboard, as in every
+        // other splitting editor: you split in order to type in the new one.
+        // If the pane being split went away while this was opening, the
+        // session is real, so it gets a tab of its own rather than being
+        // dropped on the floor.
+        let beside = match place {
             Place::Beside { pane, axis } => {
-                let Some(index) = self.tab_of(pane) else {
-                    // The pane being split went away while this was opening.
-                    // The session is real, so it keeps its place in the list
-                    // rather than being dropped on the floor.
-                    return id;
-                };
-                let tab = &mut self.tabs[index];
-                tab.root.split(pane, axis, id);
-                // The new pane takes the keyboard, as it does in every other
-                // splitting editor: you split in order to type in the new one.
-                tab.focus = id;
-                self.active = index;
+                crate::tabs::put_beside(&mut self.tabs, &mut self.active, id, pane, axis)
             }
+            Place::Tab { .. } => false,
+        };
+        if !beside {
+            let show = match place {
+                Place::Tab { show } => show,
+                Place::Beside { .. } => true,
+            };
+            self.next_tab_id += 1;
+            crate::tabs::open_tab(&mut self.tabs, &mut self.active, self.next_tab_id, id, show);
         }
 
         cx.notify();
@@ -1539,7 +1554,7 @@ impl Workspace {
             self.focus_pane(pane, cx);
             return;
         }
-        self.attach_new(alias, slug, cx);
+        self.attach_new(alias, slug, Place::Tab { show: true }, cx);
     }
 
     /// A fresh terminal in a folder, in a tab of its own.
@@ -1551,14 +1566,15 @@ impl Workspace {
             crate::sidebar::Folder::Local => self.open_local(Place::Tab { show: true }, cx),
             crate::sidebar::Folder::Host(alias) => {
                 let slug = self.free_slug(&alias);
-                self.attach_new(alias, slug, cx);
+                self.attach_new(alias, slug, Place::Tab { show: true }, cx);
             }
         }
     }
 
-    /// Attach a named session in a new tab, on the host's connection if it has
-    /// one and through a normal connect if it does not.
-    fn attach_new(&mut self, alias: String, slug: String, cx: &mut Context<Self>) {
+    /// Attach a named session where `place` says, on the host's connection if
+    /// it has one and through a normal connect, in a tab of its own, if it
+    /// does not.
+    fn attach_new(&mut self, alias: String, slug: String, place: Place, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
             return;
         };
@@ -1575,7 +1591,6 @@ impl Workspace {
             return;
         };
         tracing::info!(%alias, %slug, "attaching from the sidebar");
-        let place = Place::Tab { show: true };
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
             let installed = cx.update(|cx| cx.text_system().all_font_names());
@@ -1628,6 +1643,183 @@ impl Workspace {
         }
     }
 
+    /// A new tab with a fresh session on the focused pane's host, or on this
+    /// machine when nothing is focused or it is local.
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let folder = match self.focused().and_then(|p| p.host.as_ref()) {
+            Some(host) => crate::sidebar::Folder::Host(host.alias.clone()),
+            None => crate::sidebar::Folder::Local,
+        };
+        self.new_terminal(folder, cx);
+    }
+
+    /// Go to tab N (⌘N).
+    fn select_tab(&mut self, n: usize, cx: &mut Context<Self>) {
+        if let Some(index) = crate::tabs::numbered(&self.tabs, n) {
+            self.active = index;
+            self.wake_active(cx);
+            cx.notify();
+        }
+    }
+
+    /// The pane a row's session is shown in, if any.
+    fn shown_in(&self, target: &RowTarget) -> Option<u64> {
+        match target {
+            RowTarget::Pane(id) => self.pane(*id).map(|p| p.id),
+            RowTarget::Remote { alias, slug } => self
+                .panes
+                .iter()
+                .find(|p| p.host.as_ref().is_some_and(|h| &h.alias == alias) && &p.slug == slug)
+                .map(|p| p.id),
+            RowTarget::Local(session) => self
+                .panes
+                .iter()
+                .find(|p| p.session == Some(*session))
+                .map(|p| p.id),
+        }
+    }
+
+    /// A click on a row: its tab and pane, or a new tab if no pane shows it.
+    fn click_row(&mut self, target: RowTarget, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        if let Some(pane) = self.shown_in(&target) {
+            self.focus_pane(pane, cx);
+            return;
+        }
+        let place = Place::Tab { show: true };
+        match target {
+            RowTarget::Pane(_) => {}
+            RowTarget::Remote { alias, slug } => self.attach_new(alias, slug, place, cx),
+            RowTarget::Local(session) => self.attach_local(session, place, cx),
+        }
+    }
+
+    /// ⌥-click on a row, or a row dropped on a tab or a pane: split its
+    /// session in beside `beside` (the active tab's focused pane when none is
+    /// given), moving it if another pane shows it. A session is only ever in
+    /// one pane, since a terminal has one size.
+    fn split_in(&mut self, target: RowTarget, beside: Option<u64>, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(beside) = beside.or_else(|| self.tab().map(|t| t.focus)) else {
+            return self.click_row(target, cx);
+        };
+        let axis = Axis::Horizontal;
+        match self.shown_in(&target) {
+            Some(pane) if pane == beside => self.focus_pane(pane, cx),
+            Some(pane) => {
+                if crate::tabs::put_beside(&mut self.tabs, &mut self.active, pane, beside, axis) {
+                    tracing::info!(pane, beside, "moved a session into a tab");
+                    self.wake_active(cx);
+                    cx.notify();
+                }
+            }
+            None => {
+                let place = Place::Beside { pane: beside, axis };
+                match target {
+                    RowTarget::Pane(_) => {}
+                    RowTarget::Remote { alias, slug } => self.attach_new(alias, slug, place, cx),
+                    RowTarget::Local(session) => self.attach_local(session, place, cx),
+                }
+            }
+        }
+    }
+
+    /// Whether an agent may be working in a session: its status says so, or
+    /// an agent is there and nothing says what it is doing.
+    fn agent_working(&self, target: &RowTarget) -> bool {
+        use crate::otter::Pose;
+        let pane = self.shown_in(target);
+        let look = match (pane, target) {
+            (Some(pane), _) => self.pane_otter(pane),
+            (None, RowTarget::Local(session)) => self.session_otter(*session),
+            (None, _) => None,
+        };
+        if let Some(look) = look {
+            return look.pose == Pose::Working;
+        }
+        let remote = match (pane.and_then(|p| self.pane(p)), target) {
+            (Some(pane), _) => pane
+                .host
+                .as_ref()
+                .map(|h| (h.alias.clone(), pane.slug.clone())),
+            (None, RowTarget::Remote { alias, slug }) => Some((alias.clone(), slug.clone())),
+            _ => None,
+        };
+        let local = match (pane.and_then(|p| self.pane(p)), target) {
+            (Some(pane), _) => pane.session,
+            (None, RowTarget::Local(session)) => Some(*session),
+            _ => None,
+        };
+        if let Some((alias, slug)) = remote {
+            return self
+                .running
+                .get(&alias)
+                .and_then(|listed| listed.get(&slug))
+                .copied()
+                .unwrap_or(false);
+        }
+        local
+            .and_then(|session| self.local_sessions.iter().find(|s| s.id == session))
+            .and_then(|info| info.claude.as_ref())
+            .is_some_and(|c| c.state == berth_proto::v1::ClaudeState::Working)
+    }
+
+    /// End a session: its own action, never a close. Asked first while an
+    /// agent is working in it; otherwise ended at once.
+    fn end_session(&mut self, target: RowTarget, cx: &mut Context<Self>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let pane = self.shown_in(&target);
+        let ask = self.agent_working(&target);
+        let local = match (pane.and_then(|p| self.pane(p)), &target) {
+            (Some(p), _) => p.session,
+            (None, RowTarget::Local(session)) => Some(*session),
+            _ => None,
+        };
+        if let Some(session) = local {
+            if ask {
+                self.ask_kill_local(session, pane, cx);
+            } else {
+                self.kill_local(&session.to_string(), pane, cx);
+            }
+            return;
+        }
+        let named = match (pane.and_then(|p| self.pane(p)), &target) {
+            (Some(p), _) => p.host.as_ref().map(|h| (h.alias.clone(), p.slug.clone())),
+            (None, RowTarget::Remote { alias, slug }) => Some((alias.clone(), slug.clone())),
+            _ => None,
+        };
+        let Some((alias, slug)) = named else {
+            // A shell of its own with no session behind it: closing it ends
+            // it, and there is nothing else to end.
+            if let Some(pane) = pane {
+                self.close(pane, cx);
+            }
+            return;
+        };
+        if ask {
+            let session = berth_core::session::Session::new(slug.clone(), 80, 24).tmux_name();
+            self.modal = Some(Modal::Kill {
+                pane,
+                alias,
+                slug,
+                session,
+            });
+            self.modal_focused = false;
+            cx.notify();
+        } else {
+            self.kill(alias, slug, pane, cx);
+        }
+    }
+
     /// Act on a workspace key chord.
     fn run(&mut self, command: crate::input::Command, cx: &mut Context<Self>) {
         use crate::input::Command;
@@ -1650,6 +1842,13 @@ impl Workspace {
             // There was no way to quit but closing the window. Quitting runs
             // the quit hooks, which is where local tabs are saved.
             Command::Quit => cx.quit(),
+            Command::NewTab => self.new_tab(cx),
+            Command::SelectTab(n) => self.select_tab(n, cx),
+            Command::EndSession => {
+                if let Some(pane) = self.focused().map(|p| p.id) {
+                    self.end_session(RowTarget::Pane(pane), cx);
+                }
+            }
         }
     }
 
@@ -1756,19 +1955,7 @@ impl Workspace {
 
         // Take the pane out of its tab, collapsing the split it was half of.
         // A tab with nothing left goes with it.
-        if let Some(at) = self.tabs.iter().position(|t| t.root.contains(id)) {
-            let tab = self.tabs.remove(at);
-            if let Some(root) = tab.root.without(id) {
-                let focus = if tab.focus == id {
-                    root.panes().first().copied().unwrap_or(tab.focus)
-                } else {
-                    tab.focus
-                };
-                self.tabs.insert(at, Tab { root, focus, ..tab });
-            } else if self.active > at {
-                self.active -= 1;
-            }
-        }
+        crate::tabs::remove_pane(&mut self.tabs, &mut self.active, id);
 
         if self.sessions_on(&alias) == 0
             && let Some(mut conn) = self.conns.remove(&alias)
@@ -1811,25 +1998,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Ask before ending a session. Never kill directly from a click.
-    fn ask_kill(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(session) = self.pane(id).and_then(|p| p.session) {
-            self.ask_kill_local(session, Some(id), cx);
-            return;
-        }
-        let Some(pane) = self.pane(id).filter(|p| !p.is_local()) else {
-            return;
-        };
-        self.modal = Some(Modal::Kill {
-            pane: Some(id),
-            alias: pane.alias().to_string(),
-            slug: pane.slug.clone(),
-            session: pane.tmux_name(),
-        });
-        self.modal_focused = false;
-        cx.notify();
-    }
-
     /// Ask before ending a local server session (D50), shown or not.
     fn ask_kill_local(&mut self, session: u64, pane: Option<u64>, cx: &mut Context<Self>) {
         self.modal = Some(Modal::Kill {
@@ -1842,19 +2010,6 @@ impl Workspace {
                 .find(|(id, _)| *id == session)
                 .map(|(_, name)| name)
                 .unwrap_or_else(|| format!("{} #{session}", render::local_label())),
-        });
-        self.modal_focused = false;
-        cx.notify();
-    }
-
-    /// Ask before ending a session that has no tab.
-    fn ask_kill_detached(&mut self, alias: String, slug: String, cx: &mut Context<Self>) {
-        let session = berth_core::session::Session::new(slug.clone(), 80, 24).tmux_name();
-        self.modal = Some(Modal::Kill {
-            pane: None,
-            alias,
-            slug,
-            session,
         });
         self.modal_focused = false;
         cx.notify();
@@ -2069,14 +2224,16 @@ impl Workspace {
         match (action, target) {
             (Action::Rename, Target::Pane(id)) => self.ask_rename(id, cx),
             (Action::Detach | Action::Close, Target::Pane(id)) => self.close(id, cx),
-            (Action::EndSession, Target::Pane(id)) => self.ask_kill(id, cx),
+            (Action::EndSession, Target::Pane(id)) => self.end_session(RowTarget::Pane(id), cx),
             (Action::EndSession, Target::Detached { alias, slug }) => {
-                self.ask_kill_detached(alias, slug, cx)
+                self.end_session(RowTarget::Remote { alias, slug }, cx)
             }
             (Action::Open, Target::Detached { alias, slug }) => self.open_session(alias, slug, cx),
-            (Action::Open, Target::LocalDetached { session }) => self.attach_local(session, cx),
+            (Action::Open, Target::LocalDetached { session }) => {
+                self.attach_local(session, Place::Tab { show: true }, cx)
+            }
             (Action::EndSession, Target::LocalDetached { session }) => {
-                self.ask_kill_local(session, None, cx)
+                self.end_session(RowTarget::Local(session), cx)
             }
             (Action::NewTerminal, Target::Local) => {
                 self.new_terminal(crate::sidebar::Folder::Local, cx)

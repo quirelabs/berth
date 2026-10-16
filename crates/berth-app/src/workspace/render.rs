@@ -335,7 +335,6 @@ impl Workspace {
         let focused = pane.is_some() && self.focused().map(|p| p.id) == pane;
         let detached = pane.is_none();
 
-        let slug = name.clone();
         // A local server session no tab shows, found again by the name the
         // tree gave it.
         let local_session = self
@@ -352,6 +351,14 @@ impl Workspace {
             }
         }
         .map(str::to_string);
+        let target = match (&folder, pane) {
+            (_, Some(pane)) => Some(RowTarget::Pane(pane)),
+            (crate::sidebar::Folder::Host(alias), None) => Some(RowTarget::Remote {
+                alias: alias.clone(),
+                slug: name.clone(),
+            }),
+            (crate::sidebar::Folder::Local, None) => local_session.map(RowTarget::Local),
+        };
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
             (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {
@@ -373,17 +380,26 @@ impl Workspace {
                 }),
             )
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| match (&folder, pane) {
-                (_, Some(pane)) => this.focus_pane(pane, cx),
-                (crate::sidebar::Folder::Host(alias), None) => {
-                    this.open_session(alias.clone(), slug.clone(), cx)
-                }
-                (crate::sidebar::Folder::Local, None) => {
-                    if let Some(session) = local_session {
-                        this.attach_local(session, cx)
+            // A click shows the session; ⌥-click splits it into this tab; a
+            // drag onto a tab or a pane splits it in there.
+            .when_some(target.clone(), |row, target| {
+                let clicked = target.clone();
+                row.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    if event.modifiers().alt {
+                        this.split_in(clicked.clone(), None, cx);
+                    } else {
+                        this.click_row(clicked.clone(), cx);
                     }
-                }
-            }))
+                }))
+                .on_drag(
+                    RowDrag {
+                        target,
+                        name: name.clone().into(),
+                        theme,
+                    },
+                    |drag, _, _, cx| cx.new(|_| drag.clone()),
+                )
+            })
             .hover(|row| row.bg(hsla(theme.border)))
             .flex()
             .items_center()
@@ -464,6 +480,7 @@ impl Workspace {
             };
             let id = pane.id;
             let tab_id = tab.id;
+            let focus = tab.focus;
             let active = index == self.active;
             let colour = theme.host_colour(pane.alias(), pane.is_prod());
             let split_count = tab.root.panes().len();
@@ -504,6 +521,11 @@ impl Workspace {
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.activate(tab_id, cx)))
+                // A sidebar row dropped here splits into this tab.
+                .drag_over::<RowDrag>(move |style, _, _, _| style.bg(hsla(theme.border)))
+                .on_drop(cx.listener(move |this, drag: &RowDrag, _, cx| {
+                    this.split_in(drag.target.clone(), Some(focus), cx)
+                }))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -627,7 +649,9 @@ impl Workspace {
                             .px(px(2.0))
                             .text_color(hsla(theme.text_muted))
                             .hover(|b| b.text_color(hsla(theme.warning)))
-                            .on_click(cx.listener(move |this, _, _, cx| this.ask_kill(id, cx)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.end_session(RowTarget::Pane(id), cx)
+                            }))
                             .tooltip(move |_, cx| {
                                 cx.new(|_| Note {
                                     text: strings::TAB_KILL_TOOLTIP.into(),
@@ -1044,6 +1068,10 @@ impl Workspace {
                         gpui::MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.focus_pane(pane_id, cx)),
                     )
+                    // A sidebar row dropped on a pane splits in beside it.
+                    .on_drop(cx.listener(move |this, drag: &RowDrag, _, cx| {
+                        this.split_in(drag.target.clone(), Some(pane_id), cx)
+                    }))
                     .flex()
                     .flex_col()
                     .flex_1()
