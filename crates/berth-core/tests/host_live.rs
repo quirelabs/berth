@@ -71,9 +71,30 @@ async fn the_server_installs_on_a_real_host_and_is_removed() {
     let Some(connection) = connect().await else {
         return;
     };
+    // The builds as CI made them, each with a gzip copy made here, as the
+    // bundle carries them: what goes up the wire is the compressed one,
+    // unpacked on the host, so that path runs against a real host too.
+    let packed = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("berth-server-") || name.ends_with(".sha256") {
+            continue;
+        }
+        std::fs::copy(&path, packed.path().join(name)).unwrap();
+        let gz = std::process::Command::new("gzip")
+            .args(["-9", "-c"])
+            .arg(&path)
+            .output()
+            .expect("gzip");
+        assert!(gz.status.success());
+        std::fs::write(packed.path().join(format!("{name}.gz")), gz.stdout).unwrap();
+    }
     let servers = Servers {
-        manifest: Manifest::of_dir(dir.as_ref()).expect("the server builds"),
-        dir: dir.into(),
+        manifest: Manifest::of_dir(packed.path()).expect("the server builds"),
+        dir: packed.path().into(),
     };
     let home = probe(&connection, None).await.unwrap().home;
     assert!(home.starts_with('/') && home.len() > 1, "{home}");
@@ -99,6 +120,8 @@ async fn the_server_installs_on_a_real_host_and_is_removed() {
         payload.bytes.len(),
         payload.packed
     );
+    assert!(found.gzip, "the host has gzip");
+    assert!(payload.packed, "the compressed build goes up");
     let started = std::time::Instant::now();
     let done = install(&connection, &plan, &payload)
         .await
