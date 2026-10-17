@@ -208,7 +208,9 @@ struct Pane {
     /// A local session from a previous run whose tab has not been shown yet,
     /// so its shell has not started (D46).
     restored: Option<saving::Restored>,
-    /// The local server's session this pane shows (D50).
+    /// The server session this pane shows, on its host's server or this
+    /// machine's (D50, D55): an id on that machine's server only, so read
+    /// through [`Pane::server_session`].
     session: Option<u64>,
     /// Why this local pane runs a shell of its own instead, shown on it: it
     /// will not survive quitting (D50).
@@ -233,6 +235,12 @@ impl Pane {
 
     fn is_prod(&self) -> bool {
         self.host.as_ref().is_some_and(|h| h.is_prod())
+    }
+
+    /// The server session this pane shows, by its machine and its id there.
+    fn server_session(&self) -> Option<SessionRef> {
+        self.session
+            .map(|id| SessionRef::on(self.host.as_ref().map(|h| h.alias.as_str()), id))
     }
 
     fn tmux_name(&self) -> String {
@@ -266,6 +274,7 @@ enum Place {
     Into(u64),
 }
 
+use crate::machine::{Machine, SessionRef};
 use crate::tabs::Tab;
 
 /// A session as a sidebar row names it: shown in a pane, or running with no
@@ -274,7 +283,7 @@ use crate::tabs::Tab;
 enum RowTarget {
     Pane(u64),
     Remote { alias: String, slug: String },
-    Local(u64),
+    Session(SessionRef),
 }
 
 /// A host key the user is being asked about.
@@ -300,8 +309,10 @@ enum Modal {
     Kill {
         /// The pane showing it, if it has one. A detached session has none.
         pane: Option<u64>,
+        /// What is ended, and how.
+        ending: Ending,
+        /// Where it runs and what it is called, as the dialog says them.
         alias: String,
-        slug: String,
         session: String,
     },
     /// Renaming a session. The tmux name moves with the label, or a reattach
@@ -321,6 +332,13 @@ enum Modal {
         alias: String,
         plan: Box<berth_core::remote::Plan>,
     },
+}
+
+/// A session to end: a tmux session on a host, by its slug, or a session on
+/// a server, this machine's or a host's.
+enum Ending {
+    Tmux { alias: String, slug: String },
+    Server(SessionRef),
 }
 
 /// What the main area shows when there is no session to show.
@@ -376,9 +394,9 @@ pub struct Workspace {
     /// The local server, once started, or why local tabs run without it
     /// (D50).
     local_server: session::LocalServerCell,
-    /// The local server's sessions, as last listed: what the sidebar shows
-    /// under this machine besides the open tabs.
-    local_sessions: Vec<berth_proto::v1::SessionInfo>,
+    /// Each server's sessions, this machine's and hosts', as last listed:
+    /// what the sidebar shows besides the open tabs.
+    sessions: crate::machine::Sessions,
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
@@ -454,10 +472,13 @@ impl<K> Default for Looked<K> {
     }
 }
 
-impl<K: PartialEq + Copy> Looked<K> {
+impl<K: PartialEq + Clone> Looked<K> {
     /// One look, showing `showing`. Returns what has now been seen.
     fn look(&mut self, showing: Option<K>) -> Option<K> {
-        let seen = showing.filter(|key| self.last == Some(*key));
+        let seen = showing
+            .as_ref()
+            .filter(|key| self.last.as_ref() == Some(*key))
+            .cloned();
         // Seen once is enough: it starts over if it shows again.
         self.last = if seen.is_some() { None } else { showing };
         seen
@@ -513,11 +534,11 @@ fn short_directory(directory: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Whose status: a pane's, or a local session's that no pane shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Whose status: a pane's, or a server session's that no pane shows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum StatusKey {
     Pane(u64),
-    Session(u64),
+    Session(SessionRef),
 }
 
 /// What a status shows and says.
@@ -632,7 +653,7 @@ impl Workspace {
             menu: None,
             claude_base: install_claude_support(),
             local_server: Default::default(),
-            local_sessions: Vec::new(),
+            sessions: Default::default(),
             window_seen: true,
             status_shown: Looked::default(),
             hook_done_seen: std::collections::HashSet::new(),
@@ -709,7 +730,12 @@ impl Workspace {
         };
         let now = std::time::Instant::now();
         let recent = |at: Option<std::time::Instant>| at.is_some_and(|at| now - at < SEEN_EVERY);
-        let local = || self.panes.iter().filter(|p| p.session.is_some());
+        let local = || {
+            self.panes.iter().filter(|p| {
+                p.server_session()
+                    .is_some_and(|s| s.machine == Machine::Local)
+            })
+        };
         let painted = local().any(|p| recent(p.view.read(cx).last_frame_at));
         let busy = local().any(|p| recent(p.view.read(cx).intake.last_output()));
         let seen = if self.window_seen {
@@ -744,8 +770,8 @@ impl Workspace {
             .focused()
             .filter(|_| self.window_seen)
             .and_then(|pane| {
-                let reported = pane.session.filter(|session| {
-                    self.session_status(*session)
+                let reported = pane.server_session().filter(|session| {
+                    self.session_status(session)
                         .is_some_and(|s| matches!(s.state, StatusState::Done | StatusState::Error))
                 });
                 match reported {
@@ -757,13 +783,13 @@ impl Workspace {
             });
         match self.status_shown.look(showing) {
             Some(StatusKey::Session(session)) => {
-                let Some(Ok(server)) = self.local_server.get().cloned() else {
+                let Some(server) = self.server_of(&session.machine) else {
                     return;
                 };
+                let id = session.id;
                 cx.background_executor()
                     .spawn(async move {
-                        let _ =
-                            runtime::spawn(async move { server.status_seen(session).await }).await;
+                        let _ = runtime::spawn(async move { server.status_seen(id).await }).await;
                     })
                     .detach();
             }
@@ -820,7 +846,12 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             while let Some((session, claude)) = rx.recv().await {
                 let alive = this.update(cx, |this, cx| {
-                    for pane in this.panes.iter_mut().filter(|p| p.session == Some(session)) {
+                    let session = SessionRef::local(session);
+                    for pane in this
+                        .panes
+                        .iter_mut()
+                        .filter(|p| p.server_session().as_ref() == Some(&session))
+                    {
                         let token = pane
                             .claude
                             .as_ref()
@@ -830,7 +861,7 @@ impl Workspace {
                         known.tracker = berth_core::claude::from_wire(&claude);
                         pane.claude = Some(known);
                     }
-                    if let Some(info) = this.local_sessions.iter_mut().find(|s| s.id == session) {
+                    if let Some(info) = this.sessions.info_mut(&session) {
                         info.claude = Some(claude.clone());
                     }
                     cx.notify();
@@ -866,8 +897,7 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             while let Some(list) = rx.recv().await {
                 let alive = this.update(cx, |this, cx| {
-                    if list != this.local_sessions {
-                        this.local_sessions = list;
+                    if this.sessions.set(Machine::Local, list) {
                         cx.notify();
                     }
                 });
@@ -883,9 +913,10 @@ impl Workspace {
     /// gives them.
     fn detached_local(&self) -> Vec<(u64, String)> {
         let sessions: Vec<crate::sidebar::LocalSession> = self
-            .local_sessions
+            .sessions
+            .of(&Machine::Local)
             .iter()
-            .filter(|s| !self.panes.iter().any(|p| p.session == Some(s.id)))
+            .filter(|s| !self.shows(&SessionRef::local(s.id)))
             .map(|s| crate::sidebar::LocalSession {
                 id: s.id,
                 program: s.program.as_deref(),
@@ -897,6 +928,30 @@ impl Workspace {
     }
 
     // -- sessions ----------------------------------------------------------
+
+    /// Whether a pane shows this server session.
+    fn shows(&self, session: &SessionRef) -> bool {
+        self.pane_showing(session).is_some()
+    }
+
+    /// The pane showing a server session, if one does.
+    fn pane_showing(&self, session: &SessionRef) -> Option<u64> {
+        self.panes
+            .iter()
+            .find(|p| p.server_session().as_ref() == Some(session))
+            .map(|p| p.id)
+    }
+
+    /// A machine's server, once it is up: this machine's, or a host's.
+    fn server_of(&self, machine: &Machine) -> Option<berth_core::server::local::Server> {
+        match machine {
+            Machine::Local => match self.local_server.get() {
+                Some(Ok(server)) => Some(server.clone()),
+                _ => None,
+            },
+            Machine::Host(_) => None,
+        }
+    }
 
     fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|p| p.id == id)
@@ -1131,20 +1186,32 @@ impl Workspace {
         .detach();
     }
 
-    /// Show a local server session that no tab shows, where `place` says.
-    fn attach_local(&mut self, session_id: u64, place: Place, cx: &mut Context<Self>) {
-        if let Some(pane) = self.panes.iter().find(|p| p.session == Some(session_id)) {
-            let id = pane.id;
-            self.focus_pane(id, cx);
+    /// Show a server session that no tab shows, this machine's or a
+    /// host's, where `place` says.
+    fn attach_server(&mut self, session: SessionRef, place: Place, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_showing(&session) {
+            self.focus_pane(pane, cx);
             return;
         }
-        let Some(Ok(server)) = self.local_server.get().cloned() else {
+        let Some(server) = self.server_of(&session.machine) else {
             return;
         };
-        tracing::info!(session = session_id, "attaching a local session");
+        let session_id = session.id;
+        // A pane's slug names a tmux session; one on a host's server is
+        // named by its id, which no tmux slug can be.
+        let (host, slug) = match &session.machine {
+            Machine::Local => (None, strings::LOCAL_ALIAS.to_string()),
+            Machine::Host(alias) => {
+                let Some(host) = self.hosts.iter().find(|h| &h.alias == alias).cloned() else {
+                    return;
+                };
+                (Some(host), server_slug(session_id))
+            }
+        };
+        tracing::info!(machine = ?session.machine, session = session_id, "attaching a server session");
         // Up in the next frame, already this session's so a second click
         // finds it; the screen comes when the worker sends it (D56).
-        let id = self.place_empty(None, strings::LOCAL_ALIAS.to_string(), None, place, cx);
+        let id = self.place_empty(host, slug, None, place, cx);
         if let Some(pane) = self.pane_mut(id) {
             pane.session = Some(session_id);
         }
@@ -1163,7 +1230,7 @@ impl Workspace {
                     this.fill_pane(id, local.pty, local.events, cx);
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "could not attach a local session");
+                    tracing::warn!(%error, "could not attach a server session");
                     this.close(id, cx);
                     this.warnings.push(error);
                     cx.notify();
@@ -1186,8 +1253,9 @@ impl Workspace {
                 .and_then(|r| r.ok());
             if let Some(list) = listed {
                 let _ = this.update(cx, |this, cx| {
-                    this.local_sessions = list;
-                    cx.notify();
+                    if this.sessions.set(Machine::Local, list) {
+                        cx.notify();
+                    }
                 });
             }
         })
@@ -1229,19 +1297,15 @@ impl Workspace {
         }
     }
 
-    /// What the programs in a local session report of themselves (OSC 7501,
-    /// D53): the record the session is shown by. For display only.
-    fn session_status(&self, session: u64) -> Option<&berth_proto::v1::Status> {
-        self.local_sessions
-            .iter()
-            .find(|info| info.id == session)?
-            .status
-            .as_ref()
+    /// What the programs in a server session report of themselves (OSC
+    /// 7501, D53): the record the session is shown by. For display only.
+    fn session_status(&self, session: &SessionRef) -> Option<&berth_proto::v1::Status> {
+        self.sessions.info(session)?.status.as_ref()
     }
 
     /// The same for the session a pane shows.
     fn pane_status(&self, id: u64) -> Option<&berth_proto::v1::Status> {
-        self.session_status(self.pane(id)?.session?)
+        self.session_status(&self.pane(id)?.server_session()?)
     }
 
     /// What a pane's status shows: what its session's programs report (OSC
@@ -1274,30 +1338,26 @@ impl Workspace {
         crate::programs::shown(reported.as_deref(), self.pane_program(pane)).map(str::to_string)
     }
 
-    /// The same for a local session no pane shows.
-    fn session_shown_program(&self, session: u64) -> Option<String> {
+    /// The same for a server session no pane shows.
+    fn session_shown_program(&self, session: &SessionRef) -> Option<String> {
         let reported = self.session_look(session).and_then(|look| look.program);
         crate::programs::shown(reported.as_deref(), self.session_program(session))
             .map(str::to_string)
     }
 
-    /// What runs in a pane's session, by its process name: the local
-    /// server's word for a session of its own, the host's scan for a remote
-    /// one. Unknown for a shell Berth runs directly.
+    /// What runs in a pane's session, by its process name: its server's
+    /// word for a server session, the host's scan for a tmux one. Unknown
+    /// for a shell Berth runs directly.
     fn pane_program(&self, pane: &Pane) -> Option<&str> {
-        match (&pane.host, pane.session) {
-            (None, Some(session)) => self.session_program(session),
-            (Some(host), _) => self.remote_program(&host.alias, &pane.slug),
+        match (pane.server_session(), &pane.host) {
+            (Some(session), _) => self.session_program(&session),
+            (None, Some(host)) => self.remote_program(&host.alias, &pane.slug),
             (None, None) => None,
         }
     }
 
-    fn session_program(&self, session: u64) -> Option<&str> {
-        self.local_sessions
-            .iter()
-            .find(|info| info.id == session)?
-            .program
-            .as_deref()
+    fn session_program(&self, session: &SessionRef) -> Option<&str> {
+        self.sessions.info(session)?.program.as_deref()
     }
 
     fn remote_program(&self, alias: &str, slug: &str) -> Option<&str> {
@@ -1305,12 +1365,12 @@ impl Workspace {
     }
 
     /// A pane's title from what its program says (D53), if anything is
-    /// known: see [`tab_title`]. The directory is only known for a session
-    /// on the local server.
+    /// known: see [`tab_title`]. The directory is only known for a server
+    /// session.
     fn pane_title(&self, pane: &Pane) -> Option<String> {
         let info = pane
-            .session
-            .and_then(|session| self.local_sessions.iter().find(|info| info.id == session));
+            .server_session()
+            .and_then(|session| self.sessions.info(&session));
         let home = dirs_home();
         let program = self.pane_shown_program(pane);
         tab_title(
@@ -1322,8 +1382,8 @@ impl Workspace {
         )
     }
 
-    /// The same for a local session no pane shows.
-    fn session_look(&self, session: u64) -> Option<StatusLook> {
+    /// The same for a server session no pane shows.
+    fn session_look(&self, session: &SessionRef) -> Option<StatusLook> {
         let mut look = StatusLook::of_status(self.session_status(session)?);
         if look.program.is_none() {
             look.program = self.session_program(session).map(str::to_string);
@@ -1332,9 +1392,9 @@ impl Workspace {
     }
 
     /// How long a status has been showing as it is.
-    fn status_since(&self, key: StatusKey) -> std::time::Duration {
+    fn status_since(&self, key: &StatusKey) -> std::time::Duration {
         self.glyph_since
-            .get(&key)
+            .get(key)
             .map(|(_, since)| since.elapsed())
             .unwrap_or_default()
     }
@@ -1355,14 +1415,14 @@ impl Workspace {
 
     /// A status's glyph now: on a tab it moves, in the sidebar (`still`)
     /// it never does (D53).
-    fn glyph_of(&self, key: StatusKey, look: &StatusLook, still: bool) -> crate::glyph::Glyph {
+    fn glyph_of(&self, key: &StatusKey, look: &StatusLook, still: bool) -> crate::glyph::Glyph {
         crate::glyph::glyph(
             look.state,
             self.glyph_colours(look.program.as_deref()),
             crate::glyph::Moment {
                 clock: self.glyph_epoch.elapsed(),
                 since: self.status_since(key),
-                steady: self.glyph_steady.contains(&key),
+                steady: self.glyph_steady.contains(key),
                 still: still || self.glyph_still,
             },
         )
@@ -1372,7 +1432,7 @@ impl Workspace {
     fn pane_glyph(&self, id: u64) -> crate::glyph::Glyph {
         let key = StatusKey::Pane(id);
         match self.pane_look(id) {
-            Some(look) => self.glyph_of(key, &look, false),
+            Some(look) => self.glyph_of(&key, &look, false),
             None => {
                 let program = self.pane(id).and_then(|pane| self.pane_program(pane));
                 crate::glyph::glyph(
@@ -1408,11 +1468,9 @@ impl Workspace {
             .panes
             .iter()
             .filter_map(|pane| Some((StatusKey::Pane(pane.id), self.pane_look(pane.id)?.state)))
-            .chain(self.local_sessions.iter().filter_map(|info| {
-                Some((
-                    StatusKey::Session(info.id),
-                    self.session_look(info.id)?.state,
-                ))
+            .chain(self.sessions.all().filter_map(|(session, _)| {
+                let state = self.session_look(&session)?.state;
+                Some((StatusKey::Session(session), state))
             }))
             .collect();
         let now = std::time::Instant::now();
@@ -1422,15 +1480,15 @@ impl Workspace {
             match self.glyph_since.get(key) {
                 Some((was, _)) if was == state => {}
                 _ => {
-                    self.glyph_since.insert(*key, (*state, now));
+                    self.glyph_since.insert(key.clone(), (*state, now));
                 }
             }
         }
         self.glyph_steady
-            .retain(|key| shown.contains(&(*key, State::NeedsYou)));
+            .retain(|key| shown.contains(&(key.clone(), State::NeedsYou)));
         if self.window_seen
             && let Some(focused) = self.focused().map(|pane| StatusKey::Pane(pane.id))
-            && shown.contains(&(focused, State::NeedsYou))
+            && shown.contains(&(focused.clone(), State::NeedsYou))
         {
             self.glyph_steady.insert(focused);
         }
@@ -1442,7 +1500,7 @@ impl Workspace {
             .map(|(key, state)| {
                 (
                     *state,
-                    self.status_since(*key),
+                    self.status_since(key),
                     self.glyph_steady.contains(key),
                 )
             })
@@ -1951,7 +2009,7 @@ impl Workspace {
     }
 
     /// Every session in a state, in the order the status bar's count goes
-    /// through them: shown panes by tab, then local sessions no pane shows.
+    /// through them: shown panes by tab, then server sessions no pane shows.
     fn status_targets(&self, state: crate::glyph::State) -> Vec<RowTarget> {
         let shown = self
             .tabs
@@ -1963,13 +2021,16 @@ impl Workspace {
             })
             .map(RowTarget::Pane);
         let unshown = self
-            .detached_local()
-            .into_iter()
-            .filter(|(session, _)| {
-                self.session_look(*session)
-                    .is_some_and(|look| look.state == state)
+            .sessions
+            .all()
+            .map(|(session, _)| session)
+            .filter(|session| {
+                !self.shows(session)
+                    && self
+                        .session_look(session)
+                        .is_some_and(|look| look.state == state)
             })
-            .map(|(session, _)| RowTarget::Local(session));
+            .map(RowTarget::Session);
         shown.chain(unshown).collect()
     }
 
@@ -2015,11 +2076,7 @@ impl Workspace {
                 .iter()
                 .find(|p| p.host.as_ref().is_some_and(|h| &h.alias == alias) && &p.slug == slug)
                 .map(|p| p.id),
-            RowTarget::Local(session) => self
-                .panes
-                .iter()
-                .find(|p| p.session == Some(*session))
-                .map(|p| p.id),
+            RowTarget::Session(session) => self.pane_showing(session),
         }
     }
 
@@ -2036,7 +2093,7 @@ impl Workspace {
         match target {
             RowTarget::Pane(_) => {}
             RowTarget::Remote { alias, slug } => self.attach_new(alias, slug, place, cx),
-            RowTarget::Local(session) => self.attach_local(session, place, cx),
+            RowTarget::Session(session) => self.attach_server(session, place, cx),
         }
     }
 
@@ -2066,7 +2123,7 @@ impl Workspace {
                 match target {
                     RowTarget::Pane(_) => {}
                     RowTarget::Remote { alias, slug } => self.attach_new(alias, slug, place, cx),
-                    RowTarget::Local(session) => self.attach_local(session, place, cx),
+                    RowTarget::Session(session) => self.attach_server(session, place, cx),
                 }
             }
         }
@@ -2079,23 +2136,23 @@ impl Workspace {
         let pane = self.shown_in(target);
         let look = match (pane, target) {
             (Some(pane), _) => self.pane_look(pane),
-            (None, RowTarget::Local(session)) => self.session_look(*session),
+            (None, RowTarget::Session(session)) => self.session_look(session),
             (None, _) => None,
         };
         if let Some(look) = look {
             return look.state == State::Working;
         }
+        let server = match (pane.and_then(|p| self.pane(p)), target) {
+            (Some(pane), _) => pane.server_session(),
+            (None, RowTarget::Session(session)) => Some(session.clone()),
+            _ => None,
+        };
         let remote = match (pane.and_then(|p| self.pane(p)), target) {
-            (Some(pane), _) => pane
+            (Some(pane), _) if server.is_none() => pane
                 .host
                 .as_ref()
                 .map(|h| (h.alias.clone(), pane.slug.clone())),
             (None, RowTarget::Remote { alias, slug }) => Some((alias.clone(), slug.clone())),
-            _ => None,
-        };
-        let local = match (pane.and_then(|p| self.pane(p)), target) {
-            (Some(pane), _) => pane.session,
-            (None, RowTarget::Local(session)) => Some(*session),
             _ => None,
         };
         if let Some((alias, slug)) = remote {
@@ -2106,8 +2163,8 @@ impl Workspace {
                 .copied()
                 .unwrap_or(false);
         }
-        local
-            .and_then(|session| self.local_sessions.iter().find(|s| s.id == session))
+        server
+            .and_then(|session| self.sessions.info(&session))
             .and_then(|info| info.claude.as_ref())
             .is_some_and(|c| c.state == berth_proto::v1::ClaudeState::Working)
     }
@@ -2120,16 +2177,16 @@ impl Workspace {
         }
         let pane = self.shown_in(&target);
         let ask = self.agent_working(&target);
-        let local = match (pane.and_then(|p| self.pane(p)), &target) {
-            (Some(p), _) => p.session,
-            (None, RowTarget::Local(session)) => Some(*session),
+        let server = match (pane.and_then(|p| self.pane(p)), &target) {
+            (Some(p), _) => p.server_session(),
+            (None, RowTarget::Session(session)) => Some(session.clone()),
             _ => None,
         };
-        if let Some(session) = local {
+        if let Some(session) = server {
             if ask {
-                self.ask_kill_local(session, pane, cx);
+                self.ask_kill_server(session, pane, cx);
             } else {
-                self.kill_local(&session.to_string(), pane, cx);
+                self.kill_server(session, pane, cx);
             }
             return;
         }
@@ -2150,8 +2207,11 @@ impl Workspace {
             let session = berth_core::session::Session::new(slug.clone(), 80, 24).tmux_name();
             self.modal = Some(Modal::Kill {
                 pane,
+                ending: Ending::Tmux {
+                    alias: alias.clone(),
+                    slug,
+                },
                 alias,
-                slug,
                 session,
             });
             self.modal_focused = false;
@@ -2460,18 +2520,24 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Ask before ending a local server session (D50), shown or not.
-    fn ask_kill_local(&mut self, session: u64, pane: Option<u64>, cx: &mut Context<Self>) {
+    /// Ask before ending a server session (D50, D55), shown or not.
+    fn ask_kill_server(&mut self, session: SessionRef, pane: Option<u64>, cx: &mut Context<Self>) {
+        let (alias, name) = match &session.machine {
+            Machine::Local => (
+                strings::LOCAL_ALIAS.to_string(),
+                self.detached_local()
+                    .into_iter()
+                    .find(|(id, _)| *id == session.id)
+                    .map(|(_, name)| name)
+                    .unwrap_or_else(|| format!("{} #{}", render::local_label(), session.id)),
+            ),
+            Machine::Host(alias) => (alias.clone(), server_slug(session.id)),
+        };
         self.modal = Some(Modal::Kill {
             pane,
-            alias: strings::LOCAL_ALIAS.to_string(),
-            slug: session.to_string(),
-            session: self
-                .detached_local()
-                .into_iter()
-                .find(|(id, _)| *id == session)
-                .map(|(_, name)| name)
-                .unwrap_or_else(|| format!("{} #{session}", render::local_label())),
+            ending: Ending::Server(session),
+            alias,
+            session: name,
         });
         self.modal_focused = false;
         cx.notify();
@@ -2559,10 +2625,6 @@ impl Workspace {
     /// End a tmux session and everything running in it, and close its pane if
     /// it has one.
     fn kill(&mut self, alias: String, slug: String, pane: Option<u64>, cx: &mut Context<Self>) {
-        if alias == strings::LOCAL_ALIAS {
-            self.kill_local(&slug, pane, cx);
-            return;
-        }
         let session = berth_core::session::Session::new(slug.clone(), 80, 24);
         let name = session.tmux_name();
         let command = session.kill_command();
@@ -2590,24 +2652,35 @@ impl Workspace {
         cx.notify();
     }
 
-    /// End a local server session: its shell and everything running in it.
-    fn kill_local(&mut self, session: &str, pane: Option<u64>, cx: &mut Context<Self>) {
-        let (Ok(session), Some(Ok(server))) =
-            (session.parse::<u64>(), self.local_server.get().cloned())
-        else {
+    /// End a server session, this machine's or a host's: its shell and
+    /// everything running in it.
+    fn kill_server(&mut self, session: SessionRef, pane: Option<u64>, cx: &mut Context<Self>) {
+        let Some(server) = self.server_of(&session.machine) else {
             return;
         };
-        tracing::warn!(session, "ending a local session");
-        self.local_sessions.retain(|s| s.id != session);
+        tracing::warn!(machine = ?session.machine, session = session.id, "ending a server session");
+        self.sessions.remove(&session);
+        let id = session.id;
+        let local = session.machine == Machine::Local;
         cx.spawn(async move |this, cx| {
-            let _ = runtime::spawn(async move { server.kill(session).await }).await;
-            let _ = this.update(cx, |this, cx| this.refresh_local_sessions(cx));
+            let _ = runtime::spawn(async move { server.kill(id).await }).await;
+            if local {
+                let _ = this.update(cx, |this, cx| this.refresh_local_sessions(cx));
+            }
         })
         .detach();
         if let Some(pane) = pane {
             self.close(pane, cx);
         }
         cx.notify();
+    }
+
+    /// End what a confirmed dialog named.
+    fn end(&mut self, ending: Ending, pane: Option<u64>, cx: &mut Context<Self>) {
+        match ending {
+            Ending::Tmux { alias, slug } => self.kill(alias, slug, pane, cx),
+            Ending::Server(session) => self.kill_server(session, pane, cx),
+        }
     }
 
     /// What a host is called on screen: the name it was given, or its alias.
@@ -2671,7 +2744,7 @@ impl Workspace {
                 local: false,
                 connected: self.conns.contains_key(alias),
             },
-            Target::Detached { .. } | Target::LocalDetached { .. } | Target::Local => {
+            Target::Detached { .. } | Target::ServerDetached { .. } | Target::Local => {
                 Facts::default()
             }
         };
@@ -2691,11 +2764,11 @@ impl Workspace {
                 self.end_session(RowTarget::Remote { alias, slug }, cx)
             }
             (Action::Open, Target::Detached { alias, slug }) => self.open_session(alias, slug, cx),
-            (Action::Open, Target::LocalDetached { session }) => {
-                self.attach_local(session, Place::Tab { show: true }, cx)
+            (Action::Open, Target::ServerDetached { session }) => {
+                self.attach_server(session, Place::Tab { show: true }, cx)
             }
-            (Action::EndSession, Target::LocalDetached { session }) => {
-                self.end_session(RowTarget::Local(session), cx)
+            (Action::EndSession, Target::ServerDetached { session }) => {
+                self.end_session(RowTarget::Session(session), cx)
             }
             (Action::NewTerminal, Target::Local) => {
                 self.new_terminal(crate::sidebar::Folder::Local, cx)
@@ -2741,6 +2814,13 @@ fn refresh_hz() -> f64 {
 /// A slug names a tmux session on the server, so two panes on one host must
 /// never agree on one: the second would attach to the first's shell instead of
 /// opening its own.
+/// What a pane showing a host's server session calls it where a tmux
+/// session has its slug: `#` and its id, which no tmux slug Berth makes
+/// can be.
+fn server_slug(id: u64) -> String {
+    format!("#{id}")
+}
+
 fn free_slug(base: &str, taken: &[&str]) -> String {
     if !taken.contains(&base) {
         return base.to_string();
@@ -2924,33 +3004,42 @@ mod tests {
     fn a_status_is_seen_after_two_looks_running() {
         let mut looked = Looked::default();
         let pane = StatusKey::Pane(3);
-        assert_eq!(looked.look(Some(pane)), None, "one look");
+        assert_eq!(looked.look(Some(pane.clone())), None, "one look");
         assert_eq!(
-            looked.look(Some(pane)),
-            Some(pane),
+            looked.look(Some(pane.clone())),
+            Some(pane.clone()),
             "still there a second on"
         );
         assert_eq!(
-            looked.look(Some(pane)),
+            looked.look(Some(pane.clone())),
             None,
             "seen once, not again at once"
         );
 
         // Focus moved away in between: the count starts over.
         let mut looked = Looked::default();
-        assert_eq!(looked.look(Some(pane)), None);
+        assert_eq!(looked.look(Some(pane.clone())), None);
         assert_eq!(looked.look(None), None);
-        assert_eq!(looked.look(Some(pane)), None);
-        assert_eq!(looked.look(Some(pane)), Some(pane));
+        assert_eq!(looked.look(Some(pane.clone())), None);
+        assert_eq!(looked.look(Some(pane.clone())), Some(pane.clone()));
 
         // A different pane in front is a different thing to see.
         let mut looked = Looked::default();
+        let here = StatusKey::Session(SessionRef::local(3));
         assert_eq!(looked.look(Some(pane)), None);
-        assert_eq!(looked.look(Some(StatusKey::Session(3))), None);
+        assert_eq!(looked.look(Some(here.clone())), None);
+        assert_eq!(looked.look(Some(here.clone())), Some(here));
+
+        // The same id on a host is another session: seeing one is not
+        // seeing the other.
+        let mut looked = Looked::default();
+        let there = StatusKey::Session(SessionRef::on(Some("box"), 3));
         assert_eq!(
-            looked.look(Some(StatusKey::Session(3))),
-            Some(StatusKey::Session(3))
+            looked.look(Some(StatusKey::Session(SessionRef::local(3)))),
+            None
         );
+        assert_eq!(looked.look(Some(there.clone())), None);
+        assert_eq!(looked.look(Some(there.clone())), Some(there));
     }
 
     #[test]

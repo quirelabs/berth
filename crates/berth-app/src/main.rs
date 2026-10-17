@@ -5,6 +5,7 @@ mod bench;
 mod glyph;
 mod icons;
 mod input;
+mod machine;
 mod menu;
 mod metrics;
 mod panes;

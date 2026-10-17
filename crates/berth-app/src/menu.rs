@@ -13,8 +13,9 @@ pub enum Target {
     Pane(u64),
     /// A remote session running with no tab.
     Detached { alias: String, slug: String },
-    /// A local server session running with no tab (D50).
-    LocalDetached { session: u64 },
+    /// A server session running with no tab, on this machine or a host
+    /// (D50, D55).
+    ServerDetached { session: crate::machine::SessionRef },
     /// A host folder.
     Host(String),
     /// The "This machine" folder.
@@ -57,7 +58,7 @@ pub fn actions(target: &Target, facts: Facts) -> Vec<Action> {
     match target {
         Target::Pane(_) if facts.local => vec![Action::Rename, Action::Close],
         Target::Pane(_) => vec![Action::Rename, Action::Detach, Action::EndSession],
-        Target::Detached { .. } | Target::LocalDetached { .. } => {
+        Target::Detached { .. } | Target::ServerDetached { .. } => {
             vec![Action::Open, Action::EndSession]
         }
         Target::Host(_) if facts.connected => {
@@ -129,7 +130,12 @@ mod tests {
             [Action::Rename, Action::Detach, Action::EndSession]
         );
         assert_eq!(
-            actions(&Target::LocalDetached { session: 3 }, Facts::default()),
+            actions(
+                &Target::ServerDetached {
+                    session: crate::machine::SessionRef::local(3)
+                },
+                Facts::default()
+            ),
             [Action::Open, Action::EndSession]
         );
     }

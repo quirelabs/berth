@@ -46,9 +46,8 @@ impl Workspace {
             .map(|(id, name)| {
                 // Claude running in it, as its worker last reported (D50).
                 let agent = self
-                    .local_sessions
-                    .iter()
-                    .find(|s| s.id == id)
+                    .sessions
+                    .info(&SessionRef::local(id))
                     .and_then(|s| s.claude.as_ref())
                     .is_some_and(|c| {
                         !matches!(
@@ -371,11 +370,11 @@ impl Workspace {
     /// are reattached in a tab of their own.
     /// A local server session no tab shows, found again by the name the
     /// tree gave it.
-    fn local_session_named(&self, name: &str) -> Option<u64> {
+    fn local_session_named(&self, name: &str) -> Option<SessionRef> {
         self.detached_local()
             .into_iter()
             .find(|(_, n)| n == name)
-            .map(|(id, _)| id)
+            .map(|(id, _)| SessionRef::local(id))
     }
 
     /// What a sidebar row's session shows: its pane's status, or a local
@@ -390,7 +389,8 @@ impl Workspace {
             (Some(id), _) => Some((StatusKey::Pane(id), self.pane_look(id)?)),
             (None, crate::sidebar::Folder::Local) => {
                 let session = self.local_session_named(name)?;
-                Some((StatusKey::Session(session), self.session_look(session)?))
+                let look = self.session_look(&session)?;
+                Some((StatusKey::Session(session), look))
             }
             (None, crate::sidebar::Folder::Host(_)) => None,
         }
@@ -414,9 +414,9 @@ impl Workspace {
         let focused = pane.is_some() && self.focused().map(|p| p.id) == pane;
         let in_tab = pane.is_some_and(|id| self.tab().is_some_and(|t| t.root.contains(id)));
         let detached = pane.is_none();
-        let local_session = match (&folder, pane) {
+        let server_session = match (&folder, pane) {
             (crate::sidebar::Folder::Local, None) => self.local_session_named(&name),
-            (_, Some(id)) => self.pane(id).and_then(|p| p.session),
+            (_, Some(id)) => self.pane(id).and_then(|p| p.server_session()),
             _ => None,
         };
         // What runs in it, for its tile.
@@ -425,9 +425,9 @@ impl Workspace {
             (None, crate::sidebar::Folder::Host(alias)) => {
                 self.remote_program(alias, &name).map(str::to_string)
             }
-            (None, crate::sidebar::Folder::Local) => {
-                local_session.and_then(|session| self.session_shown_program(session))
-            }
+            (None, crate::sidebar::Folder::Local) => server_session
+                .as_ref()
+                .and_then(|session| self.session_shown_program(session)),
         };
         let target = match (&folder, pane) {
             (_, Some(pane)) => Some(RowTarget::Pane(pane)),
@@ -435,7 +435,7 @@ impl Workspace {
                 alias: alias.clone(),
                 slug: name.clone(),
             }),
-            (crate::sidebar::Folder::Local, None) => local_session.map(RowTarget::Local),
+            (crate::sidebar::Folder::Local, None) => server_session.clone().map(RowTarget::Session),
         };
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
@@ -443,18 +443,19 @@ impl Workspace {
                 alias: alias.clone(),
                 slug: name.clone(),
             }),
-            (crate::sidebar::Folder::Local, None) => {
-                local_session.map(|session| crate::menu::Target::LocalDetached { session })
-            }
+            (crate::sidebar::Folder::Local, None) => server_session
+                .clone()
+                .map(|session| crate::menu::Target::ServerDetached { session }),
         };
         let look = self.row_look(&folder, &name, pane);
-        let exit = local_session
-            .and_then(|session| self.local_sessions.iter().find(|s| s.id == session))
+        let exit = server_session
+            .as_ref()
+            .and_then(|session| self.sessions.info(session))
             .and_then(|info| info.exit);
         let meta = strings::row_meta(
             look.as_ref().map(|(_, look)| look.state),
             look.as_ref()
-                .map(|(key, _)| self.status_since(*key))
+                .map(|(key, _)| self.status_since(key))
                 .unwrap_or_default(),
             exit,
         );
@@ -584,7 +585,7 @@ impl Workspace {
         // The glyph, in a column of its own at the end; never moving, so a
         // visible sidebar costs no wakeups.
         let glyph = match &look {
-            Some((key, look)) => self.glyph_of(*key, look, true),
+            Some((key, look)) => self.glyph_of(key, look, true),
             None => crate::glyph::glyph(
                 crate::glyph::State::Idle,
                 self.glyph_colours(program.as_deref()),
@@ -606,7 +607,7 @@ impl Workspace {
             Some((key, look)) => format!(
                 "{}\n{}",
                 look.text,
-                strings::status_since(self.status_since(*key))
+                strings::status_since(self.status_since(key))
             ),
             None => String::new(),
         };
@@ -978,8 +979,8 @@ impl Workspace {
                 .unwrap_or_else(|| strings::LOCAL_ALIAS.to_string());
             let host = (!pane.is_local()).then(|| self.host_label(pane.alias()));
             let directory = pane
-                .session
-                .and_then(|session| self.local_sessions.iter().find(|i| i.id == session))
+                .server_session()
+                .and_then(|session| self.sessions.info(&session))
                 .and_then(|info| info.cwd.as_deref())
                 .map(|cwd| short_directory(cwd, dirs_home().as_deref()));
             let what = [look.as_ref().and_then(|l| l.msg.clone()), directory]
@@ -992,7 +993,7 @@ impl Workspace {
                     strings::state_word(crate::glyph::State::Idle).to_string()
                 }
                 Some(_) => {
-                    strings::row_meta(state, self.status_since(StatusKey::Pane(pane_id)), None)
+                    strings::row_meta(state, self.status_since(&StatusKey::Pane(pane_id)), None)
                 }
             };
             let tones = row_tones(theme, state, true, false, false);
@@ -1543,8 +1544,8 @@ impl Workspace {
                     .as_deref()
                     .map(crate::programs::display_name);
                 let directory = pane
-                    .session
-                    .and_then(|session| self.local_sessions.iter().find(|i| i.id == session))
+                    .server_session()
+                    .and_then(|session| self.sessions.info(&session))
                     .and_then(|info| info.cwd.as_deref())
                     .map(|cwd| short_directory(cwd, dirs_home().as_deref()));
                 let needs_you =
@@ -1553,7 +1554,7 @@ impl Workspace {
                     // The header's glyph moves with its tab's, on the same
                     // timer: no wakeup of its own.
                     let glyph = match &look {
-                        Some(look) => self.glyph_of(StatusKey::Pane(pane_id), look, false),
+                        Some(look) => self.glyph_of(&StatusKey::Pane(pane_id), look, false),
                         None => self.pane_glyph(pane_id),
                     };
                     let message = look
@@ -1648,7 +1649,7 @@ impl Workspace {
                 let state = look.as_ref().map_or(crate::glyph::State::Idle, |l| l.state);
                 let elapsed = look
                     .as_ref()
-                    .map(|_| strings::elapsed(self.status_since(StatusKey::Pane(pane_id))))
+                    .map(|_| strings::elapsed(self.status_since(&StatusKey::Pane(pane_id))))
                     .unwrap_or_default();
                 let tone = match state {
                     crate::glyph::State::NeedsYou => theme.gold,
@@ -1890,7 +1891,8 @@ impl Workspace {
             let Some(rtt) = conn.rtt else { continue };
             hosts = hosts.child(format!("{} {}ms", self.host_label(alias), rtt.as_millis()));
         }
-        if self.panes.iter().any(|p| p.is_local()) || !self.local_sessions.is_empty() {
+        if self.panes.iter().any(|p| p.is_local()) || !self.sessions.of(&Machine::Local).is_empty()
+        {
             hosts = hosts.child(strings::STATUS_LOCAL);
         }
         bar.child(hosts)
