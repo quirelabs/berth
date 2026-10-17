@@ -259,6 +259,22 @@ pub fn tab_key(number: usize) -> Option<String> {
 pub const PANEL_CHOOSE: &str = "↑↓ choose";
 pub const PANEL_FOCUS: &str = "↵ focus pane";
 
+/// What a program that needs the user is waiting for, when it gave no
+/// message of its own: the kind it reported (OSC 7501).
+pub fn needs_kind(kind: berth_proto::v1::StatusKind) -> &'static str {
+    use berth_proto::v1::StatusKind;
+    match kind {
+        StatusKind::Permission => "needs your permission",
+        StatusKind::Question => "has a question",
+        StatusKind::Auth => "needs you to sign in",
+    }
+}
+
+/// How far along a program says it is: "62%".
+pub fn progress(percent: u8) -> String {
+    format!("{percent}%")
+}
+
 /// A status in a word or two, as the glyph shows it (D53).
 pub fn state_word(state: crate::glyph::State) -> &'static str {
     use crate::glyph::State;

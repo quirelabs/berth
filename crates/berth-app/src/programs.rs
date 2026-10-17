@@ -175,6 +175,14 @@ pub fn accents() -> Vec<(&'static str, gpui::Rgba)> {
         .collect()
 }
 
+/// Which name a session is known by (D53): the `app` its program reports
+/// (OSC 7501) over the process that has the terminal, since many agents are
+/// `node` or `python` to the machine. Untrusted either way, and used only to
+/// pick a name, a tile and an accent.
+pub fn shown<'a>(app: Option<&'a str>, process: Option<&'a str>) -> Option<&'a str> {
+    app.map(str::trim).filter(|app| !app.is_empty()).or(process)
+}
+
 /// What to call a process in a title: the registry's name for it, else its
 /// own bare name, else nothing.
 pub fn display_name(command: &str) -> String {
@@ -212,6 +220,20 @@ mod tests {
         assert_eq!(lookup("nvim").icon, icons::NEOVIM);
         assert_eq!(lookup("ssh").icon, icons::SSH);
         assert_eq!(lookup("node").accent, None);
+    }
+
+    /// What a program reports itself as wins over the process that runs
+    /// it: an agent running under node is the agent.
+    #[test]
+    fn the_reported_app_comes_before_the_process() {
+        assert_eq!(shown(Some("claude"), Some("node")), Some("claude"));
+        assert_eq!(shown(None, Some("node")), Some("node"));
+        assert_eq!(shown(Some("  "), Some("node")), Some("node"));
+        assert_eq!(shown(Some("gemini"), None), Some("gemini"));
+        assert_eq!(shown(None, None), None);
+        let program = lookup(shown(Some("claude"), Some("node")).unwrap_or_default());
+        assert_eq!(program.tile, Tile::Brand(0xd97757));
+        assert_eq!(program.accent, Some(0xd97757));
     }
 
     /// `berth.toml` wins over the table, for a program in it or not.

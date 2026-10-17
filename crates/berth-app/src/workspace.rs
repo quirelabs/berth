@@ -528,17 +528,27 @@ struct StatusLook {
     program: Option<String>,
     /// The tooltip's words for it: the program's own, as a report.
     text: String,
-    /// The program's own message, if it gave one.
+    /// The program's own message, or, when it needs the user and gave none,
+    /// what kind of thing it needs.
     msg: Option<String>,
+    /// How far along it says it is, 0 to 100.
+    progress: Option<u8>,
 }
 
 impl StatusLook {
     fn of_status(status: &berth_proto::v1::Status) -> Self {
+        let msg = status.msg.clone().or_else(|| {
+            (status.state == berth_proto::v1::StatusState::Blocked)
+                .then_some(status.kind)
+                .flatten()
+                .map(|kind| strings::needs_kind(kind).to_string())
+        });
         Self {
             state: crate::glyph::State::of_status(status.state),
             program: status.app.clone(),
             text: render::status_text(status),
-            msg: status.msg.clone(),
+            msg,
+            progress: status.progress,
         }
     }
 
@@ -548,6 +558,7 @@ impl StatusLook {
             program: Some("claude".to_string()),
             text: render::claude_text(state).into(),
             msg: None,
+            progress: None,
         }
     }
 }
@@ -1256,6 +1267,20 @@ impl Workspace {
         Some(look)
     }
 
+    /// What a pane's session is known by: the `app` its program reports
+    /// over the process that has the terminal (D53).
+    fn pane_shown_program(&self, pane: &Pane) -> Option<String> {
+        let reported = self.pane_look(pane.id).and_then(|look| look.program);
+        crate::programs::shown(reported.as_deref(), self.pane_program(pane)).map(str::to_string)
+    }
+
+    /// The same for a local session no pane shows.
+    fn session_shown_program(&self, session: u64) -> Option<String> {
+        let reported = self.session_look(session).and_then(|look| look.program);
+        crate::programs::shown(reported.as_deref(), self.session_program(session))
+            .map(str::to_string)
+    }
+
     /// What runs in a pane's session, by its process name: the local
     /// server's word for a session of its own, the host's scan for a remote
     /// one. Unknown for a shell Berth runs directly.
@@ -1287,10 +1312,11 @@ impl Workspace {
             .session
             .and_then(|session| self.local_sessions.iter().find(|info| info.id == session));
         let home = dirs_home();
+        let program = self.pane_shown_program(pane);
         tab_title(
             self.pane_status(pane.id).and_then(|s| s.msg.as_deref()),
             info.and_then(|info| info.title.as_deref()),
-            self.pane_program(pane),
+            program.as_deref(),
             info.and_then(|info| info.cwd.as_deref()),
             home.as_deref(),
         )
@@ -2817,6 +2843,55 @@ mod tests {
         );
         assert_eq!(title(None, None, None, Some("/Users/j")), None);
         assert_eq!(title(None, None, Some(" "), None), None);
+    }
+
+    /// A program that needs you and gave no message says what kind of thing
+    /// it needs; its own message comes first; its progress is kept.
+    #[test]
+    fn kind_stands_in_for_a_missing_message_and_progress_is_kept() {
+        use berth_proto::v1::{Status, StatusKind, StatusState};
+        let status = |state, kind, msg: Option<&str>, progress| Status {
+            id: String::new(),
+            state,
+            kind,
+            progress,
+            app: Some("claude".into()),
+            title: None,
+            msg: msg.map(str::to_string),
+        };
+        let look = StatusLook::of_status(&status(
+            StatusState::Blocked,
+            Some(StatusKind::Permission),
+            None,
+            None,
+        ));
+        assert_eq!(look.msg.as_deref(), Some("needs your permission"));
+        let look = StatusLook::of_status(&status(
+            StatusState::Blocked,
+            Some(StatusKind::Question),
+            Some("Which branch?"),
+            Some(40),
+        ));
+        assert_eq!(look.msg.as_deref(), Some("Which branch?"));
+        assert_eq!(look.progress, Some(40));
+        assert_eq!(
+            StatusLook::of_status(&status(
+                StatusState::Blocked,
+                Some(StatusKind::Auth),
+                None,
+                None
+            ))
+            .msg
+            .as_deref(),
+            Some("needs you to sign in")
+        );
+        let working = StatusLook::of_status(&status(StatusState::Working, None, None, Some(62)));
+        assert_eq!(working.msg, None);
+        assert_eq!(
+            working.progress.map(strings::progress).as_deref(),
+            Some("62%")
+        );
+        assert_eq!(working.program.as_deref(), Some("claude"));
     }
 
     /// A title is words on a tab and nothing more. The icon and the accent

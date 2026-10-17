@@ -421,13 +421,14 @@ impl Workspace {
         };
         // What runs in it, for its tile.
         let program: Option<String> = match (pane.and_then(|id| self.pane(id)), &folder) {
-            (Some(pane), _) => self.pane_program(pane),
-            (None, crate::sidebar::Folder::Host(alias)) => self.remote_program(alias, &name),
-            (None, crate::sidebar::Folder::Local) => {
-                local_session.and_then(|session| self.session_program(session))
+            (Some(pane), _) => self.pane_shown_program(pane),
+            (None, crate::sidebar::Folder::Host(alias)) => {
+                self.remote_program(alias, &name).map(str::to_string)
             }
-        }
-        .map(str::to_string);
+            (None, crate::sidebar::Folder::Local) => {
+                local_session.and_then(|session| self.session_shown_program(session))
+            }
+        };
         let target = match (&folder, pane) {
             (_, Some(pane)) => Some(RowTarget::Pane(pane)),
             (crate::sidebar::Folder::Host(alias), None) => Some(RowTarget::Remote {
@@ -735,8 +736,8 @@ impl Workspace {
             let spoken = strings::status_label(
                 &title,
                 host.as_deref(),
-                self.pane_program(pane)
-                    .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                self.pane_shown_program(pane)
+                    .as_deref()
                     .map(crate::programs::display_name)
                     .as_deref(),
                 look.as_ref().map_or(crate::glyph::State::Idle, |l| l.state),
@@ -971,8 +972,8 @@ impl Workspace {
             let look = self.pane_look(pane_id);
             let state = look.as_ref().map(|l| l.state);
             let program = self
-                .pane_program(pane)
-                .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                .pane_shown_program(pane)
+                .as_deref()
                 .map(crate::programs::display_name)
                 .unwrap_or_else(|| strings::LOCAL_ALIAS.to_string());
             let host = (!pane.is_local()).then(|| self.host_label(pane.alias()));
@@ -1037,7 +1038,17 @@ impl Workspace {
                                     .child(program)
                                     .when_some(host, |line, host| {
                                         line.child(div().text_color(hsla(tones.muted)).child(host))
-                                    }),
+                                    })
+                                    .when_some(
+                                        look.as_ref().and_then(|l| l.progress),
+                                        |line, percent| {
+                                            line.child(
+                                                div()
+                                                    .text_color(hsla(tones.meta))
+                                                    .child(strings::progress(percent)),
+                                            )
+                                        },
+                                    ),
                             )
                             .when(!what.is_empty(), |lines| {
                                 lines.child(
@@ -1528,8 +1539,8 @@ impl Workspace {
                 // that needs the user is tinted gold (D53).
                 let look = self.pane_look(pane_id);
                 let program = self
-                    .pane_program(pane)
-                    .or(look.as_ref().and_then(|l| l.program.as_deref()))
+                    .pane_shown_program(pane)
+                    .as_deref()
                     .map(crate::programs::display_name);
                 let directory = pane
                     .session
@@ -1694,6 +1705,10 @@ impl Workspace {
                         .text_color(hsla(tone))
                         .when(dim, |line| line.opacity(opacity))
                         .child(strings::state_word(state))
+                        // How far along, where the program says (OSC 7501).
+                        .when_some(look.as_ref().and_then(|l| l.progress), |line, percent| {
+                            line.child(div().ml(px(8.0)).child(strings::progress(percent)))
+                        })
                         .child(div().ml_auto().child(elapsed)),
                 )
                 .into_any_element()
