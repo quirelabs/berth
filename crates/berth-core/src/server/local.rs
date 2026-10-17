@@ -103,10 +103,24 @@ struct Shared {
 }
 
 /// The app's handle on a server, this machine's or a host's. Cheap to
-/// clone.
+/// clone. When the last clone goes, panes' included, the connection is
+/// closed and never made again: a host closed in the app is not dialled
+/// for ever after.
 #[derive(Clone)]
 pub struct Server {
     shared: Arc<Mutex<Shared>>,
+    _life: Arc<Life>,
+}
+
+/// Ends the connection's task when the last handle is dropped.
+struct Life(Option<oneshot::Sender<()>>);
+
+impl Drop for Life {
+    fn drop(&mut self) {
+        if let Some(ended) = self.0.take() {
+            let _ = ended.send(());
+        }
+    }
 }
 
 /// This machine's server: the name the app has used for it since D50.
@@ -165,14 +179,16 @@ impl Server {
 
     async fn dial(dial: Dial, expected: String) -> Result<Self> {
         let first = reach(&dial, &expected).await?;
+        let (ended_tx, ended) = oneshot::channel();
         let server = Self {
             shared: Arc::new(Mutex::new(Shared {
                 to_server: Some(first.to_server.clone()),
                 ..Shared::default()
             })),
+            _life: Arc::new(Life(Some(ended_tx))),
         };
         let shared = server.shared.clone();
-        tokio::spawn(route(shared, dial, expected, first));
+        tokio::spawn(route(shared, dial, expected, first, ended));
         Ok(server)
     }
 
@@ -567,12 +583,24 @@ async fn forward(
 }
 
 /// Hand the server's messages to whoever is waiting, and keep connected.
-async fn route(shared: Arc<Mutex<Shared>>, dial: Dial, expected: String, first: client::Client) {
+async fn route(
+    shared: Arc<Mutex<Shared>>,
+    dial: Dial,
+    expected: String,
+    first: client::Client,
+    mut ended: oneshot::Receiver<()>,
+) {
     let mut client = first;
     loop {
         lock(&shared).to_server = Some(client.to_server.clone());
-        while let Some(message) = client.from_server.recv().await {
-            deliver(&shared, message);
+        loop {
+            tokio::select! {
+                message = client.from_server.recv() => match message {
+                    Some(message) => deliver(&shared, message),
+                    None => break,
+                },
+                _ = &mut ended => return,
+            }
         }
         // The connection is gone. Requests in flight will not be answered,
         // and are told why when the supervisor is another build that could
@@ -587,10 +615,17 @@ async fn route(shared: Arc<Mutex<Shared>>, dial: Dial, expected: String, first: 
                 .flatten();
             shared.waiting.clear();
         }
-        tracing::warn!("lost the local server; connecting again");
+        tracing::warn!("lost the server; connecting again");
         client = loop {
-            tokio::time::sleep(RETRY_EVERY).await;
-            if let Ok(client) = reach(&dial, &expected).await {
+            tokio::select! {
+                _ = tokio::time::sleep(RETRY_EVERY) => {}
+                _ = &mut ended => return,
+            }
+            let reached = tokio::select! {
+                reached = reach(&dial, &expected) => reached,
+                _ = &mut ended => return,
+            };
+            if let Ok(client) = reached {
                 break client;
             }
         };

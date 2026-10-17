@@ -274,4 +274,17 @@ async fn a_server_over_a_relay_is_a_server_and_survives_the_relay() {
     assert!(answered, "the session never answered through a new relay");
     assert!(pids.lock().unwrap().len() >= 2, "a second relay was opened");
     server.kill(session).await.unwrap();
+
+    // The app lets go of the server, its pane included: the relay it was
+    // using ends, and no other is opened after it.
+    drop((pty, events, server));
+    let last = *pids.lock().unwrap().last().unwrap();
+    let opened = pids.lock().unwrap().len();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(last) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!alive(last), "the relay outlived the last handle");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(pids.lock().unwrap().len(), opened, "dialled again after");
 }
