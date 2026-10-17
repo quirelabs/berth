@@ -244,6 +244,14 @@ impl Workspace {
             // Closed meanwhile: dropping the handle lets it go.
             return;
         };
+        // Its relays open on the host's connection as it is now, which a
+        // reconnect or a reopen may have replaced while it was reached.
+        *held.current.lock().unwrap_or_else(|p| p.into_inner()) = conn.connection.clone();
+        if conn.server.is_some() {
+            // One handle per host: the first is kept. A pane this one
+            // already shows keeps it alive for itself.
+            return;
+        }
         let lists = self.session_lists.clone();
         let machine = Machine::Host(alias.clone());
         held.server.on_sessions(move |list| {

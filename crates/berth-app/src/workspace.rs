@@ -734,26 +734,23 @@ impl Workspace {
 
     fn check_window_seen(&mut self, cx: &mut Context<Self>) {
         self.check_status_seen(cx);
-        let Some(Ok(server)) = self.local_server.get().cloned() else {
+        if self.servers().is_empty() {
             return;
-        };
+        }
         let now = std::time::Instant::now();
         let recent = |at: Option<std::time::Instant>| at.is_some_and(|at| now - at < SEEN_EVERY);
-        let local = || {
-            self.panes.iter().filter(|p| {
-                p.server_session()
-                    .is_some_and(|s| s.machine == Machine::Local)
-            })
-        };
-        let painted = local().any(|p| recent(p.view.read(cx).last_frame_at));
-        let busy = local().any(|p| recent(p.view.read(cx).intake.last_output()));
+        // Every pane on a server, this machine's or a host's: one window,
+        // drawn or not, whichever server its panes are on.
+        let on_servers = || self.panes.iter().filter(|p| p.server_session().is_some());
+        let painted = on_servers().any(|p| recent(p.view.read(cx).last_frame_at));
+        let busy = on_servers().any(|p| recent(p.view.read(cx).intake.last_output()));
         let seen = if self.window_seen {
             painted || !busy
         } else {
             painted
         };
         if seen != self.window_seen {
-            self.set_window_seen(seen, server.clone(), cx);
+            self.set_window_seen(seen, cx);
         }
         // A pane saying its input was not delivered is drawn again each
         // look, so the notice comes and goes on time.
@@ -810,22 +807,23 @@ impl Workspace {
         }
     }
 
-    fn set_window_seen(
-        &mut self,
-        seen: bool,
-        server: berth_core::server::local::LocalServer,
-        cx: &mut Context<Self>,
-    ) {
-        self.window_seen = seen;
-        tracing::info!(seen, "the window is drawn: told the servers");
-        // Hosts' servers too: while hidden, nothing need cross the link.
-        let servers: Vec<berth_core::server::local::Server> = std::iter::once(server)
+    /// Every server up now: this machine's, and each host's.
+    fn servers(&self) -> Vec<berth_core::server::local::Server> {
+        self.server_of(&Machine::Local)
+            .into_iter()
             .chain(
                 self.conns
                     .values()
                     .filter_map(|c| c.server.as_ref().map(|h| h.server.clone())),
             )
-            .collect();
+            .collect()
+    }
+
+    fn set_window_seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        self.window_seen = seen;
+        tracing::info!(seen, "the window is drawn: told the servers");
+        // Hosts' servers too: while hidden, nothing need cross the link.
+        let servers = self.servers();
         cx.background_executor()
             .spawn(async move {
                 for server in servers {
@@ -837,10 +835,8 @@ impl Workspace {
 
     /// The window became active: it is certainly drawn.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
-        if !self.window_seen
-            && let Some(Ok(server)) = self.local_server.get().cloned()
-        {
-            self.set_window_seen(true, server, cx);
+        if !self.window_seen && !self.servers().is_empty() {
+            self.set_window_seen(true, cx);
         }
     }
 
@@ -2886,14 +2882,22 @@ impl Workspace {
         self.sessions.remove(&session);
         let id = session.id;
         let local = session.machine == Machine::Local;
+        // A host's pane closes once the kill has gone: closing its last pane
+        // ends the connection, and the kill must not be left behind it.
+        let close_after = if local { None } else { pane };
         cx.spawn(async move |this, cx| {
             let _ = runtime::spawn(async move { server.kill(id).await }).await;
-            if local {
-                let _ = this.update(cx, |this, cx| this.refresh_local_sessions(cx));
-            }
+            let _ = this.update(cx, |this, cx| {
+                if local {
+                    this.refresh_local_sessions(cx);
+                }
+                if let Some(pane) = close_after {
+                    this.close(pane, cx);
+                }
+            });
         })
         .detach();
-        if let Some(pane) = pane {
+        if local && let Some(pane) = pane {
             self.close(pane, cx);
         }
         cx.notify();

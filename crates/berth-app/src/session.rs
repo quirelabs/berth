@@ -239,20 +239,51 @@ pub async fn connect_on_server(
         _ => None,
     };
     let terminal = terminal_for(cols, rows, palette);
-    let Some(held) = server else {
-        let attached = rejoin(connection, fallback.clone(), cols, rows).await?;
-        return Ok(OnServer {
-            connected: Connected {
-                connection: attached.connection,
-                pty: attached.pty,
-                terminal,
-                events: attached.events,
-            },
-            next,
-            server: None,
-            shown: Opening::Tmux(fallback),
-        });
-    };
+    // On the server when it answers all the way, on tmux otherwise: a
+    // server that came up and then failed is no reason for the host to.
+    if let Some(held) = server {
+        match open_on_host_server(&connection, &held, last.as_ref(), cols, rows).await {
+            Ok((pty, events, shown)) => {
+                return Ok(OnServer {
+                    connected: Connected {
+                        connection,
+                        pty,
+                        terminal,
+                        events,
+                    },
+                    next,
+                    server: Some(held),
+                    shown,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(alias = %host.alias, %error, "the host's server failed; using tmux");
+            }
+        }
+    }
+    let attached = rejoin(connection, fallback.clone(), cols, rows).await?;
+    Ok(OnServer {
+        connected: Connected {
+            connection: attached.connection,
+            pty: attached.pty,
+            terminal,
+            events: attached.events,
+        },
+        next,
+        server: None,
+        shown: Opening::Tmux(fallback),
+    })
+}
+
+/// Open what a host on its server should show: see [`crate::machine::opening`].
+async fn open_on_host_server(
+    connection: &Arc<Connection>,
+    held: &HostServer,
+    last: Option<&berth_core::settings::LastSession>,
+    cols: u16,
+    rows: u16,
+) -> berth_core::Result<(Pty, mpsc::Receiver<PtyEvent>, crate::machine::Opening)> {
+    use crate::machine::Opening;
     let on_server: Vec<u64> = held.server.list().await?.iter().map(|s| s.id).collect();
     let in_tmux: Vec<String> = match connection.exec(&berth_core::agents::scan_command()).await {
         Ok(out) => crate::sidebar::listing(&berth_core::agents::parse_scan(&out.stdout_string()))
@@ -260,33 +291,21 @@ pub async fn connect_on_server(
             .collect(),
         Err(_) => Vec::new(),
     };
-    let shown = crate::machine::opening(last.as_ref(), &on_server, &in_tmux);
-    let (pty, events, shown) = match shown {
+    match crate::machine::opening(last, &on_server, &in_tmux) {
         Opening::Tmux(slug) => {
             let attached = rejoin(connection.clone(), slug.clone(), cols, rows).await?;
-            (attached.pty, attached.events, Opening::Tmux(slug))
+            Ok((attached.pty, attached.events, Opening::Tmux(slug)))
         }
         Opening::Server(id) => {
             let (pty, events) = held.server.attach(id, cols, rows, None).await?;
-            (pty, events, Opening::Server(id))
+            Ok((pty, events, Opening::Server(id)))
         }
         Opening::NewServer => {
             let id = held.server.create(None, cols, rows, None, None).await?;
             let (pty, events) = held.server.attach(id, cols, rows, None).await?;
-            (pty, events, Opening::Server(id))
+            Ok((pty, events, Opening::Server(id)))
         }
-    };
-    Ok(OnServer {
-        connected: Connected {
-            connection,
-            pty,
-            terminal,
-            events,
-        },
-        next,
-        server: Some(held),
-        shown,
-    })
+    }
 }
 
 /// What a host offered when asked for its key, without being trusted.
