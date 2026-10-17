@@ -8,7 +8,7 @@ fn main() -> std::process::ExitCode {
         Some(code) => code,
         None => {
             eprintln!(
-                "usage: berth-server --version | --remove [--force] | --supervisor | --worker ... | --bench-throughput [kind ...] [--mb N]"
+                "usage: berth-server --version | --remove [--force] | --connect | --supervisor | --worker ... | --bench-throughput [kind ...] [--mb N]"
             );
             std::process::ExitCode::FAILURE
         }

@@ -11,6 +11,7 @@
 pub mod install;
 pub mod manifest;
 pub mod probe;
+pub mod relay;
 
 use std::future::Future;
 

@@ -144,7 +144,23 @@ struct Session {
     info: SessionInfo,
     to_worker: ToWorker,
     attached: HashSet<ClientId>,
+    /// The size each attached client shows it at. A session has one size,
+    /// a terminal's: the client that was last active sets it, and the
+    /// others see the screen at that size (D55).
+    sizes: HashMap<ClientId, (u16, u16)>,
     build: String,
+}
+
+impl Session {
+    /// Whether `client` showing this session at its own size calls for a
+    /// resize first: it is the one active now, and its size is not the
+    /// session's.
+    fn size_for(&self, client: ClientId) -> Option<(u16, u16)> {
+        self.sizes
+            .get(&client)
+            .copied()
+            .filter(|size| *size != (self.info.cols, self.info.rows))
+    }
 }
 
 /// One client's own bounded queue. The table never waits on a client: a full
@@ -448,6 +464,7 @@ impl State {
         self.clients.remove(&client);
         for session in self.sessions.values_mut() {
             session.attached.remove(&client);
+            session.sizes.remove(&client);
         }
     }
 
@@ -481,6 +498,7 @@ impl State {
                         info: *info,
                         to_worker,
                         attached: HashSet::new(),
+                        sizes: HashMap::new(),
                         build,
                     },
                 );
@@ -685,6 +703,7 @@ impl State {
                     return;
                 };
                 entry.attached.insert(client);
+                entry.sizes.insert(client, (cols, rows));
                 entry.info.cols = cols;
                 entry.info.rows = rows;
                 self.queue_for_worker(client, session, message).await;
@@ -692,6 +711,7 @@ impl State {
             ToServer::Detach { session } => {
                 if let Some(entry) = self.sessions.get_mut(&session) {
                     entry.attached.remove(&client);
+                    entry.sizes.remove(&client);
                 }
             }
             ToServer::Resize {
@@ -700,12 +720,33 @@ impl State {
                 rows,
             } => {
                 if let Some(entry) = self.sessions.get_mut(&session) {
+                    entry.sizes.insert(client, (cols, rows));
                     entry.info.cols = cols;
                     entry.info.rows = rows;
                 }
                 self.forward(client, session, message).await;
             }
-            ToServer::Input { session, .. } | ToServer::Kill { session } => {
+            // Typing is being active: a client typing into a session that is
+            // at another client's size takes it back to its own first, so
+            // what it types meets the screen it sees (D55). Scrolling stays
+            // each client's own.
+            ToServer::Input { session, .. } => {
+                let resize = self.sessions.get_mut(&session).and_then(|entry| {
+                    let (cols, rows) = entry.size_for(client)?;
+                    entry.info.cols = cols;
+                    entry.info.rows = rows;
+                    Some(ToServer::Resize {
+                        session,
+                        cols,
+                        rows,
+                    })
+                });
+                if let Some(resize) = resize {
+                    self.forward(client, session, resize).await;
+                }
+                self.forward(client, session, message).await;
+            }
+            ToServer::Kill { session } => {
                 self.forward(client, session, message).await;
             }
             // Dropped rather than queued when the worker is not reading:
@@ -943,8 +984,54 @@ where
     }
 }
 
-/// Start a process that outlives this one: its own process group on Unix,
-/// detached and out of the job object on Windows (D49).
+/// The C library's own calls for detaching, declared here rather than taken
+/// from a crate.
+#[cfg(unix)]
+mod detach {
+    use std::ffi::c_int;
+
+    unsafe extern "C" {
+        #[link_name = "setsid"]
+        fn c_setsid() -> c_int;
+        #[link_name = "fcntl"]
+        fn c_fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        #[link_name = "getdtablesize"]
+        fn c_getdtablesize() -> c_int;
+    }
+
+    /// `F_SETFD` and `FD_CLOEXEC`: the same on Linux and macOS.
+    const F_SETFD: c_int = 2;
+    const FD_CLOEXEC: c_int = 1;
+
+    /// The most descriptors looked at, whatever the limit says: a process
+    /// started from an ssh channel holds a handful.
+    const AT_MOST: c_int = 65_536;
+
+    /// Start a session of its own. Async-signal-safe, for between fork and
+    /// exec.
+    pub fn setsid() -> c_int {
+        // SAFETY: no arguments, no memory.
+        unsafe { c_setsid() }
+    }
+
+    /// Mark every descriptor past stderr to close on exec, so a child
+    /// started next holds none of them: what this process was handed, by
+    /// an ssh channel or anything else, stays here. Rust opens its own that
+    /// way already.
+    pub fn close_on_exec() {
+        // SAFETY: plain integers in and out.
+        let limit = unsafe { c_getdtablesize() }.clamp(3, AT_MOST);
+        for fd in 3..limit {
+            // SAFETY: sets one flag on a descriptor; one that is not open
+            // fails harmlessly.
+            unsafe { c_fcntl(fd, F_SETFD, FD_CLOEXEC) };
+        }
+    }
+}
+
+/// Start a process that outlives this one: a session of its own on Unix,
+/// holding none of this process's descriptors but the standard three, sent
+/// to /dev/null; detached and out of the job object on Windows (D49, D55).
 ///
 /// `env` sets or, where `None`, removes variables, so a value the supervisor
 /// happened to inherit never reaches a worker by accident.
@@ -968,7 +1055,23 @@ pub fn spawn_detached(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // Nothing past the standard three goes with it, so it holds open
+        // nothing this process was handed: an exec channel waits for all of
+        // its descriptors to close (D55).
+        detach::close_on_exec();
+        // A session of its own, so nothing that ends the session it was
+        // started from (an ssh channel closing, a terminal hanging up)
+        // reaches it.
+        // SAFETY: between fork and exec only setsid is called, which is
+        // async-signal-safe, and nothing is allocated.
+        unsafe {
+            command.pre_exec(|| {
+                if detach::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {

@@ -157,8 +157,29 @@ async fn the_server_installs_on_a_real_host_and_is_removed() {
         Next::Use(_)
     ));
 
+    // The transport (D55): an exec channel running the relay, read past
+    // whatever the shell prints, greeted by the supervisor the relay starts,
+    // of the build just installed. A second relay finds it running and asks
+    // it, through the core, for its sessions: none. Both channels close
+    // again: the supervisor, detached, holds neither open.
+    let stream = berth_core::remote::relay::open(&connection, &plan.path)
+        .await
+        .expect("the relay");
+    let opened = berth_core::server::link::open(stream, &berth_core::server::link::hello())
+        .await
+        .expect("the supervisor greeted");
+    assert_eq!(opened.theirs.build, plan.build);
+    let second = berth_core::remote::relay::open(&connection, &plan.path)
+        .await
+        .expect("a second relay");
+    let sessions = berth_core::server::client::core_over(second, berth_proto::core::Ask::Sessions)
+        .await
+        .expect("the core answered");
+    assert!(sessions.is_empty(), "{sessions:?}");
+    drop(opened);
+
     // Its own removal command, as given: the server finds its data directory
-    // from where it is installed.
+    // from where it is installed, and stops the supervisor it started.
     let removed = connection.run(&plan.removal(), b"").await.unwrap();
     eprintln!("{}{}", removed.stdout_string(), removed.stderr_string());
     assert!(removed.succeeded());

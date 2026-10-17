@@ -569,6 +569,42 @@ async fn program_status_reaches_the_app_and_outlives_it() {
 /// A session two apps have open ends for both when one ends it, also right
 /// after a flood, with the second app attaching at its end and reading
 /// nothing: the worker must go, not linger with its shell dead.
+/// Two apps on one session at different sizes: the one typing sets the
+/// size, so what it types meets the screen it sees, and the other sees the
+/// screen at that size until it types in turn (D55).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_typing_sets_the_size_of_a_session_two_show() {
+    let server = server().await;
+    let mut small = client::connect(&server.places).await.unwrap();
+    let session = create(&mut small).await;
+    attach(&mut small, session).await;
+    // The shell is up and reading.
+    type_line(&small, session, "echo R_$((1+1))").await;
+    until_output_within(&mut small, "R_2", Duration::from_secs(10)).await;
+
+    let mut large = client::connect(&server.places).await.unwrap();
+    large
+        .to_server
+        .send(ToServer::Attach {
+            session,
+            cols: 60,
+            rows: 12,
+        })
+        .await
+        .unwrap();
+    type_line(&large, session, "echo L_$(stty size | tr ' ' x)").await;
+    until_output_within(&mut large, "L_12x60", Duration::from_secs(10)).await;
+
+    // The smaller app types: back to its size, before what it typed runs.
+    type_line(&small, session, "echo S_$(stty size | tr ' ' x)").await;
+    until_output_within(&mut small, "S_10x40", Duration::from_secs(10)).await;
+
+    // And the larger one again.
+    type_line(&large, session, "echo T_$(stty size | tr ' ' x)").await;
+    until_output_within(&mut large, "T_12x60", Duration::from_secs(10)).await;
+    let _ = small.to_server.send(ToServer::Kill { session }).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ending_a_session_two_apps_have_open_ends_it() {
     let server = server().await;

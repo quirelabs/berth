@@ -103,7 +103,7 @@ async fn reach(places: &Places, start: &Start, expected: &str) -> Result<client:
     };
     places.prepare()?;
     let copy = paths::install_copy(&places.bin, exe)?;
-    super::supervisor::spawn_detached(&copy, &["--supervisor".to_string()], &[])?;
+    super::start::ensure_running(places, &copy).await?;
     let deadline = tokio::time::Instant::now() + START_WITHIN;
     loop {
         match client::connect_expecting(places, expected).await {

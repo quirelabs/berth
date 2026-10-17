@@ -296,6 +296,19 @@ impl Connection {
         drain(&mut channel).await
     }
 
+    /// Run `command` on an exec channel and hand back the channel as a byte
+    /// stream both ways: no pty, and no login shell beyond the one sshd
+    /// itself runs the command with. What Berth's server relay rides on
+    /// (D55).
+    pub async fn open_stream(
+        &self,
+        command: &str,
+    ) -> Result<russh::ChannelStream<russh::client::Msg>> {
+        let channel = self.handle.channel_open_session().await?;
+        channel.exec(true, command).await?;
+        Ok(channel.into_stream())
+    }
+
     /// Open an interactive shell, attaching to `session`'s tmux session.
     ///
     /// `new-session -A` makes first connect and re-attach the same code path,

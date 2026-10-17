@@ -101,6 +101,12 @@ impl Places {
         self.run.join("s.pid")
     }
 
+    /// Held while a supervisor is being started, so two arriving together
+    /// start one (D55).
+    pub fn start_lock(&self) -> PathBuf {
+        self.run.join("start.lock")
+    }
+
     pub fn worker_pid(&self, session: SessionId) -> PathBuf {
         self.run.join(format!("w{session}.pid"))
     }

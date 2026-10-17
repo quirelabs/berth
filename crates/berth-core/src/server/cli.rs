@@ -27,7 +27,7 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
     }
     if !matches!(
         mode,
-        "--supervisor" | "--worker" | "--bench-throughput" | "--bench-engine"
+        "--supervisor" | "--worker" | "--connect" | "--bench-throughput" | "--bench-engine"
     ) {
         return None;
     }
@@ -41,6 +41,8 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
     let ok = runtime.block_on(async {
         match mode {
             "--supervisor" => super::supervisor::run_process().await.map(|()| true),
+            // The far end of the app's exec channel on a host (D55).
+            "--connect" => super::relay::run_process().await,
             "--worker" => super::worker_host::run_process(args).await.map(|()| true),
             "--bench-engine" => super::bench::run_engine(args).await,
             _ => super::bench::run_process(args).await,
