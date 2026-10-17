@@ -224,6 +224,9 @@ struct Pane {
     /// A pane for a session on its host's server (D55), its id known or
     /// not yet: never a tmux session, whatever its slug.
     on_server: bool,
+    /// A restored host pane being attached now: attached once, and kept
+    /// restored until it is, so a failure leaves it to try again.
+    attaching: bool,
 }
 
 impl Pane {
@@ -1748,6 +1751,7 @@ impl Workspace {
             direct: None,
             starting: false,
             on_server: false,
+            attaching: false,
         });
 
         // The first session to land is shown whether or not it was asked for
@@ -1829,9 +1833,9 @@ impl Workspace {
                 HostStatus::Connection(ConnectionState::Connecting),
             );
             // Its tabs came back from the last run: connected for them,
-            // with no tab of its own.
+            // with no tab of its own (see `connect`).
             if self.has_restored(&host.alias) {
-                self.reconnect_restored(host.alias.clone(), cx);
+                self.connect(host, None, asked_for, cx);
                 continue;
             }
             if asked_for {
@@ -1847,6 +1851,15 @@ impl Workspace {
     /// which is what warming and a click on a host have always reattached to.
     fn connect(&mut self, host: Host, slug: Option<String>, show: bool, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
+        // Its panes came back from the last run: they are what it shows,
+        // attached once it connects, and no tab of its own opens.
+        if slug.is_none() && self.has_restored(&alias) {
+            self.reconnect_restored(alias.clone(), cx);
+            if show && let Some(pane) = self.pane_for(&alias) {
+                self.focus_pane(pane, cx);
+            }
+            return;
+        }
         // A host whose server was installed opens what it should show
         // there (D55); asked for a tmux session by name, it opens that.
         if slug.is_none()
@@ -2045,8 +2058,17 @@ impl Workspace {
         if matches!(self.statuses.get(&alias), Some(HostStatus::Verifying)) {
             return;
         }
-        // Restored from the last run and not connected: try again.
-        if !self.conns.contains_key(&alias) && self.has_restored(&alias) {
+        // Restored from the last run and not connected: try again, once
+        // the host is trusted; a host never trusted is verified first, and
+        // its panes attach after.
+        if !self.conns.contains_key(&alias)
+            && self.has_restored(&alias)
+            && let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned()
+        {
+            if !berth_core::known_hosts::is_known(&host.hostname, host.port) {
+                self.verify(host, cx);
+                return;
+            }
             self.reconnect_restored(alias.clone(), cx);
         }
         // Already open somewhere: go to it rather than opening a second one.

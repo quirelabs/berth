@@ -170,11 +170,23 @@ impl Workspace {
                         session::start_forwards(reached.connection.clone(), &forwards).await;
                     let _ = this.update(cx, |this, cx| {
                         this.restoring.remove(&alias);
-                        this.join_connection(&alias, reached.connection, forwarders, cx);
-                        if let Some(held) = reached.server {
-                            this.hold_host_server(alias.clone(), held, cx);
+                        // Every pane it was for closed meanwhile: nothing
+                        // needs it, and it goes with this scope.
+                        if !this.has_restored(&alias) && this.sessions_on(&alias) == 0 {
+                            this.statuses.insert(
+                                alias.clone(),
+                                HostStatus::Connection(ConnectionState::Disconnected),
+                            );
+                            cx.notify();
+                            return;
                         }
-                        this.server_decided(alias.clone(), reached.next, false, cx);
+                        // Connected another way meanwhile: that one is kept.
+                        if this.join_connection(&alias, reached.connection, forwarders, cx) {
+                            if let Some(held) = reached.server {
+                                this.hold_host_server(alias.clone(), held, cx);
+                            }
+                            this.server_decided(alias.clone(), reached.next, false, cx);
+                        }
                         this.attach_restored(alias, cx);
                     });
                 }
@@ -204,19 +216,29 @@ impl Workspace {
         let waiting: Vec<(u64, HostSession, Entity<TerminalView>)> = self
             .panes
             .iter_mut()
-            .filter(|p| !p.is_local() && p.alias() == alias)
+            .filter(|p| !p.is_local() && p.alias() == alias && !p.attaching)
             .filter_map(|p| {
                 let host = p.restored.as_ref()?.host.clone()?;
-                p.restored = None;
+                p.attaching = true;
                 Some((p.id, host, p.view.clone()))
             })
+            .collect();
+        // Tmux slugs not in use here, one for each server pane that may
+        // have to fall back, none of them the same.
+        let open = self.open_sessions();
+        let mut taken: Vec<String> = crate::sidebar::taken(&alias, &open, &self.running)
+            .into_iter()
+            .map(str::to_string)
             .collect();
         for (id, saved, view) in waiting {
             let size = view.read(cx).grid_size();
             let connection = connection.clone();
             let server = server.clone();
-            // A tmux slug not in use here, should a server pane fall back.
-            let spare = self.free_slug(&alias);
+            let spare = {
+                let refs: Vec<&str> = taken.iter().map(String::as_str).collect();
+                super::free_slug(&Self::slug(), &refs)
+            };
+            taken.push(spare.clone());
             cx.spawn(async move |this, cx| {
                 let opened = runtime::spawn(async move {
                     reattach_one(connection, server, saved, spare, size.cols, size.rows).await
@@ -229,6 +251,8 @@ impl Workspace {
                         let Some(pane) = this.pane_mut(id) else {
                             return;
                         };
+                        pane.restored = None;
+                        pane.attaching = false;
                         match now {
                             HostSession::Tmux(slug) => {
                                 pane.on_server = false;
@@ -250,7 +274,12 @@ impl Workspace {
                         cx.notify();
                     }
                     Err(error) => {
+                        // Still restored: tried again when its tab is
+                        // shown, the host clicked or the connection back.
                         tracing::warn!(pane = id, %error, "a restored pane could not attach");
+                        if let Some(pane) = this.pane_mut(id) {
+                            pane.attaching = false;
+                        }
                         this.warnings.push(error);
                         cx.notify();
                     }
@@ -313,6 +342,7 @@ impl Workspace {
             direct: None,
             starting: false,
             on_server,
+            attaching: false,
         });
         id
     }
