@@ -405,6 +405,8 @@ pub struct Workspace {
     sessions: crate::machine::Sessions,
     /// Hosts whose server is being reached, so it is reached once.
     server_starting: std::collections::BTreeSet<String>,
+    /// Hosts being connected for their restored panes, so once each.
+    restoring: std::collections::BTreeSet<String>,
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
@@ -704,6 +706,7 @@ impl Workspace {
             local_server: Default::default(),
             sessions: Default::default(),
             server_starting: Default::default(),
+            restoring: Default::default(),
             window_seen: true,
             status_shown: Looked::default(),
             hook_done_seen: std::collections::HashSet::new(),
@@ -1159,35 +1162,8 @@ impl Workspace {
             )),
         };
 
-        // A second session on a host joins the connection that is already
-        // there rather than opening another one.
-        let fresh = !self.conns.contains_key(&alias);
+        let fresh = self.join_connection(&alias, connected.connection.clone(), forwarders, cx);
         if fresh {
-            let mut reconnect = crate::reconnect::Driver::new();
-            reconnect.handle(Event::Open);
-            reconnect.handle(Event::ConnectSucceeded);
-            self.conns.insert(
-                alias.clone(),
-                Conn {
-                    connection: connected.connection.clone(),
-                    forwarders,
-                    reconnect,
-                    rtt: None,
-                    server: None,
-                },
-            );
-        }
-
-        self.statuses.insert(
-            alias.clone(),
-            HostStatus::Connection(ConnectionState::Connected),
-        );
-        self.report_cold_start(&alias);
-        // One driver and one measurement per connection, not per session.
-        if fresh {
-            self.drive(alias.clone(), cx);
-            self.measure_rtt(alias.clone(), cx);
-            self.watch_agents(alias.clone(), cx);
             // Only a host the user asked for is asked anything, and a
             // benchmark run is never interrupted by a question.
             let asking = matches!(place_shown, Some(true));
@@ -1197,6 +1173,46 @@ impl Workspace {
         }
         cx.notify();
         placed
+    }
+
+    /// A host's connection, kept for every session on it: a second session
+    /// joins the one already there rather than opening another. Whether it
+    /// was the first, which starts its clock, its measurement and its scan,
+    /// one of each per connection.
+    fn join_connection(
+        &mut self,
+        alias: &str,
+        connection: Arc<Connection>,
+        forwarders: Vec<Forwarder>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let fresh = !self.conns.contains_key(alias);
+        if fresh {
+            let mut reconnect = crate::reconnect::Driver::new();
+            reconnect.handle(Event::Open);
+            reconnect.handle(Event::ConnectSucceeded);
+            self.conns.insert(
+                alias.to_string(),
+                Conn {
+                    connection,
+                    forwarders,
+                    reconnect,
+                    rtt: None,
+                    server: None,
+                },
+            );
+        }
+        self.statuses.insert(
+            alias.to_string(),
+            HostStatus::Connection(ConnectionState::Connected),
+        );
+        self.report_cold_start(alias);
+        if fresh {
+            self.drive(alias.to_string(), cx);
+            self.measure_rtt(alias.to_string(), cx);
+            self.watch_agents(alias.to_string(), cx);
+        }
+        fresh
     }
 
     /// Open a shell on this machine: a new session on the local server
@@ -1812,6 +1828,12 @@ impl Workspace {
                 host.alias.clone(),
                 HostStatus::Connection(ConnectionState::Connecting),
             );
+            // Its tabs came back from the last run: connected for them,
+            // with no tab of its own.
+            if self.has_restored(&host.alias) {
+                self.reconnect_restored(host.alias.clone(), cx);
+                continue;
+            }
             if asked_for {
                 self.empty = Empty::Connecting(host.alias.clone());
             }
@@ -2022,6 +2044,10 @@ impl Workspace {
         }
         if matches!(self.statuses.get(&alias), Some(HostStatus::Verifying)) {
             return;
+        }
+        // Restored from the last run and not connected: try again.
+        if !self.conns.contains_key(&alias) && self.has_restored(&alias) {
+            self.reconnect_restored(alias.clone(), cx);
         }
         // Already open somewhere: go to it rather than opening a second one.
         if let Some(pane) = self.pane_for(&alias)
@@ -2754,7 +2780,6 @@ impl Workspace {
         };
         let pane = self.panes.remove(index);
         let alias = pane.alias().to_string();
-        let local = pane.is_local();
         tracing::info!(%alias, session = %pane.tmux_name(), "detached");
         drop(pane);
 
@@ -2793,12 +2818,10 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.empty = Empty::FirstRun;
         }
-        // A closed local shell has ended, so it must not come back at the next
-        // launch. Saved now rather than at the next minute or at quit, which a
-        // crash would skip.
-        if local {
-            self.save_local(cx);
-        }
+        // A closed tab must not come back at the next launch. Saved now
+        // rather than at the next minute or at quit, which a crash would
+        // skip.
+        self.save_local(cx);
         // Closing can put a restored tab on screen.
         self.wake_active(cx);
         cx.notify();

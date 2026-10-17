@@ -1,14 +1,16 @@
-//! Local sessions kept across a quit or a reboot (D46).
+//! Tabs kept across a quit or a reboot (D46, D55).
 //!
-//! The shell itself ends with Berth (D36). Its tab, its split, its directory
-//! and its last screen are saved every minute, when a local tab closes and on
-//! quit. On launch the tabs come back with nothing running, and a tab's shells
-//! start, in their saved directories under their old screens, when that tab is
-//! first shown. A tab never looked at costs no process.
+//! Every tab, its split and each pane's last screen are saved every minute,
+//! when a tab closes and on quit. On launch they come back as they were. A
+//! local pane's shell starts, in its saved directory under its old screen,
+//! when its tab is first shown, so a tab never looked at costs no process.
+//! A host's panes attach again once the host connects, which it does at
+//! launch: its tmux sessions by name, its server's by id, and a server
+//! session that has ended since gets a new one in the same pane.
 
 use std::path::PathBuf;
 
-use berth_core::restore::{Saved, SavedClaude, SavedPane, SavedTab};
+use berth_core::restore::{HostSession, Saved, SavedClaude, SavedHost, SavedPane, SavedTab};
 
 use super::*;
 
@@ -28,6 +30,8 @@ pub(super) struct Restored {
     /// still running (D50), and that session's pane token.
     pub session: Option<u64>,
     pub token: Option<String>,
+    /// For a host's pane, the session on the host to attach to again.
+    pub host: Option<HostSession>,
 }
 
 /// Where a pane's directory comes from when saving: already known, or to be
@@ -49,6 +53,18 @@ impl Workspace {
         tabs.sort_by_key(|t| t.position);
 
         for tab in tabs {
+            // A host no longer in ssh config takes its tab with it: there
+            // is nothing to attach its panes to.
+            let unknown = tab.panes.iter().find_map(|p| {
+                p.host
+                    .as_ref()
+                    .filter(|h| !self.hosts.iter().any(|known| known.alias == h.alias))
+                    .map(|h| h.alias.clone())
+            });
+            if let Some(alias) = unknown {
+                tracing::info!(%alias, "a restored tab's host is not configured now; not restored");
+                continue;
+            }
             let ids: Vec<u64> = tab
                 .panes
                 .into_iter()
@@ -75,7 +91,7 @@ impl Workspace {
             );
         }
         self.active = 0;
-        tracing::info!(tabs = self.tabs.len(), "restored local sessions");
+        tracing::info!(tabs = self.tabs.len(), "restored tabs");
         self.wake_active(cx);
     }
 
@@ -94,9 +110,155 @@ impl Workspace {
             .into_iter()
             .filter(|id| self.pane(*id).is_some_and(|p| p.restored.is_some()))
             .collect();
+        let mut hosts = std::collections::BTreeSet::new();
         for id in waiting {
-            self.resume(id, cx);
+            match self.pane(id).and_then(|p| p.host.as_ref()) {
+                // A host's pane waits for its host; shown, it is tried again
+                // if the host is not on its way.
+                Some(host) => {
+                    hosts.insert(host.alias.clone());
+                }
+                None => self.resume(id, cx),
+            }
         }
+        for alias in hosts {
+            self.reconnect_restored(alias, cx);
+        }
+    }
+
+    /// Whether any pane of a host is a restored one still to attach.
+    pub(super) fn has_restored(&self, alias: &str) -> bool {
+        self.panes
+            .iter()
+            .any(|p| p.restored.is_some() && p.alias() == alias && !p.is_local())
+    }
+
+    /// Connect a host whose panes came back from the last run, and attach
+    /// them (D55). Once at a time per host; a host already connected only
+    /// attaches. Nothing opens a tab of its own here.
+    pub(super) fn reconnect_restored(&mut self, alias: String, cx: &mut Context<Self>) {
+        if self.conns.contains_key(&alias) {
+            self.attach_restored(alias, cx);
+            return;
+        }
+        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+        if !berth_core::known_hosts::is_known(&host.hostname, host.port) {
+            return;
+        }
+        if !self.restoring.insert(alias.clone()) {
+            return;
+        }
+        self.statuses.insert(
+            alias.clone(),
+            HostStatus::Connection(ConnectionState::Connecting),
+        );
+        tracing::info!(%alias, "connecting for its restored panes");
+        let choice = self.settings.host_server(&alias);
+        let forwards = host.forwards.clone();
+        cx.spawn(async move |this, cx| {
+            let manifest = crate::servers::carried().map(|s| &s.manifest);
+            let reached =
+                runtime::spawn(async move { session::reach_host(&host, choice, manifest).await })
+                    .await
+                    .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
+            match reached {
+                Ok(reached) => {
+                    let forwarders =
+                        session::start_forwards(reached.connection.clone(), &forwards).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.restoring.remove(&alias);
+                        this.join_connection(&alias, reached.connection, forwarders, cx);
+                        if let Some(held) = reached.server {
+                            this.hold_host_server(alias.clone(), held, cx);
+                        }
+                        this.server_decided(alias.clone(), reached.next, false, cx);
+                        this.attach_restored(alias, cx);
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%alias, %error, "could not connect for restored panes");
+                    let _ = this.update(cx, |this, cx| {
+                        this.restoring.remove(&alias);
+                        this.statuses
+                            .insert(alias.clone(), HostStatus::Failed(error));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Attach every restored pane of a connected host, in whatever tab: a
+    /// tmux one to its session by name, which tmux makes again if it has
+    /// gone; a server one to its session by id, or to a new one in the same
+    /// pane if it has ended or the host's server cannot be used.
+    pub(super) fn attach_restored(&mut self, alias: String, cx: &mut Context<Self>) {
+        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
+            return;
+        };
+        let server = self.server_of(&Machine::Host(alias.clone()));
+        let waiting: Vec<(u64, HostSession, Entity<TerminalView>)> = self
+            .panes
+            .iter_mut()
+            .filter(|p| !p.is_local() && p.alias() == alias)
+            .filter_map(|p| {
+                let host = p.restored.as_ref()?.host.clone()?;
+                p.restored = None;
+                Some((p.id, host, p.view.clone()))
+            })
+            .collect();
+        for (id, saved, view) in waiting {
+            let size = view.read(cx).grid_size();
+            let connection = connection.clone();
+            let server = server.clone();
+            // A tmux slug not in use here, should a server pane fall back.
+            let spare = self.free_slug(&alias);
+            cx.spawn(async move |this, cx| {
+                let opened = runtime::spawn(async move {
+                    reattach_one(connection, server, saved, spare, size.cols, size.rows).await
+                })
+                .await
+                .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()));
+                let _ = this.update(cx, |this, cx| match opened {
+                    Ok((pty, events, now)) => {
+                        let Some(pane) = this.pane_mut(id) else {
+                            return;
+                        };
+                        match now {
+                            HostSession::Tmux(slug) => {
+                                pane.on_server = false;
+                                pane.session = None;
+                                pane.slug = slug;
+                            }
+                            HostSession::Server(session) => {
+                                pane.on_server = true;
+                                pane.session = Some(session);
+                                pane.slug = server_slug(session);
+                            }
+                        }
+                        // The grid stays: the session's own screen comes
+                        // over it.
+                        view.update(cx, |view, _| {
+                            view.swap_pty(pty);
+                            session::start_pump(view, events);
+                        });
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        tracing::warn!(pane = id, %error, "a restored pane could not attach");
+                        this.warnings.push(error);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn restored_pane(
@@ -118,10 +280,26 @@ impl Workspace {
         self.next_pane_id += 1;
         let id = self.next_pane_id;
         self.watch_signals(id, &view, cx);
+        let host = saved.host.as_ref().and_then(|saved| {
+            self.hosts
+                .iter()
+                .find(|h| h.alias == saved.alias)
+                .cloned()
+                .map(|host| (host, saved.session.clone()))
+        });
+        let (slug, on_server) = match host.as_ref().map(|(_, session)| session) {
+            None => (strings::LOCAL_ALIAS.to_string(), false),
+            Some(HostSession::Tmux(slug)) => (slug.clone(), false),
+            Some(HostSession::Server(session)) => (server_slug(*session), true),
+        };
+        let (host, host_session) = match host {
+            Some((host, session)) => (Some(host), Some(session)),
+            None => (None, None),
+        };
         self.panes.push(Pane {
             id,
-            host: None,
-            slug: strings::LOCAL_ALIAS.to_string(),
+            host,
+            slug,
             view,
             claude: None,
             restored: Some(Restored {
@@ -129,11 +307,12 @@ impl Workspace {
                 claude: saved.claude,
                 session: saved.session,
                 token: saved.token,
+                host: host_session,
             }),
             session: None,
             direct: None,
             starting: false,
-            on_server: false,
+            on_server,
         });
         id
     }
@@ -249,17 +428,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Every tab that holds only local shells, as it would be saved, with the
-    /// directories still to be looked up.
-    ///
-    /// Remote tabs are not saved here: their sessions live in tmux on the
-    /// server, and the sidebar lists them whether a tab is open or not.
+    /// Every tab as it would be saved, local panes with their directories
+    /// still to be looked up and hosts' panes with their host and session.
     fn snapshot_local(&self, cx: &Context<Self>) -> Vec<(SavedTab, Vec<Dir>)> {
         let mut out = Vec::new();
         for (position, tab) in self.tabs.iter().enumerate() {
             let order = tab.root.panes();
             let panes: Vec<&Pane> = order.iter().filter_map(|id| self.pane(*id)).collect();
-            if panes.len() != order.len() || panes.iter().any(|p| !p.is_local()) {
+            if panes.len() != order.len() {
                 continue;
             }
             let Some(layout) = crate::restore::layout_of(&tab.root, &order) else {
@@ -272,6 +448,28 @@ impl Workspace {
                 let Some((screen, size)) = view.saved_screen() else {
                     continue;
                 };
+                if let Some(host) = &pane.host {
+                    // A server pane whose session has not come yet has
+                    // nothing to attach to again: its tab is not saved.
+                    let Some(session) = host_session(pane) else {
+                        continue;
+                    };
+                    dirs.push(Dir::Known(None));
+                    saved.push(SavedPane {
+                        cwd: None,
+                        cols: size.cols,
+                        rows: size.rows,
+                        screen,
+                        claude: None,
+                        session: None,
+                        token: None,
+                        host: Some(SavedHost {
+                            alias: host.alias.clone(),
+                            session,
+                        }),
+                    });
+                    continue;
+                }
                 dirs.push(
                     match (&pane.restored, view.pty().and_then(|p| p.local_pid())) {
                         (Some(restored), _) => Dir::Known(restored.cwd.clone()),
@@ -300,6 +498,7 @@ impl Workspace {
                         Some(restored) => restored.claude.clone(),
                         None => pane.claude.as_ref().and_then(|c| conversation(&c.tracker)),
                     },
+                    host: None,
                 });
             }
             if saved.len() != order.len() {
@@ -382,6 +581,54 @@ fn conversation(tracker: &berth_core::claude::Tracker) -> Option<SavedClaude> {
         session: tracker.session_id.clone()?,
         dir: tracker.cwd.clone()?,
     })
+}
+
+/// The session a host's pane shows, to attach to again: as it was restored
+/// if it has not attached yet, else its id on the host's server or its tmux
+/// slug. None for a server pane whose session has not come.
+fn host_session(pane: &Pane) -> Option<HostSession> {
+    if let Some(saved) = pane.restored.as_ref().and_then(|r| r.host.clone()) {
+        return Some(saved);
+    }
+    match (pane.on_server, pane.session) {
+        (true, Some(id)) => Some(HostSession::Server(id)),
+        (true, None) => None,
+        (false, _) => Some(HostSession::Tmux(pane.slug.clone())),
+    }
+}
+
+/// Attach a restored host pane's session again, or what stands in for it:
+/// see [`Workspace::attach_restored`]. What it shows now comes back with
+/// the pty.
+async fn reattach_one(
+    connection: Arc<Connection>,
+    server: Option<berth_core::server::local::Server>,
+    saved: HostSession,
+    spare: String,
+    cols: u16,
+    rows: u16,
+) -> berth_core::Result<(
+    berth_core::pty::Pty,
+    tokio::sync::mpsc::Receiver<berth_core::pty::PtyEvent>,
+    HostSession,
+)> {
+    let slug = match (saved, server) {
+        (HostSession::Tmux(slug), _) => slug,
+        (HostSession::Server(id), Some(server)) => {
+            let running = server.list().await?.iter().any(|s| s.id == id);
+            let id = if running {
+                id
+            } else {
+                server.create(None, cols, rows, None, None).await?
+            };
+            let (pty, events) = server.attach(id, cols, rows, None).await?;
+            return Ok((pty, events, HostSession::Server(id)));
+        }
+        // The host's server cannot be used now: a tmux session in its place.
+        (HostSession::Server(_), None) => spare,
+    };
+    let attached = session::rejoin(connection, slug.clone(), cols, rows).await?;
+    Ok((attached.pty, attached.events, HostSession::Tmux(slug)))
 }
 
 /// Fill in the directories and make the file's contents. Blocking.

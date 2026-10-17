@@ -116,10 +116,12 @@ impl Workspace {
         };
         // Panes on the host's server are not reattached here: its handle
         // reconnects them itself, through relays on the new connection.
+        // Panes from the last run still to attach are attached once it is
+        // back, by `attach_restored`.
         let Ok(sessions) = this.read_with(cx, |this, _| {
             this.panes
                 .iter()
-                .filter(|p| p.alias() == alias && !p.on_server)
+                .filter(|p| p.alias() == alias && !p.on_server && p.restored.is_none())
                 .map(|p| (p.id, p.slug.clone(), p.view.clone()))
                 .collect::<Vec<_>>()
         }) else {
@@ -229,6 +231,8 @@ impl Workspace {
             tracing::info!(%alias, state = ?step.state, forwards, "reattached");
             this.statuses
                 .insert(alias.to_string(), HostStatus::Connection(step.state));
+            // Panes from the last run that had not attached yet do now.
+            this.attach_restored(alias.to_string(), cx);
             cx.notify();
         });
     }

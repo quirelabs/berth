@@ -203,24 +203,22 @@ pub struct OnServer {
     pub shown: crate::machine::Opening,
 }
 
-/// Connect to a host whose server was installed, and open what it should
-/// show (D55): the session last used there, in tmux or on the server, or
-/// else a new one on the server. Its server is looked at as any connect
-/// looks at it, and nothing is installed or offered here: a host whose
-/// server cannot be used opens on tmux as it always did.
-#[allow(clippy::too_many_arguments)]
-pub async fn connect_on_server(
-    host: Host,
+/// A host connected, its server looked at, and reached if it can be used.
+pub struct Reached {
+    pub connection: Arc<Connection>,
+    pub next: berth_core::remote::Next,
+    pub server: Option<HostServer>,
+}
+
+/// Connect to a host and look at its server as any connect does (D55):
+/// reached when it is this app's build, and otherwise left for the
+/// workspace to act on. Nothing is installed or offered here.
+pub async fn reach_host(
+    host: &Host,
     choice: Option<berth_core::remote::Choice>,
     manifest: Option<&berth_core::remote::Manifest>,
-    last: Option<berth_core::settings::LastSession>,
-    fallback: String,
-    cols: u16,
-    rows: u16,
-    palette: berth_term::terminal::Palette,
-) -> berth_core::Result<OnServer> {
-    use crate::machine::Opening;
-    let connection = Arc::new(Connection::connect(&host, TrustPolicy::KnownHostsOnly).await?);
+) -> berth_core::Result<Reached> {
+    let connection = Arc::new(Connection::connect(host, TrustPolicy::KnownHostsOnly).await?);
     let next = match berth_core::remote::probe(connection.as_ref(), None).await {
         Ok(probe) => berth_core::remote::decide(&probe, manifest, choice, false),
         Err(error) => {
@@ -238,6 +236,35 @@ pub async fn connect_on_server(
         },
         _ => None,
     };
+    Ok(Reached {
+        connection,
+        next,
+        server,
+    })
+}
+
+/// Connect to a host whose server was installed, and open what it should
+/// show (D55): the session last used there, in tmux or on the server, or
+/// else a new one on the server. Its server is looked at as any connect
+/// looks at it, and nothing is installed or offered here: a host whose
+/// server cannot be used opens on tmux as it always did.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_on_server(
+    host: Host,
+    choice: Option<berth_core::remote::Choice>,
+    manifest: Option<&berth_core::remote::Manifest>,
+    last: Option<berth_core::settings::LastSession>,
+    fallback: String,
+    cols: u16,
+    rows: u16,
+    palette: berth_term::terminal::Palette,
+) -> berth_core::Result<OnServer> {
+    use crate::machine::Opening;
+    let Reached {
+        connection,
+        next,
+        server,
+    } = reach_host(&host, choice, manifest).await?;
     let terminal = terminal_for(cols, rows, palette);
     // On the server when it answers all the way, on tmux otherwise: a
     // server that came up and then failed is no reason for the host to.
