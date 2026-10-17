@@ -49,9 +49,10 @@ pub struct Attached {
 ///
 /// Deliberately not a `Connected`: there is no connection, and a field holding
 /// a fake one would be a lie the rest of the app would have to keep believing.
+/// A local session's input and output; its pane holds the terminal, put up
+/// before the session came (D56).
 pub struct Local {
     pub pty: Pty,
-    pub terminal: SharedTerminal,
     pub events: mpsc::Receiver<PtyEvent>,
 }
 
@@ -110,7 +111,6 @@ pub async fn open_local_tab(
     cell: LocalServerCell,
     direct: Option<String>,
     size: (u16, u16),
-    palette: berth_term::terminal::Palette,
     pane: berth_core::claude::PaneEnv,
     cwd: Option<std::path::PathBuf>,
 ) -> berth_core::Result<LocalTab> {
@@ -128,7 +128,7 @@ pub async fn open_local_tab(
                 .await;
             match created {
                 Ok(session) => {
-                    let local = attach_session(&server, session, cols, rows, palette).await?;
+                    let local = attach_session(&server, session, cols, rows).await?;
                     return Ok(LocalTab {
                         local,
                         session: Some(session),
@@ -146,11 +146,7 @@ pub async fn open_local_tab(
         None => berth_core::local::open(cols, rows, Some(&pane)).await?,
     };
     Ok(LocalTab {
-        local: Local {
-            pty,
-            terminal: terminal_for(cols, rows, palette),
-            events,
-        },
+        local: Local { pty, events },
         session: None,
         direct: Some(reason),
     })
@@ -162,7 +158,6 @@ pub async fn attach_session(
     session: u64,
     cols: u16,
     rows: u16,
-    palette: berth_term::terminal::Palette,
 ) -> berth_core::Result<Local> {
     // The shell's pid, which saving reads the directory from (D46).
     let pid = server
@@ -172,11 +167,7 @@ pub async fn attach_session(
         .and_then(|list| list.into_iter().find(|s| s.id == session))
         .and_then(|s| s.pid);
     let (pty, events) = server.attach(session, cols, rows, pid).await?;
-    Ok(Local {
-        pty,
-        terminal: terminal_for(cols, rows, palette),
-        events,
-    })
+    Ok(Local { pty, events })
 }
 
 /// What a host offered when asked for its key, without being trusted.

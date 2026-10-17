@@ -132,6 +132,7 @@ impl Workspace {
             }),
             session: None,
             direct: None,
+            starting: false,
         });
         id
     }
@@ -179,7 +180,6 @@ impl Workspace {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let palette = crate::terminal_style::TerminalStyle::default().palette;
             let opened = runtime::spawn(async move {
                 if let Some(session_id) = saved_session
                     && let Ok(server) = session::local_server(cell.clone(), direct.clone()).await
@@ -189,8 +189,7 @@ impl Workspace {
                         .is_ok_and(|list| list.iter().any(|s| s.id == session_id))
                 {
                     let local =
-                        session::attach_session(&server, session_id, size.cols, size.rows, palette)
-                            .await?;
+                        session::attach_session(&server, session_id, size.cols, size.rows).await?;
                     return Ok((
                         session::LocalTab {
                             local,
@@ -200,15 +199,9 @@ impl Workspace {
                         true,
                     ));
                 }
-                let tab = session::open_local_tab(
-                    cell,
-                    direct,
-                    (size.cols, size.rows),
-                    palette,
-                    pane_env,
-                    dir,
-                )
-                .await?;
+                let tab =
+                    session::open_local_tab(cell, direct, (size.cols, size.rows), pane_env, dir)
+                        .await?;
                 Ok::<_, berth_core::Error>((tab, false))
             })
             .await

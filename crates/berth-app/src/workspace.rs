@@ -213,6 +213,9 @@ struct Pane {
     /// Why this local pane runs a shell of its own instead, shown on it: it
     /// will not survive quitting (D50).
     direct: Option<String>,
+    /// Up before its session: drawn at once, empty, with an idle cursor,
+    /// until the session it is for arrives (D56).
+    starting: bool,
 }
 
 impl Pane {
@@ -259,6 +262,8 @@ enum Place {
     Tab { show: bool },
     /// Beside an existing pane, splitting it.
     Beside { pane: u64, axis: Axis },
+    /// Into a pane put up for it before it came (D56).
+    Into(u64),
 }
 
 use crate::tabs::Tab;
@@ -393,6 +398,8 @@ pub struct Workspace {
     status_cycle: std::collections::HashMap<crate::glyph::State, usize>,
     /// The divider being dragged, whose pill stays up while it is.
     dragging_divider: Option<(u64, crate::panes::Path)>,
+    /// The platform's fonts, once asked for.
+    installed_fonts: Option<Vec<String>>,
     /// Where each tab was last drawn, for a dragged tab's landing place and
     /// the hover panel's anchor.
     tab_bounds:
@@ -620,6 +627,7 @@ impl Workspace {
             hook_done_seen: std::collections::HashSet::new(),
             programs: std::collections::BTreeMap::new(),
             dragging_divider: None,
+            installed_fonts: None,
             status_cycle: std::collections::HashMap::new(),
             rendered_at: None,
             tab_bounds: Default::default(),
@@ -995,19 +1003,26 @@ impl Workspace {
 
         let place_shown = match &place {
             Place::Tab { show } => Some(*show),
-            Place::Beside { .. } => None,
+            Place::Beside { .. } | Place::Into(_) => None,
         };
-        let _ = self.place_pane(
-            host,
-            slug,
-            None,
-            connected.terminal.clone(),
-            connected.pty.clone(),
-            connected.events,
-            installed,
-            place,
-            cx,
-        );
+        match place {
+            Place::Into(id) => {
+                self.fill_pane(id, connected.pty.clone(), connected.events, cx);
+            }
+            _ => {
+                let _ = self.place_pane(
+                    host,
+                    slug,
+                    None,
+                    connected.terminal.clone(),
+                    connected.pty.clone(),
+                    connected.events,
+                    installed,
+                    place,
+                    cx,
+                );
+            }
+        }
 
         // A second session on a host joins the connection that is already
         // there rather than opening another one.
@@ -1056,14 +1071,14 @@ impl Workspace {
         let token = Some(pane_env.token.clone());
         let cell = self.local_server.clone();
         let direct = self.local_direct();
+        // The tab and its pane are up in the next frame; the shell joins
+        // them when it has started (D56).
+        let id = self.place_empty(None, strings::LOCAL_ALIAS.to_string(), token, place, cx);
         cx.spawn(async move |this, cx| {
-            let palette = crate::terminal_style::TerminalStyle::default().palette;
-            let installed = cx.update(|cx| cx.text_system().all_font_names());
             let opened = runtime::spawn(session::open_local_tab(
                 cell,
                 direct,
                 (80, 24),
-                palette,
                 pane_env,
                 None,
             ))
@@ -1074,18 +1089,11 @@ impl Workspace {
             match opened {
                 Ok(tab) => {
                     let _ = this.update(cx, |this, cx| {
-                        let id = this.place_pane(
-                            None,
-                            strings::LOCAL_ALIAS.to_string(),
-                            token,
-                            tab.local.terminal,
-                            tab.local.pty,
-                            tab.local.events,
-                            installed,
-                            place,
-                            cx,
-                        );
-                        if let Some(pane) = this.pane_mut(id) {
+                        // Closed while it started: a server session lives on
+                        // detached, a shell of its own ends with its pty.
+                        if this.fill_pane(id, tab.local.pty, tab.local.events, cx)
+                            && let Some(pane) = this.pane_mut(id)
+                        {
                             pane.session = tab.session;
                             pane.direct = tab.direct;
                         }
@@ -1102,6 +1110,7 @@ impl Workspace {
                 Err(error) => {
                     tracing::warn!(%error, "could not open a local shell");
                     let _ = this.update(cx, |this, cx| {
+                        this.close(id, cx);
                         this.warnings.push(error);
                         cx.notify();
                     });
@@ -1122,37 +1131,29 @@ impl Workspace {
             return;
         };
         tracing::info!(session = session_id, "attaching a local session");
+        // Up in the next frame, already this session's so a second click
+        // finds it; the screen comes when the worker sends it (D56).
+        let id = self.place_empty(None, strings::LOCAL_ALIAS.to_string(), None, place, cx);
+        if let Some(pane) = self.pane_mut(id) {
+            pane.session = Some(session_id);
+        }
         cx.spawn(async move |this, cx| {
-            let palette = crate::terminal_style::TerminalStyle::default().palette;
-            let installed = cx.update(|cx| cx.text_system().all_font_names());
             let attached = runtime::spawn(async move {
-                session::attach_session(&server, session_id, 80, 24, palette).await
+                session::attach_session(&server, session_id, 80, 24).await
             })
             .await
             .map_err(|_| strings::RUNTIME_DROPPED.to_string())
             .and_then(|r| r.map_err(|e| e.to_string()));
             let _ = this.update(cx, |this, cx| match attached {
+                // Claude status for a session opened in an earlier run waits
+                // for the worker to report it (step 2, piece 6): the pane's
+                // token is not known here.
                 Ok(local) => {
-                    // Claude status for a session opened in an earlier run
-                    // waits for the worker to report it (step 2, piece 6): the
-                    // pane's token is not known here.
-                    let id = this.place_pane(
-                        None,
-                        strings::LOCAL_ALIAS.to_string(),
-                        None,
-                        local.terminal,
-                        local.pty,
-                        local.events,
-                        installed,
-                        place,
-                        cx,
-                    );
-                    if let Some(pane) = this.pane_mut(id) {
-                        pane.session = Some(session_id);
-                    }
+                    this.fill_pane(id, local.pty, local.events, cx);
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not attach a local session");
+                    this.close(id, cx);
                     this.warnings.push(error);
                     cx.notify();
                 }
@@ -1444,6 +1445,7 @@ impl Workspace {
     /// The half of adopting a session that has nothing to do with transports,
     /// so a local shell and a remote one share it rather than drifting apart.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn place_pane(
         &mut self,
         host: Option<Host>,
@@ -1456,21 +1458,102 @@ impl Workspace {
         place: Place,
         cx: &mut Context<Self>,
     ) -> u64 {
+        let id = self.place_view(
+            host,
+            slug,
+            token,
+            terminal,
+            Some(pty),
+            &installed,
+            place,
+            cx,
+        );
+        if let Some(pane) = self.pane(id) {
+            pane.view
+                .update(cx, |view, _| session::start_pump(view, events));
+        }
+        id
+    }
+
+    /// A pane put up before its session, in the frame after it was asked
+    /// for (D56): an empty terminal with an idle cursor, which
+    /// [`Workspace::fill_pane`] gives the session when it comes.
+    fn place_empty(
+        &mut self,
+        host: Option<Host>,
+        slug: String,
+        token: Option<berth_core::claude::PaneToken>,
+        place: Place,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let palette = crate::terminal_style::TerminalStyle::default().palette;
+        let terminal = session::terminal_for(80, 24, palette);
+        let installed = self.installed_fonts(cx);
+        let id = self.place_view(host, slug, token, terminal, None, &installed, place, cx);
+        if let Some(pane) = self.pane_mut(id) {
+            pane.starting = true;
+            pane.view.update(cx, |view, _| view.waiting = true);
+        }
+        id
+    }
+
+    /// The session has come for a pane put up before it: its output into
+    /// the pane's terminal, its input from it. The pane's own grid is kept;
+    /// the one the session came with is not needed.
+    fn fill_pane(
+        &mut self,
+        id: u64,
+        pty: berth_core::pty::Pty,
+        events: tokio::sync::mpsc::Receiver<berth_core::pty::PtyEvent>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pane) = self.pane_mut(id) else {
+            return false;
+        };
+        pane.starting = false;
+        pane.view.update(cx, |view, cx| {
+            view.swap_pty(pty);
+            session::start_pump(view, events);
+            cx.notify();
+        });
+        cx.notify();
+        true
+    }
+
+    /// The platform's fonts, asked for once: a terminal's family is resolved
+    /// against them, and asking on every new tab would cost a frame.
+    fn installed_fonts(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+        self.installed_fonts
+            .get_or_insert_with(|| cx.text_system().all_font_names())
+            .clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_view(
+        &mut self,
+        host: Option<Host>,
+        slug: String,
+        token: Option<berth_core::claude::PaneToken>,
+        terminal: crate::terminal_view::SharedTerminal,
+        pty: Option<berth_core::pty::Pty>,
+        installed: &[String],
+        place: Place,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let font_size = self.settings.font_size;
         let view = cx.new(|cx| {
             TerminalView::new(
                 terminal,
-                Some(pty),
+                pty,
                 {
                     let mut style = crate::terminal_style::TerminalStyle::default();
-                    style.resolve_family(&installed);
+                    style.resolve_family(installed);
                     style.font_size = font_size;
                     style
                 },
                 cx,
             )
         });
-        view.update(cx, |view, _| session::start_pump(view, events));
 
         self.next_pane_id += 1;
         let id = self.next_pane_id;
@@ -1484,6 +1567,7 @@ impl Workspace {
             restored: None,
             session: None,
             direct: None,
+            starting: false,
         });
 
         // The first session to land is shown whether or not it was asked for
@@ -1498,12 +1582,12 @@ impl Workspace {
             Place::Beside { pane, axis } => {
                 crate::tabs::put_beside(&mut self.tabs, &mut self.active, id, pane, axis)
             }
-            Place::Tab { .. } => false,
+            Place::Tab { .. } | Place::Into(_) => false,
         };
         if !beside {
             let show = match place {
                 Place::Tab { show } => show,
-                Place::Beside { .. } => true,
+                Place::Beside { .. } | Place::Into(_) => true,
             };
             self.next_tab_id += 1;
             crate::tabs::open_tab(&mut self.tabs, &mut self.active, self.next_tab_id, id, show);
@@ -1776,36 +1860,48 @@ impl Workspace {
             return;
         };
         tracing::info!(%alias, %slug, "attaching from the sidebar");
+        self.open_into(host, slug, connection, place, cx);
+    }
+
+    /// Put a remote session's pane up at once, empty, and attach the session
+    /// into it when it comes (D56). A session that could not open takes its
+    /// pane away again and says why.
+    fn open_into(
+        &mut self,
+        host: Host,
+        slug: String,
+        connection: std::sync::Arc<berth_core::transport::Connection>,
+        place: Place,
+        cx: &mut Context<Self>,
+    ) {
+        let alias = host.alias.clone();
+        let id = self.place_empty(Some(host.clone()), slug.clone(), None, place, cx);
         cx.spawn(async move |this, cx| {
             let palette = crate::terminal_style::TerminalStyle::default().palette;
-            let installed = cx.update(|cx| cx.text_system().all_font_names());
             let result =
                 runtime::spawn(session::open_on(connection, slug.clone(), 80, 24, palette))
                     .await
                     .map_err(|_| strings::RUNTIME_DROPPED.to_string())
                     .and_then(|r| r.map_err(|e| e.to_string()));
-            match result {
+            let _ = this.update(cx, |this, cx| match result {
                 Ok(connected) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.adopt(
-                            Some(host),
-                            slug,
-                            connected,
-                            Vec::new(),
-                            installed,
-                            place,
-                            cx,
-                        );
-                    });
+                    this.adopt(
+                        Some(host),
+                        slug,
+                        connected,
+                        Vec::new(),
+                        Vec::new(),
+                        Place::Into(id),
+                        cx,
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(%alias, %error, "attach failed");
-                    let _ = this.update(cx, |this, cx| {
-                        this.warnings.push(error);
-                        cx.notify();
-                    });
+                    this.close(id, cx);
+                    this.warnings.push(error);
+                    cx.notify();
                 }
-            }
+            });
         })
         .detach();
     }
@@ -2259,41 +2355,18 @@ impl Workspace {
             return;
         }
 
-        let host = pane.host.clone();
-        let alias = pane.alias().to_string();
+        let Some(host) = pane.host.clone() else {
+            return;
+        };
+        let alias = host.alias.clone();
         let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
             return;
         };
         let slug = self.free_slug(&alias);
         tracing::info!(%alias, %slug, ?axis, "splitting");
-
-        cx.spawn(async move |this, cx| {
-            let palette = crate::terminal_style::TerminalStyle::default().palette;
-            let installed = cx.update(|cx| cx.text_system().all_font_names());
-            let result =
-                runtime::spawn(session::open_on(connection, slug.clone(), 80, 24, palette))
-                    .await
-                    .map_err(|_| strings::RUNTIME_DROPPED.to_string())
-                    .and_then(|r| r.map_err(|e| e.to_string()));
-
-            match result {
-                Ok(connected) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.adopt(host, slug, connected, Vec::new(), installed, place, cx);
-                    });
-                }
-                Err(error) => {
-                    // The existing panes are untouched. A split that could not
-                    // open is one missing pane, not a broken tab.
-                    tracing::warn!(%alias, %error, "split failed");
-                    let _ = this.update(cx, |this, cx| {
-                        this.warnings.push(error);
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
+        // The existing panes are untouched: a split that could not open is
+        // one pane taken away again, not a broken tab.
+        self.open_into(host, slug, connection, place, cx);
     }
 
     /// Close a pane. This detaches and never kills.

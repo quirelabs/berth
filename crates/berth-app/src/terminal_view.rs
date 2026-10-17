@@ -19,6 +19,9 @@ use gpui::{
 
 use crate::terminal_style::{CursorShape, TerminalStyle};
 
+/// The most input held for a session that has not come yet.
+const HELD_AT_MOST: usize = 64 * 1024;
+
 /// The longest a frame waits for the engine to reflow a new size.
 const RESIZE_WAIT: Duration = Duration::from_millis(3);
 use berth_core::pty::Pty;
@@ -222,6 +225,10 @@ pub struct TerminalView {
     /// benchmark holds to one per frame and to none (D53).
     pub resizes_sent: u64,
     pub stale_frames: u64,
+    /// Input typed before the session came, to send when it does, and
+    /// whether the view is still waiting for it.
+    held: std::cell::RefCell<Vec<u8>>,
+    pub waiting: bool,
     /// When the view was first drawn, and first drawn with anything from
     /// its session on it: what the feel benchmark times a new tab by (D53).
     pub first_painted_at: Option<Instant>,
@@ -305,6 +312,8 @@ impl TerminalView {
             longest_gap: Duration::ZERO,
             resizes_sent: 0,
             stale_frames: 0,
+            held: Default::default(),
+            waiting: false,
             first_painted_at: None,
             first_content_at: None,
             corners: gpui::Corners::default(),
@@ -376,6 +385,11 @@ impl TerminalView {
     /// exactly the blank flash the reconnect is supposed to avoid.
     pub fn swap_pty(&mut self, pty: Pty) {
         self.pty = Some(pty);
+        self.waiting = false;
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        if !held.is_empty() {
+            self.write(held);
+        }
         // The remote is a fresh tmux client that has not been told the size,
         // so forget what the last one was told and let the next paint resize.
         self.last_sent_size = None;
@@ -607,8 +621,17 @@ impl TerminalView {
     }
 
     /// Send bytes to the remote, if there is one.
+    /// Send input to the session. Typed into a pane whose session has not
+    /// come yet, it is held and sent when it does (D56), so typing straight
+    /// after Cmd+T loses nothing; past [`HELD_AT_MOST`] it is dropped.
     fn write(&self, bytes: Vec<u8>) {
-        let Some(pty) = self.pty.clone() else { return };
+        let Some(pty) = self.pty.clone() else {
+            let mut held = self.held.borrow_mut();
+            if held.len() + bytes.len() <= HELD_AT_MOST {
+                held.extend_from_slice(&bytes);
+            }
+            return;
+        };
         crate::runtime::handle().spawn(async move {
             pty.write(bytes).await;
         });
@@ -961,7 +984,10 @@ impl Element for TerminalElement {
             let _ = shaped.paint(at, cell_h, TextAlign::Left, None, window, cx);
         }
 
-        if state.snapshot.cursor.visible && !state.snapshot.is_scrolled_back() {
+        // A pane waiting for its session shows the idle glyph where the
+        // prompt will be, not the empty grid's cursor (D56).
+        let waiting = self.view.read(cx).waiting;
+        if state.snapshot.cursor.visible && !state.snapshot.is_scrolled_back() && !waiting {
             let cursor = &self.style.cursor;
             let at = point(
                 origin.x + cell_w * state.snapshot.cursor.column as f32,

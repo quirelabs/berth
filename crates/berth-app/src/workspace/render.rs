@@ -1644,13 +1644,40 @@ impl Workspace {
                     crate::glyph::State::Error => theme.rose_text,
                     _ => theme.text_muted,
                 };
+                // A pane up before its session shows an idle cursor where
+                // the prompt will be, and no spinner (D56).
+                let waiting = pane.starting.then(|| {
+                    let view = pane.view.read(cx);
+                    let cell = view.resolved_cell.map(|c| (c.width, c.height));
+                    let pad = view.style().padding_x;
+                    let idle = crate::glyph::glyph(
+                        crate::glyph::State::Idle,
+                        self.glyph_colours(None),
+                        crate::glyph::Moment {
+                            clock: Duration::ZERO,
+                            since: Duration::ZERO,
+                            steady: true,
+                            still: true,
+                        },
+                    );
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(px(pad))
+                        .child(crate::glyph::render(
+                            idle,
+                            crate::glyph::tab_size(cell, self.settings.font_size),
+                        ))
+                });
                 body.child(
                     div()
+                        .relative()
                         .flex()
                         .flex_1()
                         .min_h_0()
                         .when(dim, |view| view.opacity(opacity))
-                        .child(pane.view.clone()),
+                        .child(pane.view.clone())
+                        .children(waiting),
                 )
                 .child(
                     div()
