@@ -140,12 +140,14 @@ fn fallback_run(base: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
+/// Whether `dir` is this user's `/tmp/berth-<uid>`, exactly: a data
+/// directory that only happens to sit in `/tmp` with a name starting
+/// `berth-`, as a benchmark's does, is not it.
 fn is_fallback_root(dir: &Path) -> bool {
-    dir.parent() == Some(Path::new("/tmp"))
-        && dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("berth-"))
+    let Some(uid) = own_uid() else {
+        return false;
+    };
+    dir == Path::new(&format!("/tmp/berth-{uid}"))
 }
 
 /// This user's id, asked of `id` once: the standard library has no call for
@@ -443,6 +445,13 @@ mod tests {
         assert_eq!(places.run.parent(), Some(root.as_path()), "{places:?}");
         assert!(fits(&places.run));
         assert!(is_fallback_root(&root));
+        // A data directory in /tmp named like it is not it.
+        assert!(!is_fallback_root(Path::new("/tmp/berth-bench-3874")));
+        assert!(!is_fallback_root(&root.join("run")));
+        // And nothing is asked of it before connecting.
+        Places::under(Path::new("/tmp/berth-bench-1"))
+            .trusted()
+            .unwrap();
         assert_ne!(places.run, Places::under(&deep("two")).run);
         assert_eq!(places.bin, deep("one").join("bin"), "only the sockets move");
     }
