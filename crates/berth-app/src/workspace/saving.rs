@@ -332,6 +332,7 @@ impl Workspace {
             // On the way out there is no later to put this off to. The lookups
             // are a few milliseconds each and the quit waits for them.
             finish(this.snapshot_local(cx)).save();
+            this.save_settings_due();
             async {}
         })
         .detach();

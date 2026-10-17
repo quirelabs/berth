@@ -452,6 +452,11 @@ pub struct Workspace {
     glyph_steady: std::collections::HashSet<StatusKey>,
     glyph_still: bool,
     glyph_timer: Option<gpui::Task<()>>,
+    /// The settings write waiting for focus to settle, and its timer: the
+    /// last session used on a host is noted at once and written once,
+    /// [`SETTLE`] after the last change.
+    settings_due: Debounce,
+    settings_timer: Option<gpui::Task<()>>,
     /// The accents `berth.toml` gives programs, by name in lower case, and
     /// how far unfocused panes in a split dim.
     accents: std::collections::BTreeMap<String, [u8; 3]>,
@@ -463,6 +468,42 @@ pub struct Workspace {
     /// it is up.
     claude_reports: session::ClaudeReports,
     session_lists: session::SessionLists,
+}
+
+/// How long focus has to stay put before the session last used on a host is
+/// written to the settings file.
+const SETTLE: Duration = Duration::from_secs(2);
+
+/// A write that waits for things to settle: due [`SETTLE`] after the last
+/// change, and done once however many changes came before it.
+#[derive(Debug, Default)]
+struct Debounce {
+    due: Option<std::time::Instant>,
+}
+
+impl Debounce {
+    /// Something changed at `now`. How long until the write is due.
+    fn touch(&mut self, now: std::time::Instant) -> Duration {
+        self.due = Some(now + SETTLE);
+        SETTLE
+    }
+
+    /// Whether the write is due at `now`; if it is, it is no longer
+    /// waiting.
+    fn fire(&mut self, now: std::time::Instant) -> bool {
+        match self.due {
+            Some(due) if now >= due => {
+                self.due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a write is waiting, now no longer: for quitting.
+    fn take(&mut self) -> bool {
+        self.due.take().is_some()
+    }
 }
 
 /// Seen means looked at twice running: whatever a look is showing is seen
@@ -684,6 +725,8 @@ impl Workspace {
             glyph_steady: std::collections::HashSet::new(),
             glyph_still: false,
             glyph_timer: None,
+            settings_due: Debounce::default(),
+            settings_timer: None,
             accents,
             unfocused_opacity,
             chrome_font: None,
@@ -1919,7 +1962,7 @@ impl Workspace {
                         // an update offered, or the server reached.
                         this.server_decided(alias.clone(), opened.next, false, cx);
                         if let Some(id) = placed {
-                            this.note_used(id);
+                            this.note_used(id, cx);
                         }
                     });
                 }
@@ -2103,7 +2146,7 @@ impl Workspace {
                         pane.session = Some(session);
                         pane.slug = server_slug(session);
                     }
-                    this.note_used(id);
+                    this.note_used(id, cx);
                     cx.notify();
                 }
                 Err(error) => {
@@ -2119,7 +2162,7 @@ impl Workspace {
 
     /// Remember the session a pane on a host shows as the one last used
     /// there, so opening the host shows it again (D55).
-    fn note_used(&mut self, pane: u64) {
+    fn note_used(&mut self, pane: u64, cx: &mut Context<Self>) {
         let Some(pane) = self.pane(pane) else {
             return;
         };
@@ -2132,6 +2175,28 @@ impl Workspace {
             (false, _) => berth_core::settings::LastSession::Tmux(pane.slug.clone()),
         };
         if self.settings.set_last_session(&alias, last) {
+            self.save_settings_soon(cx);
+        }
+    }
+
+    /// Write the settings once focus has settled: moving between panes
+    /// quickly changes them each time, and writes them once.
+    fn save_settings_soon(&mut self, cx: &mut Context<Self>) {
+        let wait = self.settings_due.touch(std::time::Instant::now());
+        // A new timer replaces the one before it, which is dropped unfired.
+        self.settings_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, _| {
+                if this.settings_due.fire(std::time::Instant::now()) {
+                    this.settings.save();
+                }
+            });
+        }));
+    }
+
+    /// The settings write, if one is waiting: on the way out.
+    pub(super) fn save_settings_due(&mut self) {
+        if self.settings_due.take() {
             self.settings.save();
         }
     }
@@ -3268,6 +3333,39 @@ mod tests {
         );
         assert_eq!(looked.look(Some(there.clone())), None);
         assert_eq!(looked.look(Some(there.clone())), Some(there));
+    }
+
+    /// Focus moving quickly writes the settings once, two seconds after it
+    /// last moved; a timer from before the last move finds nothing due.
+    #[test]
+    fn the_last_session_is_written_once_focus_settles() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut due = Debounce::default();
+        let mut writes = 0;
+        // Three moves within a second and a half, each with its own timer.
+        let mut timers = Vec::new();
+        for ms in [0, 700, 1500] {
+            timers.push(at(ms) + due.touch(at(ms)));
+        }
+        for fires in timers {
+            if due.fire(fires) {
+                writes += 1;
+            }
+        }
+        assert_eq!(writes, 1, "one write for the burst");
+        assert!(!due.fire(at(10_000)), "nothing left after it");
+        // Earlier timers fired before the last move had settled.
+        let mut due = Debounce::default();
+        due.touch(at(0));
+        due.touch(at(1500));
+        assert!(!due.fire(at(2000)), "not two seconds after the last move");
+        assert!(due.fire(at(3500)));
+        // Quitting with a write waiting does it once.
+        let mut due = Debounce::default();
+        due.touch(at(0));
+        assert!(due.take());
+        assert!(!due.take());
     }
 
     #[test]

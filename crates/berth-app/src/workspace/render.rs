@@ -2055,7 +2055,7 @@ impl Render for Workspace {
             self.focused_pane = Some(id);
             window.focus(&handle, cx);
             // What opening its host shows next time (D55).
-            self.note_used(id);
+            self.note_used(id, cx);
         }
 
         let showing = self.tab().map(|t| (t.root.clone(), t.focus));
