@@ -114,7 +114,18 @@ async fn the_server_installs_on_a_real_host_and_is_removed() {
         .await
         .unwrap();
     eprintln!("{}", mode.stdout_string());
-    assert_eq!(mode.stdout_string().matches("rwx------").count(), 3);
+    // The owner's alone: nothing for group or others. A setgid bit a home
+    // directory hands down (`drwx--S---`) gives nobody anything.
+    let modes: Vec<String> = mode
+        .stdout_string()
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    assert_eq!(modes.len(), 3, "{modes:?}");
+    for mode in &modes {
+        assert_eq!(&mode[1..4], "rwx", "{mode}");
+        assert!(!mode[4..10].contains(['r', 'w', 'x']), "{mode}");
+    }
 
     let found = probe(&connection, Some(&data)).await.unwrap();
     assert_eq!(found.builds, std::slice::from_ref(&plan.build));

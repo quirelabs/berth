@@ -174,7 +174,9 @@ async fn vim_takes_and_releases_the_alternate_screen() {
         .await;
 
     pty.close().await;
-    let _ = conn.exec("rm -f ~/berth-bench/berth_vim_test.txt").await;
+    let _ = conn
+        .exec("rm -f ~/berth-bench/berth_vim_test.txt; rmdir ~/berth-bench 2>/dev/null; true")
+        .await;
     conn.disconnect().await.unwrap();
 }
 
@@ -438,7 +440,9 @@ async fn the_shell_integration_emits_all_four_markers_through_tmux() {
     pty.write("exit\n").await;
     pty.close().await;
     let _ = conn
-        .exec("rm -f ~/berth-bench/berth_shell_integration.sh")
+        .exec(
+            "rm -f ~/berth-bench/berth_shell_integration.sh; rmdir ~/berth-bench 2>/dev/null; true",
+        )
         .await;
     kill_session(&conn, &session).await;
     conn.disconnect().await.unwrap();

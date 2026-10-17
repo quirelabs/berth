@@ -124,7 +124,9 @@ async fn what_survives_tmux() {
     println!("=========================================================\n");
 
     let _ = conn.exec("tmux kill-session -t 'berth/abdiag'").await;
-    let _ = conn.exec("rm -f ~/berth-bench/berth_si.sh").await;
+    let _ = conn
+        .exec("rm -f ~/berth-bench/berth_si.sh; rmdir ~/berth-bench 2>/dev/null; true")
+        .await;
     conn.disconnect().await.unwrap();
 
     // The plain case is the control: if this fails, the snippet or the parser
