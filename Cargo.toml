@@ -105,3 +105,8 @@ opt-level = 2
 # rather than Debug, which parses slowly enough to stall a test on a megabyte.
 [profile.dev.package.libghostty-vt-sys]
 debug = false
+
+# The same for the profiling build, or what it profiles is Debug's integrity
+# checks rather than the parser. Its symbols stay, without line tables.
+[profile.profiling.package.libghostty-vt-sys]
+debug = false
