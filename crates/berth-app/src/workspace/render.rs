@@ -59,10 +59,24 @@ impl Workspace {
                 (name, agent)
             })
             .collect();
-        let needs_you = |folder: &crate::sidebar::Folder, name: &str, pane: Option<u64>| {
-            self.row_look(folder, name, pane)
+        let needs_you = |folder: &crate::sidebar::Folder,
+                         name: &str,
+                         pane: Option<u64>,
+                         server: Option<u64>| {
+            self.row_look(folder, name, pane, server)
                 .is_some_and(|(_, look)| look.state == crate::glyph::State::NeedsYou)
         };
+        let on_server: std::collections::BTreeSet<String> = self
+            .conns
+            .iter()
+            .filter(|(_, conn)| conn.server.is_some())
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        let host_servers: std::collections::BTreeMap<String, Vec<crate::sidebar::ServerRow>> =
+            on_server
+                .iter()
+                .map(|alias| (alias.clone(), self.host_server_rows(alias)))
+                .collect();
         let rows = crate::sidebar::rows(&Input {
             hosts: &hosts,
             open: &open,
@@ -70,6 +84,8 @@ impl Workspace {
             expanded: &self.expanded,
             local_label: &shell,
             local_detached: &detached,
+            host_servers: &host_servers,
+            on_server: &on_server,
             needs_you: &needs_you,
         });
 
@@ -108,9 +124,11 @@ impl Workspace {
                     folder,
                     name,
                     pane,
+                    server,
+                    tmux,
                     pinned,
                     ..
-                } => self.session_row(index, folder, name, pane, pinned, cx),
+                } => self.session_row(index, folder, name, pane, server, tmux, pinned, cx),
                 Row::NewTerminal(folder) => div()
                     .id(("new-terminal", index))
                     .cursor_pointer()
@@ -377,23 +395,73 @@ impl Workspace {
             .map(|(id, _)| SessionRef::local(id))
     }
 
-    /// What a sidebar row's session shows: its pane's status, or a local
-    /// session's no pane shows. A remote session no pane shows has none.
+    /// A host's server sessions as its folder lists them (D55): named as
+    /// local ones are, by what runs and where, with the pane showing each.
+    fn host_server_rows(&self, alias: &str) -> Vec<crate::sidebar::ServerRow> {
+        let machine = Machine::Host(alias.to_string());
+        let listed = self.sessions.of(&machine);
+        let mut sessions: Vec<crate::sidebar::LocalSession> = listed
+            .iter()
+            .map(|s| crate::sidebar::LocalSession {
+                id: s.id,
+                program: s.program.as_deref(),
+                cwd: s.cwd.as_deref(),
+            })
+            .collect();
+        // A pane's session that the list has not caught up with yet.
+        for pane in self.panes.iter().filter(|p| p.on_server) {
+            if let Some(session) = pane.server_session()
+                && session.machine == machine
+                && !listed.iter().any(|s| s.id == session.id)
+            {
+                sessions.push(crate::sidebar::LocalSession {
+                    id: session.id,
+                    program: None,
+                    cwd: None,
+                });
+            }
+        }
+        crate::sidebar::local_session_names(&sessions, strings::HOST_SHELL_LABEL, None)
+            .into_iter()
+            .map(|(id, name)| {
+                let session = SessionRef::on(Some(alias), id);
+                let agent = self
+                    .sessions
+                    .info(&session)
+                    .and_then(|s| s.claude.as_ref())
+                    .is_some_and(|c| {
+                        !matches!(
+                            c.state,
+                            berth_proto::v1::ClaudeState::Finished
+                                | berth_proto::v1::ClaudeState::Interrupted
+                        )
+                    });
+                crate::sidebar::ServerRow {
+                    id,
+                    name,
+                    pane: self.pane_showing(&session),
+                    agent,
+                }
+            })
+            .collect()
+    }
+
+    /// What a sidebar row's session shows: its pane's status, or a server
+    /// session's no pane shows. A tmux session no pane shows has none.
     fn row_look(
         &self,
         folder: &crate::sidebar::Folder,
         name: &str,
         pane: Option<u64>,
+        server: Option<u64>,
     ) -> Option<(StatusKey, StatusLook)> {
-        match (pane, folder) {
-            (Some(id), _) => Some((StatusKey::Pane(id), self.pane_look(id)?)),
-            (None, crate::sidebar::Folder::Local) => {
-                let session = self.local_session_named(name)?;
-                let look = self.session_look(&session)?;
-                Some((StatusKey::Session(session), look))
-            }
-            (None, crate::sidebar::Folder::Host(_)) => None,
-        }
+        let session = match (pane, folder) {
+            (Some(id), _) => return Some((StatusKey::Pane(id), self.pane_look(id)?)),
+            (None, crate::sidebar::Folder::Local) => self.local_session_named(name)?,
+            (None, crate::sidebar::Folder::Host(alias)) => SessionRef::on(Some(alias), server?),
+        };
+        let look = self.session_look(&session)?;
+        Some((StatusKey::Session(session), look))
     }
 
     /// One session (D53): its program's tile, its name, how long it has been
@@ -401,12 +469,15 @@ impl Workspace {
     /// glyph, which never moves here. Open ones are switched to, detached
     /// ones are reattached in a tab of their own. A pinned one is in the
     /// needs-you group, a remote one there with its host in front.
+    #[allow(clippy::too_many_arguments)]
     fn session_row(
         &self,
         index: usize,
         folder: crate::sidebar::Folder,
         name: String,
         pane: Option<u64>,
+        server: Option<u64>,
+        tmux: bool,
         pinned: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -417,37 +488,48 @@ impl Workspace {
         let server_session = match (&folder, pane) {
             (crate::sidebar::Folder::Local, None) => self.local_session_named(&name),
             (_, Some(id)) => self.pane(id).and_then(|p| p.server_session()),
-            _ => None,
+            (crate::sidebar::Folder::Host(alias), None) => {
+                server.map(|id| SessionRef::on(Some(alias), id))
+            }
         };
         // What runs in it, for its tile.
         let program: Option<String> = match (pane.and_then(|id| self.pane(id)), &folder) {
             (Some(pane), _) => self.pane_shown_program(pane),
-            (None, crate::sidebar::Folder::Host(alias)) => {
-                self.remote_program(alias, &name).map(str::to_string)
-            }
+            (None, crate::sidebar::Folder::Host(alias)) => match &server_session {
+                Some(session) => self.session_shown_program(session),
+                None => self.remote_program(alias, &name).map(str::to_string),
+            },
             (None, crate::sidebar::Folder::Local) => server_session
                 .as_ref()
                 .and_then(|session| self.session_shown_program(session)),
         };
         let target = match (&folder, pane) {
             (_, Some(pane)) => Some(RowTarget::Pane(pane)),
-            (crate::sidebar::Folder::Host(alias), None) => Some(RowTarget::Remote {
-                alias: alias.clone(),
-                slug: name.clone(),
-            }),
+            (crate::sidebar::Folder::Host(alias), None) => match &server_session {
+                Some(session) => Some(RowTarget::Session(session.clone())),
+                None => Some(RowTarget::Remote {
+                    alias: alias.clone(),
+                    slug: name.clone(),
+                }),
+            },
             (crate::sidebar::Folder::Local, None) => server_session.clone().map(RowTarget::Session),
         };
         let menu_target = match (&folder, pane) {
             (_, Some(pane)) => Some(crate::menu::Target::Pane(pane)),
-            (crate::sidebar::Folder::Host(alias), None) => Some(crate::menu::Target::Detached {
-                alias: alias.clone(),
-                slug: name.clone(),
-            }),
+            (crate::sidebar::Folder::Host(alias), None) => match &server_session {
+                Some(session) => Some(crate::menu::Target::ServerDetached {
+                    session: session.clone(),
+                }),
+                None => Some(crate::menu::Target::Detached {
+                    alias: alias.clone(),
+                    slug: name.clone(),
+                }),
+            },
             (crate::sidebar::Folder::Local, None) => server_session
                 .clone()
                 .map(|session| crate::menu::Target::ServerDetached { session }),
         };
-        let look = self.row_look(&folder, &name, pane);
+        let look = self.row_look(&folder, &name, pane, server);
         let exit = server_session
             .as_ref()
             .and_then(|session| self.sessions.info(session))
@@ -564,7 +646,18 @@ impl Workspace {
                                 .child(format!("{host} ")),
                         )
                     })
-                    .child(div().truncate().text_color(hsla(tones.name)).child(name)),
+                    .child(div().truncate().text_color(hsla(tones.name)).child(name))
+                    // Still on tmux, on a host that has moved to its server.
+                    .when(tmux, |names| {
+                        names.child(
+                            div()
+                                .flex_shrink_0()
+                                .ml(px(6.0))
+                                .text_xs()
+                                .text_color(hsla(tones.muted))
+                                .child(strings::TMUX_MARK),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -903,6 +996,8 @@ impl Workspace {
         self.pane_title(pane).unwrap_or_else(|| {
             if pane.is_local() {
                 pane.alias().to_string()
+            } else if pane.on_server && (pane.slug.is_empty() || pane.slug.starts_with('#')) {
+                strings::HOST_SHELL_LABEL.to_string()
             } else {
                 pane.slug.clone()
             }
@@ -1956,8 +2051,11 @@ impl Render for Workspace {
             // Without this the terminal never receives a keystroke, and after a
             // switch or a split it would be the wrong terminal receiving them.
             let handle = pane.view.focus_handle(cx);
-            self.focused_pane = Some(pane.id);
+            let id = pane.id;
+            self.focused_pane = Some(id);
             window.focus(&handle, cx);
+            // What opening its host shows next time (D55).
+            self.note_used(id);
         }
 
         let showing = self.tab().map(|t| (t.root.clone(), t.focus));

@@ -93,8 +93,12 @@ pub async fn local_server(
 /// it (D50), for the workspace to fold into its panes.
 pub type ClaudeReports = tokio::sync::mpsc::UnboundedSender<(u64, berth_proto::v1::Claude)>;
 
-/// The local server's session list as the supervisor pushes it.
-pub type SessionLists = tokio::sync::mpsc::UnboundedSender<Vec<berth_proto::v1::SessionInfo>>;
+/// A server's session list as its supervisor pushes it, by machine: this
+/// one's, or a host's (D55).
+pub type SessionLists = tokio::sync::mpsc::UnboundedSender<(
+    crate::machine::Machine,
+    Vec<berth_proto::v1::SessionInfo>,
+)>;
 
 /// A local tab as it opened.
 pub struct LocalTab {
@@ -168,6 +172,121 @@ pub async fn attach_session(
         .and_then(|s| s.pid);
     let (pty, events) = server.attach(session, cols, rows, pid).await?;
     Ok(Local { pty, events })
+}
+
+/// A host's server as the app holds it: the handle, and the connection its
+/// relays are opened on, which a reconnect replaces (D55).
+#[derive(Clone)]
+pub struct HostServer {
+    pub server: berth_core::server::local::Server,
+    pub current: berth_core::remote::relay::Current,
+}
+
+/// A host's server, reached through relays on `connection`.
+pub async fn host_server(
+    connection: Arc<Connection>,
+    plan: &berth_core::remote::Plan,
+) -> berth_core::Result<HostServer> {
+    let current = Arc::new(std::sync::Mutex::new(connection));
+    let open = berth_core::remote::relay::opener(current.clone(), plan.path.clone());
+    let server = berth_core::server::local::Server::over(open, plan.build.clone()).await?;
+    Ok(HostServer { server, current })
+}
+
+/// A host opened on its server, or on tmux when its server cannot be used.
+pub struct OnServer {
+    pub connected: Connected,
+    /// What the probe decided, for the workspace to act on as it would.
+    pub next: berth_core::remote::Next,
+    pub server: Option<HostServer>,
+    /// The session shown: a tmux slug, or an id on the server.
+    pub shown: crate::machine::Opening,
+}
+
+/// Connect to a host whose server was installed, and open what it should
+/// show (D55): the session last used there, in tmux or on the server, or
+/// else a new one on the server. Its server is looked at as any connect
+/// looks at it, and nothing is installed or offered here: a host whose
+/// server cannot be used opens on tmux as it always did.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_on_server(
+    host: Host,
+    choice: Option<berth_core::remote::Choice>,
+    manifest: Option<&berth_core::remote::Manifest>,
+    last: Option<berth_core::settings::LastSession>,
+    fallback: String,
+    cols: u16,
+    rows: u16,
+    palette: berth_term::terminal::Palette,
+) -> berth_core::Result<OnServer> {
+    use crate::machine::Opening;
+    let connection = Arc::new(Connection::connect(&host, TrustPolicy::KnownHostsOnly).await?);
+    let next = match berth_core::remote::probe(connection.as_ref(), None).await {
+        Ok(probe) => berth_core::remote::decide(&probe, manifest, choice, false),
+        Err(error) => {
+            tracing::warn!(alias = %host.alias, %error, "could not look at the host for its server");
+            berth_core::remote::Next::Tmux(berth_core::remote::Stays::NotNow)
+        }
+    };
+    let server = match &next {
+        berth_core::remote::Next::Use(plan) => match host_server(connection.clone(), plan).await {
+            Ok(server) => Some(server),
+            Err(error) => {
+                tracing::warn!(alias = %host.alias, %error, "the host's server did not answer; using tmux");
+                None
+            }
+        },
+        _ => None,
+    };
+    let terminal = terminal_for(cols, rows, palette);
+    let Some(held) = server else {
+        let attached = rejoin(connection, fallback.clone(), cols, rows).await?;
+        return Ok(OnServer {
+            connected: Connected {
+                connection: attached.connection,
+                pty: attached.pty,
+                terminal,
+                events: attached.events,
+            },
+            next,
+            server: None,
+            shown: Opening::Tmux(fallback),
+        });
+    };
+    let on_server: Vec<u64> = held.server.list().await?.iter().map(|s| s.id).collect();
+    let in_tmux: Vec<String> = match connection.exec(&berth_core::agents::scan_command()).await {
+        Ok(out) => crate::sidebar::listing(&berth_core::agents::parse_scan(&out.stdout_string()))
+            .into_keys()
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let shown = crate::machine::opening(last.as_ref(), &on_server, &in_tmux);
+    let (pty, events, shown) = match shown {
+        Opening::Tmux(slug) => {
+            let attached = rejoin(connection.clone(), slug.clone(), cols, rows).await?;
+            (attached.pty, attached.events, Opening::Tmux(slug))
+        }
+        Opening::Server(id) => {
+            let (pty, events) = held.server.attach(id, cols, rows, None).await?;
+            (pty, events, Opening::Server(id))
+        }
+        Opening::NewServer => {
+            let id = held.server.create(None, cols, rows, None, None).await?;
+            let (pty, events) = held.server.attach(id, cols, rows, None).await?;
+            (pty, events, Opening::Server(id))
+        }
+    };
+    Ok(OnServer {
+        connected: Connected {
+            connection,
+            pty,
+            terminal,
+            events,
+        },
+        next,
+        server: Some(held),
+        shown,
+    })
 }
 
 /// What a host offered when asked for its key, without being trusted.

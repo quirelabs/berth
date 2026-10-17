@@ -395,11 +395,15 @@ pub fn server_installed(host: &str, hash_checked: bool) -> String {
     } else {
         "its hash could not be checked on the host"
     };
-    // Until the connection to it is built, sessions stay where they are.
-    format!(
-        "Berth's server is installed on {host}; {checked}. Sessions there still use tmux in this build."
-    )
+    format!("Berth's server is installed on {host}; {checked}. New sessions there run on it.")
 }
+/// After a tmux session's name, on a host that has moved to its server: it
+/// stays on tmux until it ends (D55).
+pub const TMUX_MARK: &str = "tmux";
+/// What a session on a host's server is called when nothing more is known
+/// of it, before its number.
+pub const HOST_SHELL_LABEL: &str = "shell";
+
 pub fn server_in_use(host: &str, build: &str) -> String {
     format!("Berth's server {build} is installed on {host}.")
 }

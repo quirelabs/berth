@@ -114,10 +114,12 @@ impl Workspace {
         }) else {
             return;
         };
+        // Panes on the host's server are not reattached here: its handle
+        // reconnects them itself, through relays on the new connection.
         let Ok(sessions) = this.read_with(cx, |this, _| {
             this.panes
                 .iter()
-                .filter(|p| p.alias() == alias)
+                .filter(|p| p.alias() == alias && !p.on_server)
                 .map(|p| (p.id, p.slug.clone(), p.view.clone()))
                 .collect::<Vec<_>>()
         }) else {
@@ -163,8 +165,32 @@ impl Workspace {
                 }
             }
         }
-        let Some(connection) = connection else {
-            return;
+        // Only server panes on the host: the connection is made on its own.
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                let host = host.clone();
+                match runtime::spawn(async move {
+                    Connection::connect(&host, berth_core::known_hosts::TrustPolicy::KnownHostsOnly)
+                        .await
+                })
+                .await
+                {
+                    Ok(Ok(connection)) => Arc::new(connection),
+                    failed => {
+                        if let Ok(Err(error)) = failed {
+                            tracing::warn!(%alias, %error, "reconnect failed");
+                        }
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(conn) = this.conns.get_mut(alias) {
+                                conn.reconnect.handle(Event::ConnectFailed);
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            }
         };
 
         // Forwards come back before the state does, so nothing ever sees a host
@@ -192,6 +218,10 @@ impl Workspace {
             let Some(conn) = this.conns.get_mut(alias) else {
                 return;
             };
+            // The host's server opens its next relay on this one.
+            if let Some(held) = &conn.server {
+                *held.current.lock().unwrap_or_else(|p| p.into_inner()) = connection.clone();
+            }
             conn.connection = connection;
             conn.forwarders = forwarders;
             let step = conn.reconnect.handle(Event::ConnectSucceeded);

@@ -114,6 +114,35 @@ impl Sessions {
     }
 }
 
+/// What opening a host shows (D55).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Opening {
+    /// A tmux session, by its slug.
+    Tmux(String),
+    /// A session already on the host's server.
+    Server(u64),
+    /// A new session on the host's server.
+    NewServer,
+}
+
+/// What opening a host that runs Berth's server shows: the session last
+/// used there, in tmux or on the server, if it still runs; otherwise a new
+/// session on the server. Never "whatever tmux has", or a long-lived tmux
+/// session would be what every open lands in and the host would never move
+/// to its server.
+pub fn opening(
+    last: Option<&berth_core::settings::LastSession>,
+    on_server: &[u64],
+    in_tmux: &[String],
+) -> Opening {
+    use berth_core::settings::LastSession;
+    match last {
+        Some(LastSession::Tmux(slug)) if in_tmux.contains(slug) => Opening::Tmux(slug.clone()),
+        Some(LastSession::Server(id)) if on_server.contains(id) => Opening::Server(*id),
+        _ => Opening::NewServer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +205,31 @@ mod tests {
         assert!(sessions.set(Machine::Local, Vec::new()));
         assert!(sessions.of(&Machine::Local).is_empty());
         assert_eq!(sessions.all().count(), 0);
+    }
+
+    #[test]
+    fn opening_a_host_shows_the_session_last_used_or_a_new_server_one() {
+        use berth_core::settings::LastSession;
+        let tmux = ["main".to_string(), "logs".to_string()];
+        let tmux_main = LastSession::Tmux("main".into());
+        assert_eq!(
+            opening(Some(&tmux_main), &[1, 2], &tmux),
+            Opening::Tmux("main".into())
+        );
+        assert_eq!(
+            opening(Some(&LastSession::Server(2)), &[1, 2], &tmux),
+            Opening::Server(2)
+        );
+        // Gone since: a new one on the server, not the tmux session.
+        assert_eq!(
+            opening(Some(&LastSession::Server(9)), &[1, 2], &tmux),
+            Opening::NewServer
+        );
+        assert_eq!(
+            opening(Some(&LastSession::Tmux("old".into())), &[], &tmux),
+            Opening::NewServer
+        );
+        // Nothing remembered: tmux's sessions do not win by being there.
+        assert_eq!(opening(None, &[1], &tmux), Opening::NewServer);
     }
 }

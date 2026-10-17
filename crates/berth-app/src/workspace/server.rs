@@ -47,7 +47,7 @@ impl Workspace {
                     Ok(Ok(probe)) => {
                         let manifest = servers.map(|s| &s.manifest);
                         let next = berth_core::remote::decide(&probe, manifest, choice, asking);
-                        this.server_decided(alias, next, explicit);
+                        this.server_decided(alias, next, explicit, cx);
                     }
                     Ok(Err(error)) => {
                         tracing::warn!(%alias, %error, "could not look at the host for its server");
@@ -64,7 +64,13 @@ impl Workspace {
         .detach();
     }
 
-    fn server_decided(&mut self, alias: String, next: Next, explicit: bool) {
+    pub(super) fn server_decided(
+        &mut self,
+        alias: String,
+        next: Next,
+        explicit: bool,
+        cx: &mut Context<Self>,
+    ) {
         match next {
             Next::Ask(plan) => {
                 // One question at a time; this one is asked at the next connect.
@@ -89,6 +95,7 @@ impl Workspace {
                     self.warnings
                         .push(strings::server_in_use(&alias, &plan.build));
                 }
+                self.reach_host_server(alias, plan, cx);
             }
             Next::Tmux(stays) => {
                 tracing::info!(%alias, ?stays, "the host stays on tmux");
@@ -160,6 +167,9 @@ impl Workspace {
                         this.server_updates.remove(&alias);
                         this.warnings
                             .push(strings::server_installed(&alias, hash_checked));
+                        // Looked at again, as a connect would: the build
+                        // just installed is the one used from here on.
+                        this.check_server(alias.clone(), false, false, cx);
                     }
                     // Not something asking again would change: the host
                     // stays on tmux until the user brings it up themselves.
@@ -187,5 +197,69 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Reach a host's server, installed and of this app's build, so new
+    /// sessions there go to it (D55). Once per connection; nothing is
+    /// installed or started here but the supervisor the relay starts.
+    pub(super) fn reach_host_server(&mut self, alias: String, plan: Plan, cx: &mut Context<Self>) {
+        let Some(connection) = self
+            .conns
+            .get(&alias)
+            .filter(|c| c.server.is_none())
+            .map(|c| c.connection.clone())
+        else {
+            return;
+        };
+        if !self.server_starting.insert(alias.clone()) {
+            return;
+        }
+        tracing::info!(%alias, build = %plan.build, "reaching the host's server");
+        cx.spawn(async move |this, cx| {
+            let reached = runtime::spawn(async move { session::host_server(connection, &plan).await })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.server_starting.remove(&alias);
+                match reached {
+                    Ok(Ok(held)) => this.hold_host_server(alias, held, cx),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%alias, %error, "the host's server did not answer; staying on tmux");
+                    }
+                    Err(_) => {}
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Keep a host's server for as long as its connection: its session list
+    /// pushed into the workspace's, by host.
+    pub(super) fn hold_host_server(
+        &mut self,
+        alias: String,
+        held: session::HostServer,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.conns.get_mut(&alias) else {
+            // Closed meanwhile: dropping the handle lets it go.
+            return;
+        };
+        let lists = self.session_lists.clone();
+        let machine = Machine::Host(alias.clone());
+        held.server.on_sessions(move |list| {
+            let _ = lists.send((machine.clone(), list));
+        });
+        let server = held.server.clone();
+        conn.server = Some(held);
+        tracing::info!(%alias, "using the host's server");
+        let lists = self.session_lists.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Ok(Ok(list)) = runtime::spawn(async move { server.list().await }).await {
+                    let _ = lists.send((Machine::Host(alias), list));
+                }
+            })
+            .detach();
+        cx.notify();
     }
 }

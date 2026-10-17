@@ -188,6 +188,9 @@ struct Conn {
     forwarders: Vec<Forwarder>,
     reconnect: crate::reconnect::Driver,
     rtt: Option<Duration>,
+    /// The host's own server, once it runs one Berth can use (D55): new
+    /// sessions there go to it, and its sessions are listed beside tmux's.
+    server: Option<session::HostServer>,
 }
 
 /// One open session, and the view onto it.
@@ -218,6 +221,9 @@ struct Pane {
     /// Up before its session: drawn at once, empty, with an idle cursor,
     /// until the session it is for arrives (D56).
     starting: bool,
+    /// A pane for a session on its host's server (D55), its id known or
+    /// not yet: never a tmux session, whatever its slug.
+    on_server: bool,
 }
 
 impl Pane {
@@ -397,6 +403,8 @@ pub struct Workspace {
     /// Each server's sessions, this machine's and hosts', as last listed:
     /// what the sidebar shows besides the open tabs.
     sessions: crate::machine::Sessions,
+    /// Hosts whose server is being reached, so it is reached once.
+    server_starting: std::collections::BTreeSet<String>,
     /// Whether the window is taken to be drawn, as the local server was last
     /// told (D50).
     window_seen: bool,
@@ -654,6 +662,7 @@ impl Workspace {
             claude_base: install_claude_support(),
             local_server: Default::default(),
             sessions: Default::default(),
+            server_starting: Default::default(),
             window_seen: true,
             status_shown: Looked::default(),
             hook_done_seen: std::collections::HashSet::new(),
@@ -808,10 +817,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.window_seen = seen;
-        tracing::info!(seen, "the window is drawn: told the local server");
+        tracing::info!(seen, "the window is drawn: told the servers");
+        // Hosts' servers too: while hidden, nothing need cross the link.
+        let servers: Vec<berth_core::server::local::Server> = std::iter::once(server)
+            .chain(
+                self.conns
+                    .values()
+                    .filter_map(|c| c.server.as_ref().map(|h| h.server.clone())),
+            )
+            .collect();
         cx.background_executor()
             .spawn(async move {
-                let _ = runtime::spawn(async move { server.set_visible(seen).await }).await;
+                for server in servers {
+                    let _ = runtime::spawn(async move { server.set_visible(seen).await }).await;
+                }
             })
             .detach();
     }
@@ -884,20 +903,24 @@ impl Workspace {
             });
             let lists = self.session_lists.clone();
             server.on_sessions(move |list| {
-                let _ = lists.send(list);
+                let _ = lists.send((Machine::Local, list));
             });
         }
     }
 
-    /// Keep the session list as the supervisor pushes it (D50): no timer.
+    /// Keep each server's session list as its supervisor pushes it (D50,
+    /// D55): no timer.
     fn watch_session_lists(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<berth_proto::v1::SessionInfo>>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<(Machine, Vec<berth_proto::v1::SessionInfo>)>,
         cx: &mut Context<Self>,
     ) {
         cx.spawn(async move |this, cx| {
-            while let Some(list) = rx.recv().await {
+            while let Some((machine, list)) = rx.recv().await {
                 let alive = this.update(cx, |this, cx| {
-                    if this.sessions.set(Machine::Local, list) {
+                    // A host closed meanwhile keeps no list.
+                    let gone =
+                        matches!(&machine, Machine::Host(alias) if !this.conns.contains_key(alias));
+                    if !gone && this.sessions.set(machine, list) {
                         cx.notify();
                     }
                 });
@@ -949,7 +972,11 @@ impl Workspace {
                 Some(Ok(server)) => Some(server.clone()),
                 _ => None,
             },
-            Machine::Host(_) => None,
+            Machine::Host(alias) => self
+                .conns
+                .get(alias)
+                .and_then(|c| c.server.as_ref())
+                .map(|h| h.server.clone()),
         }
     }
 
@@ -1033,12 +1060,16 @@ impl Workspace {
 
     /// Every pane, as the sidebar sees it.
     fn open_sessions(&self) -> Vec<crate::sidebar::OpenSession<'_>> {
+        // A server pane whose session has not come yet is listed once it
+        // has: until then it has no name, and is no tmux session.
         self.panes
             .iter()
+            .filter(|p| !(p.on_server && p.session.is_none()))
             .map(|p| crate::sidebar::OpenSession {
                 pane: p.id,
                 host: p.host.as_ref().map(|h| h.alias.as_str()),
                 slug: p.slug.as_str(),
+                server: p.session.filter(|_| p.host.is_some()),
             })
             .collect()
     }
@@ -1060,8 +1091,9 @@ impl Workspace {
         forwarders: Vec<Forwarder>,
         installed: Vec<String>,
         place: Place,
+        check: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<u64> {
         let alias = host
             .as_ref()
             .map(|h| h.alias.clone())
@@ -1071,24 +1103,22 @@ impl Workspace {
             Place::Tab { show } => Some(*show),
             Place::Beside { .. } | Place::Into(_) => None,
         };
-        match place {
-            Place::Into(id) => {
-                self.fill_pane(id, connected.pty.clone(), connected.events, cx);
-            }
-            _ => {
-                let _ = self.place_pane(
-                    host,
-                    slug,
-                    None,
-                    connected.terminal.clone(),
-                    connected.pty.clone(),
-                    connected.events,
-                    installed,
-                    place,
-                    cx,
-                );
-            }
-        }
+        let placed = match place {
+            Place::Into(id) => self
+                .fill_pane(id, connected.pty.clone(), connected.events, cx)
+                .then_some(id),
+            _ => Some(self.place_pane(
+                host,
+                slug,
+                None,
+                connected.terminal.clone(),
+                connected.pty.clone(),
+                connected.events,
+                installed,
+                place,
+                cx,
+            )),
+        };
 
         // A second session on a host joins the connection that is already
         // there rather than opening another one.
@@ -1104,6 +1134,7 @@ impl Workspace {
                     forwarders,
                     reconnect,
                     rtt: None,
+                    server: None,
                 },
             );
         }
@@ -1121,11 +1152,12 @@ impl Workspace {
             // Only a host the user asked for is asked anything, and a
             // benchmark run is never interrupted by a question.
             let asking = matches!(place_shown, Some(true));
-            if alias != strings::LOCAL_ALIAS && crate::bench::Bench::from_env().is_none() {
+            if check && alias != strings::LOCAL_ALIAS && crate::bench::Bench::from_env().is_none() {
                 self.check_server(alias, asking, false, cx);
             }
         }
         cx.notify();
+        placed
     }
 
     /// Open a shell on this machine: a new session on the local server
@@ -1211,13 +1243,21 @@ impl Workspace {
         tracing::info!(machine = ?session.machine, session = session_id, "attaching a server session");
         // Up in the next frame, already this session's so a second click
         // finds it; the screen comes when the worker sends it (D56).
+        let on_host = session.machine != Machine::Local;
         let id = self.place_empty(host, slug, None, place, cx);
         if let Some(pane) = self.pane_mut(id) {
             pane.session = Some(session_id);
+            pane.on_server = on_host;
         }
         cx.spawn(async move |this, cx| {
             let attached = runtime::spawn(async move {
-                session::attach_session(&server, session_id, 80, 24).await
+                if on_host {
+                    // A host's shell pid means nothing on this machine.
+                    let (pty, events) = server.attach(session_id, 80, 24, None).await?;
+                    Ok(session::Local { pty, events })
+                } else {
+                    session::attach_session(&server, session_id, 80, 24).await
+                }
             })
             .await
             .map_err(|_| strings::RUNTIME_DROPPED.to_string())
@@ -1652,6 +1692,7 @@ impl Workspace {
             session: None,
             direct: None,
             starting: false,
+            on_server: false,
         });
 
         // The first session to land is shown whether or not it was asked for
@@ -1745,6 +1786,16 @@ impl Workspace {
     /// which is what warming and a click on a host have always reattached to.
     fn connect(&mut self, host: Host, slug: Option<String>, show: bool, cx: &mut Context<Self>) {
         let alias = host.alias.clone();
+        // A host whose server was installed opens what it should show
+        // there (D55); asked for a tmux session by name, it opens that.
+        if slug.is_none()
+            && self.settings.host_server(&alias) == Some(berth_core::remote::Choice::Install)
+            && crate::servers::carried().is_some()
+            && crate::bench::Bench::from_env().is_none()
+        {
+            self.connect_on_server(host, show, cx);
+            return;
+        }
         tracing::info!(%alias, "connecting");
         let slug = slug.unwrap_or_else(|| self.first_slug(&alias));
         let forwards = host.forwards.clone();
@@ -1779,6 +1830,7 @@ impl Workspace {
                             forwarders,
                             installed,
                             place,
+                            true,
                             cx,
                         );
                     });
@@ -1791,6 +1843,91 @@ impl Workspace {
                 Err(error) => {
                     // Recorded against this host only. A host that refuses must
                     // not take the others down with it.
+                    tracing::warn!(%alias, %error, "connect failed");
+                    let _ = this.update(cx, |this, cx| {
+                        this.statuses
+                            .insert(alias.clone(), HostStatus::Failed(error.clone()));
+                        if this.tabs.is_empty() {
+                            this.empty = Empty::Failed(error);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Bring up a host that runs Berth's server in a tab of its own (D55):
+    /// the session last used there, in tmux or on the server, or a new one
+    /// on the server. A host whose server cannot be used now opens on tmux,
+    /// as [`Workspace::connect`] does.
+    fn connect_on_server(&mut self, host: Host, show: bool, cx: &mut Context<Self>) {
+        let alias = host.alias.clone();
+        tracing::info!(%alias, "connecting, on the host's server");
+        let fallback = self.first_slug(&alias);
+        let last = self.settings.last_session(&alias).cloned();
+        let choice = self.settings.host_server(&alias);
+        let forwards = host.forwards.clone();
+        cx.spawn(async move |this, cx| {
+            let palette = crate::terminal_style::TerminalStyle::default().palette;
+            let installed = cx.update(|cx| cx.text_system().all_font_names());
+            let manifest = crate::servers::carried().map(|s| &s.manifest);
+            let result = runtime::spawn(session::connect_on_server(
+                host.clone(),
+                choice,
+                manifest,
+                last,
+                fallback,
+                80,
+                24,
+                palette,
+            ))
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+            match result {
+                Ok(opened) => {
+                    let forwarders =
+                        session::start_forwards(opened.connected.connection.clone(), &forwards)
+                            .await;
+                    let _ = this.update(cx, |this, cx| {
+                        let server_id = match &opened.shown {
+                            crate::machine::Opening::Server(id) => Some(*id),
+                            _ => None,
+                        };
+                        let slug = match &opened.shown {
+                            crate::machine::Opening::Tmux(slug) => slug.clone(),
+                            _ => server_id.map(server_slug).unwrap_or_default(),
+                        };
+                        let placed = this.adopt(
+                            Some(host),
+                            slug,
+                            opened.connected,
+                            forwarders,
+                            installed,
+                            Place::Tab { show },
+                            false,
+                            cx,
+                        );
+                        if let Some(pane) = placed.and_then(|id| this.pane_mut(id))
+                            && server_id.is_some()
+                        {
+                            pane.session = server_id;
+                            pane.on_server = true;
+                        }
+                        if let Some(held) = opened.server {
+                            this.hold_host_server(alias.clone(), held, cx);
+                        }
+                        // What the look decided, acted on as any connect's:
+                        // an update offered, or the server reached.
+                        this.server_decided(alias.clone(), opened.next, false, cx);
+                        if let Some(id) = placed {
+                            this.note_used(id);
+                        }
+                    });
+                }
+                Err(error) => {
                     tracing::warn!(%alias, %error, "connect failed");
                     let _ = this.update(cx, |this, cx| {
                         this.statuses
@@ -1901,7 +2038,9 @@ impl Workspace {
         if let Some(pane) = self
             .panes
             .iter()
-            .find(|p| p.host.as_ref().is_some_and(|h| h.alias == alias) && p.slug == slug)
+            .find(|p| {
+                !p.on_server && p.host.as_ref().is_some_and(|h| h.alias == alias) && p.slug == slug
+            })
             .map(|p| p.id)
         {
             self.focus_pane(pane, cx);
@@ -1918,9 +2057,86 @@ impl Workspace {
         match folder {
             crate::sidebar::Folder::Local => self.open_local(Place::Tab { show: true }, cx),
             crate::sidebar::Folder::Host(alias) => {
-                let slug = self.free_slug(&alias);
-                self.attach_new(alias, slug, Place::Tab { show: true }, cx);
+                self.new_on_host(alias, Place::Tab { show: true }, cx);
             }
+        }
+    }
+
+    /// A new session on a host, where `place` says: on its server once it
+    /// runs one (D55), else a new tmux session.
+    fn new_on_host(&mut self, alias: String, place: Place, cx: &mut Context<Self>) {
+        if self.server_of(&Machine::Host(alias.clone())).is_some() {
+            self.open_server_session(alias, place, cx);
+        } else {
+            let slug = self.free_slug(&alias);
+            self.attach_new(alias, slug, place, cx);
+        }
+    }
+
+    /// Start a session on a host's server and show it where `place` says:
+    /// the pane is up at once, the session joins it when it has started
+    /// (D56).
+    fn open_server_session(&mut self, alias: String, place: Place, cx: &mut Context<Self>) {
+        let Some(server) = self.server_of(&Machine::Host(alias.clone())) else {
+            return;
+        };
+        let Some(host) = self.hosts.iter().find(|h| h.alias == alias).cloned() else {
+            return;
+        };
+        tracing::info!(%alias, "a new session on the host's server");
+        let id = self.place_empty(Some(host), String::new(), None, place, cx);
+        if let Some(pane) = self.pane_mut(id) {
+            pane.on_server = true;
+        }
+        cx.spawn(async move |this, cx| {
+            let opened = runtime::spawn(async move {
+                let session = server.create(None, 80, 24, None, None).await?;
+                let (pty, events) = server.attach(session, 80, 24, None).await?;
+                Ok::<_, berth_core::Error>((session, pty, events))
+            })
+            .await
+            .map_err(|_| strings::RUNTIME_DROPPED.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
+            let _ = this.update(cx, |this, cx| match opened {
+                Ok((session, pty, events)) => {
+                    // Closed while it started: the session lives on,
+                    // detached, in the host's list.
+                    if this.fill_pane(id, pty, events, cx)
+                        && let Some(pane) = this.pane_mut(id)
+                    {
+                        pane.session = Some(session);
+                        pane.slug = server_slug(session);
+                    }
+                    this.note_used(id);
+                    cx.notify();
+                }
+                Err(error) => {
+                    tracing::warn!(%alias, %error, "could not start a session on the host's server");
+                    this.close(id, cx);
+                    this.warnings.push(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Remember the session a pane on a host shows as the one last used
+    /// there, so opening the host shows it again (D55).
+    fn note_used(&mut self, pane: u64) {
+        let Some(pane) = self.pane(pane) else {
+            return;
+        };
+        let Some(alias) = pane.host.as_ref().map(|h| h.alias.clone()) else {
+            return;
+        };
+        let last = match (pane.on_server, pane.session) {
+            (true, Some(id)) => berth_core::settings::LastSession::Server(id),
+            (true, None) => return,
+            (false, _) => berth_core::settings::LastSession::Tmux(pane.slug.clone()),
+        };
+        if self.settings.set_last_session(&alias, last) {
+            self.settings.save();
         }
     }
 
@@ -1976,6 +2192,7 @@ impl Workspace {
                         Vec::new(),
                         Vec::new(),
                         Place::Into(id),
+                        true,
                         cx,
                     );
                 }
@@ -2074,7 +2291,11 @@ impl Workspace {
             RowTarget::Remote { alias, slug } => self
                 .panes
                 .iter()
-                .find(|p| p.host.as_ref().is_some_and(|h| &h.alias == alias) && &p.slug == slug)
+                .find(|p| {
+                    !p.on_server
+                        && p.host.as_ref().is_some_and(|h| &h.alias == alias)
+                        && &p.slug == slug
+                })
                 .map(|p| p.id),
             RowTarget::Session(session) => self.pane_showing(session),
         }
@@ -2191,6 +2412,9 @@ impl Workspace {
             return;
         }
         let named = match (pane.and_then(|p| self.pane(p)), &target) {
+            // A server pane whose session has not come yet: nothing to end
+            // but the pane.
+            (Some(p), _) if p.on_server => None,
             (Some(p), _) => p.host.as_ref().map(|h| (h.alias.clone(), p.slug.clone())),
             (None, RowTarget::Remote { alias, slug }) => Some((alias.clone(), slug.clone())),
             _ => None,
@@ -2441,18 +2665,16 @@ impl Workspace {
             return;
         }
 
-        let Some(host) = pane.host.clone() else {
+        let Some(alias) = pane.host.as_ref().map(|h| h.alias.clone()) else {
             return;
         };
-        let alias = host.alias.clone();
-        let Some(connection) = self.conns.get(&alias).map(|c| c.connection.clone()) else {
+        if !self.conns.contains_key(&alias) {
             return;
-        };
-        let slug = self.free_slug(&alias);
-        tracing::info!(%alias, %slug, ?axis, "splitting");
+        }
+        tracing::info!(%alias, ?axis, "splitting");
         // The existing panes are untouched: a split that could not open is
         // one pane taken away again, not a broken tab.
-        self.open_into(host, slug, connection, place, cx);
+        self.new_on_host(alias, place, cx);
     }
 
     /// Close a pane. This detaches and never kills.
@@ -2490,6 +2712,7 @@ impl Workspace {
             // With no connection nothing keeps the listing true, and a stale
             // row would reattach to a session killed from somewhere else.
             self.running.remove(&alias);
+            self.sessions.set(Machine::Host(alias.clone()), Vec::new());
             self.statuses
                 .insert(alias, HostStatus::Connection(ConnectionState::Disconnected));
             // Politeness, not correctness: dropping the handle would end it
@@ -2581,11 +2804,12 @@ impl Workspace {
             return;
         }
 
-        // A local session has no tmux behind it, so its name is only a label
-        // and there is nothing on a server to keep in step.
+        // A local session, or one on a host's server, has no tmux behind
+        // it, so its name is only a label and there is nothing to keep in
+        // step.
         let remote = self
             .pane(id)
-            .filter(|p| !p.is_local())
+            .filter(|p| !p.is_local() && !p.on_server)
             .and_then(|_| self.conns.get(&alias))
             .map(|c| c.connection.clone());
 

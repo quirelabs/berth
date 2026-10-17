@@ -133,6 +133,7 @@ impl Workspace {
             session: None,
             direct: None,
             starting: false,
+            on_server: false,
         });
         id
     }

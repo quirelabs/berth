@@ -37,10 +37,15 @@ pub enum Row {
     },
     Session {
         folder: Folder,
-        /// The tmux slug for a remote session, the label for a local one.
+        /// The tmux slug for a remote tmux session, the label for any other.
         name: String,
         /// The pane showing it, or `None` when it runs detached.
         pane: Option<u64>,
+        /// Its id on its host's server, for a host's server session (D55).
+        server: Option<u64>,
+        /// A tmux session on a host that has moved to its server: marked so,
+        /// as it stays on tmux until it ends.
+        tmux: bool,
         agent: bool,
         /// In the needs-you group rather than under its folder.
         pinned: bool,
@@ -60,6 +65,17 @@ pub struct OpenSession<'a> {
     /// `None` for a local shell.
     pub host: Option<&'a str>,
     pub slug: &'a str,
+    /// Its id on the host's server, when it shows a server session there
+    /// rather than a tmux one (D55).
+    pub server: Option<u64>,
+}
+
+/// A session on a host's server, open or not, as its folder lists it.
+pub struct ServerRow {
+    pub id: u64,
+    pub name: String,
+    pub pane: Option<u64>,
+    pub agent: bool,
 }
 
 /// Everything the tree is built from.
@@ -77,9 +93,28 @@ pub struct Input<'a> {
     /// (D50).
     /// (With whether Claude runs in each.)
     pub local_detached: &'a [(String, bool)],
-    /// Whether a session needs the user, by its folder, name and pane: it
-    /// is pinned to the top then, whatever its folder.
-    pub needs_you: &'a dyn Fn(&Folder, &str, Option<u64>) -> bool,
+    /// Each host's server sessions, open or not, by alias (D55).
+    pub host_servers: &'a BTreeMap<String, Vec<ServerRow>>,
+    /// Hosts that have moved to their server: their tmux sessions are
+    /// marked as such.
+    pub on_server: &'a BTreeSet<String>,
+    /// Whether a session needs the user, by its folder, name, pane and id
+    /// on a host's server: it is pinned to the top then, whatever its
+    /// folder.
+    pub needs_you: &'a NeedsYou<'a>,
+}
+
+/// Whether a session needs the user: by its folder, name, pane, and id on
+/// a host's server.
+pub type NeedsYou<'a> = dyn Fn(&Folder, &str, Option<u64>, Option<u64>) -> bool + 'a;
+
+/// A session as a folder holds it before it is a row.
+struct Listed {
+    name: String,
+    pane: Option<u64>,
+    server: Option<u64>,
+    tmux: bool,
+    agent: bool,
 }
 
 /// Berth's own sessions from one host's scan, with whether an agent is running
@@ -147,15 +182,41 @@ pub fn rows(input: &Input) -> Vec<Row> {
             .collect();
         // An open pane counts before its first scan has come back, so a new
         // session never blinks out of the tree for five seconds.
-        for open in input.open.iter().filter(|o| o.host == Some(host.alias)) {
+        for open in input
+            .open
+            .iter()
+            .filter(|o| o.host == Some(host.alias) && o.server.is_none())
+        {
             sessions.entry(open.slug.to_string()).or_default().0 = Some(open.pane);
         }
 
-        let mut ordered: Vec<(String, Option<u64>, bool)> = sessions
+        let mut tmux: Vec<(String, Option<u64>, bool)> = sessions
             .into_iter()
             .map(|(slug, (pane, agent))| (slug, pane, agent))
             .collect();
-        ordered.sort_by(|a, b| natural(&a.0).cmp(&natural(&b.0)));
+        tmux.sort_by(|a, b| natural(&a.0).cmp(&natural(&b.0)));
+        let marked = input.on_server.contains(host.alias);
+        // The server's sessions first, then those still on tmux.
+        let ordered: Vec<Listed> = input
+            .host_servers
+            .get(host.alias)
+            .into_iter()
+            .flatten()
+            .map(|row| Listed {
+                name: row.name.clone(),
+                pane: row.pane,
+                server: Some(row.id),
+                tmux: false,
+                agent: row.agent,
+            })
+            .chain(tmux.into_iter().map(|(name, pane, agent)| Listed {
+                name,
+                pane,
+                server: None,
+                tmux: marked,
+                agent,
+            }))
+            .collect();
 
         push_folder(
             &mut out,
@@ -166,19 +227,26 @@ pub fn rows(input: &Input) -> Vec<Row> {
         );
     }
 
-    let mut local: Vec<(String, Option<u64>, bool)> = input
+    let mut local: Vec<Listed> = input
         .open
         .iter()
         .filter(|o| o.host.is_none())
         .enumerate()
-        .map(|(index, o)| (local_name(input.local_label, index), Some(o.pane), false))
+        .map(|(index, o)| Listed {
+            name: local_name(input.local_label, index),
+            pane: Some(o.pane),
+            server: None,
+            tmux: false,
+            agent: false,
+        })
         .collect();
-    local.extend(
-        input
-            .local_detached
-            .iter()
-            .map(|(name, agent)| (name.clone(), None, *agent)),
-    );
+    local.extend(input.local_detached.iter().map(|(name, agent)| Listed {
+        name: name.clone(),
+        pane: None,
+        server: None,
+        tmux: false,
+        agent: *agent,
+    }));
     push_folder(&mut out, &mut pinned, Folder::Local, local, input);
 
     if pinned.is_empty() {
@@ -194,19 +262,21 @@ fn push_folder(
     out: &mut Vec<Row>,
     pinned: &mut Vec<Row>,
     folder: Folder,
-    sessions: Vec<(String, Option<u64>, bool)>,
+    sessions: Vec<Listed>,
     input: &Input,
 ) {
     // Those needing the user go to the top, open folder or closed.
     let (needing, sessions): (Vec<_>, Vec<_>) = sessions
         .into_iter()
-        .partition(|(name, pane, _)| (input.needs_you)(&folder, name, *pane));
-    for (name, pane, agent) in needing {
+        .partition(|s| (input.needs_you)(&folder, &s.name, s.pane, s.server));
+    for s in needing {
         pinned.push(Row::Session {
             folder: folder.clone(),
-            name,
-            pane,
-            agent,
+            name: s.name,
+            pane: s.pane,
+            server: s.server,
+            tmux: s.tmux,
+            agent: s.agent,
             pinned: true,
         });
     }
@@ -215,7 +285,7 @@ fn push_folder(
         .get(&folder)
         .copied()
         .unwrap_or(!sessions.is_empty());
-    let agent = !open && sessions.iter().any(|s| s.2);
+    let agent = !open && sessions.iter().any(|s| s.agent);
     out.push(Row::Folder {
         folder: folder.clone(),
         expanded: open,
@@ -224,12 +294,14 @@ fn push_folder(
     if !open {
         return;
     }
-    for (name, pane, agent) in sessions {
+    for s in sessions {
         out.push(Row::Session {
             folder: folder.clone(),
-            name,
-            pane,
-            agent,
+            name: s.name,
+            pane: s.pane,
+            server: s.server,
+            tmux: s.tmux,
+            agent: s.agent,
             pinned: false,
         });
     }
@@ -320,7 +392,7 @@ pub fn taken<'a>(
 ) -> BTreeSet<&'a str> {
     let mut out: BTreeSet<&str> = open
         .iter()
-        .filter(|o| o.host == Some(alias))
+        .filter(|o| o.host == Some(alias) && o.server.is_none())
         .map(|o| o.slug)
         .collect();
     if let Some(listed) = running.get(alias) {
@@ -377,7 +449,9 @@ mod tests {
             expanded,
             local_label: "zsh",
             local_detached: &[],
-            needs_you: &|_, _, _| false,
+            host_servers: &BTreeMap::new(),
+            on_server: &BTreeSet::new(),
+            needs_you: &|_, _, _, _| false,
         })
     }
 
@@ -407,7 +481,7 @@ mod tests {
         );
         let mut expanded = BTreeMap::new();
         expanded.insert(Folder::Host("db".into()), false);
-        let needs = |folder: &Folder, name: &str, _: Option<u64>| {
+        let needs = |folder: &Folder, name: &str, _: Option<u64>, _: Option<u64>| {
             name == "main" && *folder != Folder::Local
         };
         let rows = rows(&Input {
@@ -417,6 +491,8 @@ mod tests {
             expanded: &expanded,
             local_label: "zsh",
             local_detached: &[],
+            host_servers: &BTreeMap::new(),
+            on_server: &BTreeSet::new(),
             needs_you: &needs,
         });
         assert_eq!(rows[0], Row::NeedsYou);
@@ -491,6 +567,7 @@ mod tests {
             pane: 7,
             host: Some("web"),
             slug: "main",
+            server: None,
         }];
         let running = BTreeMap::from([(
             "web".to_string(),
@@ -502,6 +579,8 @@ mod tests {
             folder: web(),
             name: "main".into(),
             pane: Some(7),
+            server: None,
+            tmux: false,
             agent: false,
             pinned: false,
         }));
@@ -509,6 +588,8 @@ mod tests {
             folder: web(),
             name: "deploy".into(),
             pane: None,
+            server: None,
+            tmux: false,
             agent: true,
             pinned: false,
         }));
@@ -523,6 +604,7 @@ mod tests {
             pane: 1,
             host: Some("web"),
             slug: "main",
+            server: None,
         }];
         let rows = build(&hosts, &open, &BTreeMap::new(), &BTreeMap::new());
         assert_eq!(session_names(&rows, &web()), ["main"]);
@@ -655,11 +737,13 @@ mod tests {
                 pane: 3,
                 host: None,
                 slug: "local",
+                server: None,
             },
             OpenSession {
                 pane: 5,
                 host: None,
                 slug: "local",
+                server: None,
             },
         ];
         let rows = build(&[], &open, &BTreeMap::new(), &BTreeMap::new());
@@ -668,6 +752,8 @@ mod tests {
             folder: Folder::Local,
             name: "zsh 2".into(),
             pane: Some(5),
+            server: None,
+            tmux: false,
             agent: false,
             pinned: false,
         }));
@@ -681,6 +767,7 @@ mod tests {
             pane: 1,
             host: None,
             slug: "local",
+            server: None,
         }];
         let rows = build(&hosts, &open, &BTreeMap::new(), &BTreeMap::new());
         assert!(session_names(&rows, &Folder::Host("local".into())).is_empty());
@@ -695,6 +782,7 @@ mod tests {
             pane: 1,
             host: None,
             slug: "local",
+            server: None,
         }];
         let detached = [("zsh #4".to_string(), true)];
         let rows = rows(&Input {
@@ -704,13 +792,17 @@ mod tests {
             expanded: &BTreeMap::new(),
             local_label: "zsh",
             local_detached: &detached,
-            needs_you: &|_, _, _| false,
+            host_servers: &BTreeMap::new(),
+            on_server: &BTreeSet::new(),
+            needs_you: &|_, _, _, _| false,
         });
         assert_eq!(session_names(&rows, &Folder::Local), ["zsh", "zsh #4"]);
         assert!(rows.contains(&Row::Session {
             folder: Folder::Local,
             name: "zsh #4".into(),
             pane: None,
+            server: None,
+            tmux: false,
             agent: true,
             pinned: false,
         }));
@@ -780,6 +872,7 @@ mod tests {
             pane: 1,
             host: Some("web"),
             slug: "main",
+            server: None,
         }];
         let running = BTreeMap::from([(
             "web".to_string(),
@@ -787,5 +880,94 @@ mod tests {
         )]);
         let taken = taken("web", &open, &running);
         assert_eq!(taken.into_iter().collect::<Vec<_>>(), ["main", "main-2"]);
+    }
+
+    /// A host that has moved to its server lists the server's sessions
+    /// first, open or not, each with its id, and then the tmux sessions it
+    /// still has, marked. An open server pane is never also a tmux row,
+    /// and a host still on tmux marks nothing.
+    #[test]
+    fn a_host_on_its_server_lists_server_sessions_then_marked_tmux_ones() {
+        let hosts = [host("web", None), host("db", None)];
+        let open = [OpenSession {
+            pane: 9,
+            host: Some("web"),
+            slug: "#3",
+            server: Some(3),
+        }];
+        let mut running = BTreeMap::new();
+        running.insert(
+            "web".to_string(),
+            BTreeMap::from([("main".to_string(), false)]),
+        );
+        running.insert(
+            "db".to_string(),
+            BTreeMap::from([("main".to_string(), false)]),
+        );
+        let mut host_servers = BTreeMap::new();
+        host_servers.insert(
+            "web".to_string(),
+            vec![
+                ServerRow {
+                    id: 3,
+                    name: "claude \u{b7} ~/berth".into(),
+                    pane: Some(9),
+                    agent: true,
+                },
+                ServerRow {
+                    id: 5,
+                    name: "zsh \u{b7} ~".into(),
+                    pane: None,
+                    agent: false,
+                },
+            ],
+        );
+        let on_server = BTreeSet::from(["web".to_string()]);
+        let rows = rows(&Input {
+            hosts: &hosts,
+            open: &open,
+            running: &running,
+            expanded: &BTreeMap::new(),
+            local_label: "zsh",
+            local_detached: &[],
+            host_servers: &host_servers,
+            on_server: &on_server,
+            needs_you: &|_, _, _, _| false,
+        });
+        let web: Vec<(String, Option<u64>, Option<u64>, bool)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session {
+                    folder,
+                    name,
+                    pane,
+                    server,
+                    tmux,
+                    ..
+                } if *folder == Folder::Host("web".into()) => {
+                    Some((name.clone(), *pane, *server, *tmux))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            web,
+            [
+                ("claude \u{b7} ~/berth".to_string(), Some(9), Some(3), false),
+                ("zsh \u{b7} ~".to_string(), None, Some(5), false),
+                ("main".to_string(), None, None, true),
+            ]
+        );
+        assert!(rows.contains(&Row::Session {
+            folder: Folder::Host("db".into()),
+            name: "main".into(),
+            pane: None,
+            server: None,
+            tmux: false,
+            agent: false,
+            pinned: false,
+        }));
+        let taken = taken("web", &open, &running);
+        assert_eq!(taken.into_iter().collect::<Vec<_>>(), ["main"]);
     }
 }
