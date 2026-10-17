@@ -76,8 +76,10 @@ fn device_attributes() -> libghostty_vt::terminal::DeviceAttributes {
 /// What a terminal answers XTVERSION: Berth, by name and version.
 const XTVERSION: &str = concat!("Berth ", env!("CARGO_PKG_VERSION"));
 
-/// The reply to the OSC 7501 support query: the query's own body.
-const STATUS_SUPPORTED: &[u8] = b"\x1b]7501;?\x1b\\";
+/// The reply to the OSC 7501 support query: `?`, and the states and kinds
+/// Berth understands, every one the protocol defines.
+const STATUS_SUPPORTED: &[u8] =
+    b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
 
 /// Something about program status (OSC 7501), in stream order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1658,11 +1660,11 @@ mod tests {
     fn the_status_query_is_answered_before_the_attributes_after_it() {
         assert_eq!(
             answers(b"\x1b]7501;?\x1b\\\x1b[c"),
-            "\x1b]7501;?\x1b\\\x1b[?62;22c"
+            format!("{SUPPORTED}\x1b[?62;22c")
         );
         assert_eq!(
             answers(b"\x1b]7501;?\x07\x1b[c"),
-            "\x1b]7501;?\x1b\\\x1b[?62;22c"
+            format!("{SUPPORTED}\x1b[?62;22c")
         );
     }
 
@@ -1681,6 +1683,32 @@ mod tests {
                 StatusEvent::CommandEnd(Some(1)),
             ]
         );
+    }
+
+    /// The support query is answered with every state and kind, as the
+    /// protocol's own example names them.
+    const SUPPORTED: &str =
+        "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+
+    #[test]
+    fn the_support_reply_names_every_state_and_kind() {
+        assert_eq!(STATUS_SUPPORTED, SUPPORTED.as_bytes());
+    }
+
+    /// A full reset (RIS) takes every record; a soft reset (DECSTR) takes
+    /// none.
+    #[test]
+    fn a_soft_reset_keeps_the_records_and_a_full_one_does_not() {
+        let term = Terminal::server(TermSize::new(20, 5), Scrollback::VIEW, Box::new(|_| {}));
+        term.advance(b"\x1b]7501;state=working\x1b\\\x1b[!p");
+        let _ = term.snapshot();
+        assert_eq!(
+            term.drain_status_events(),
+            [StatusEvent::Report("state=working".into())]
+        );
+        term.advance(b"\x1bc");
+        let _ = term.snapshot();
+        assert_eq!(term.drain_status_events(), [StatusEvent::Reset]);
     }
 
     #[test]

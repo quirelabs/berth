@@ -798,7 +798,7 @@ mod tests {
     async fn the_status_query_is_answered_first_on_a_real_pty() {
         let (worker, mut rx) = Worker::start(spec(None)).await.unwrap();
         let script = "stty raw -echo; printf '\\033]7501;?\\033\\\\\\033[c'; \
-                      r=$(dd bs=1 count=19 2>/dev/null); stty sane; \
+                      r=$(dd bs=1 count=89 2>/dev/null); stty sane; \
                       echo \"got_$(printf '%s' \"$r\" | tr -d '\\033')\"\n";
         worker
             .handle(ToServer::Input {
@@ -806,7 +806,12 @@ mod tests {
                 bytes: script.as_bytes().to_vec(),
             })
             .await;
-        until(&mut rx, "got_]7501;?\\[?62;22c").await;
+        until(
+            &mut rx,
+            "got_]7501;?:states=idle,working,done,blocked,error\
+             :kinds=permission,question,auth\\[?62;22c",
+        )
+        .await;
     }
 
     /// Status changes until `wanted` of them have come, or time runs out.

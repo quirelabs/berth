@@ -484,6 +484,40 @@ mod tests {
         assert!(parse(&format!("state=idle:msg={}", "QUFB".repeat(682))).is_some());
     }
 
+    /// Every limit the published protocol sets, at its edge: within it the
+    /// report stands, one past it the report is discarded whole.
+    #[test]
+    fn every_limit_discards_the_whole_report_one_past_it() {
+        // msg: 2048 decoded (2732 encoded is 2049).
+        assert!(parse(&format!("state=idle:msg={}QUE=", "QUFB".repeat(682))).is_some());
+        assert_eq!(
+            parse(&format!("state=idle:msg={}", "QUFB".repeat(683))),
+            None
+        );
+        // title: 192 decoded, 256 encoded.
+        assert!(parse(&format!("state=idle:title={}", "QUFB".repeat(64))).is_some());
+        assert_eq!(
+            parse(&format!("state=idle:title={}QQ==", "QUFB".repeat(64))),
+            None
+        );
+        // app: 32 bytes.
+        assert!(parse(&format!("state=idle:app={}", "a".repeat(32))).is_some());
+        assert_eq!(parse(&format!("state=idle:app={}", "a".repeat(33))), None);
+        // id: 128 bytes, 32 a segment, 8 deep.
+        let a = |n: usize| "a".repeat(n);
+        let id128 = format!("{}/{}/{}/{}", a(32), a(31), a(31), a(31));
+        let id129 = format!("{}/{}/{}/{}", a(32), a(32), a(31), a(31));
+        assert_eq!((id128.len(), id129.len()), (128, 129));
+        assert!(parse(&format!("state=idle:id={id128}")).is_some());
+        assert_eq!(parse(&format!("state=idle:id={id129}")), None);
+        assert_eq!(parse(&format!("state=idle:id={}", a(33))), None);
+        assert!(parse(&format!("state=idle:id={}", ["a"; 8].join("/"))).is_some());
+        assert_eq!(
+            parse(&format!("state=idle:id={}", ["a"; 9].join("/"))),
+            None
+        );
+    }
+
     #[test]
     fn text_that_could_mislead_is_neutralised() {
         // "a" RIGHT-TO-LEFT OVERRIDE "b" ZERO WIDTH SPACE "c".

@@ -68,9 +68,10 @@ const SHELL_PREFIX: &[u8] = b"133;";
 /// OSC 7501, the Program Status Protocol: a program saying what it is doing.
 const STATUS_PREFIX: &[u8] = b"7501;";
 
-/// Longest program status report kept: the protocol caps the whole sequence
-/// at 4096 bytes, and anything longer is discarded.
-pub const MAX_STATUS_PARAM: usize = 4096;
+/// Longest program status report kept: the protocol caps the whole sequence,
+/// `ESC ]` through `ESC \`, at 4096 bytes, and anything longer is discarded
+/// whole. Its parameter is that less the four bytes around it.
+pub const MAX_STATUS_PARAM: usize = 4096 - 4;
 
 /// Splits a byte stream into runs of ordinary output and OSC 133 markers.
 #[derive(Debug, Clone)]
@@ -537,6 +538,30 @@ mod tests {
         let body = "x".repeat(MAX_AGENT_PARAM + 10);
         let signal = format!("\x1b]7717;berth;{body}\x07");
         assert!(agents(&[signal.as_bytes()]).is_empty());
+    }
+
+    /// A status report is kept up to a whole sequence of 4096 bytes, `ESC ]`
+    /// through `ESC \\`, and discarded whole one byte past it.
+    #[test]
+    fn a_status_report_is_kept_to_4096_bytes_whole() {
+        let statuses = |sequence: &str| {
+            let mut scanner = Scanner::new();
+            scanner
+                .scan(sequence.as_bytes())
+                .into_iter()
+                .filter_map(|piece| match piece {
+                    Piece::Status(body) => Some(body.len()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let report = |total: usize| {
+            let body = "x".repeat(total - "\x1b]7501;\x1b\\".len());
+            format!("\x1b]7501;{body}\x1b\\")
+        };
+        assert_eq!(report(4096).len(), 4096);
+        assert_eq!(statuses(&report(4096)), [4096 - 9]);
+        assert!(statuses(&report(4097)).is_empty());
     }
 
     /// Another program's 7717, without the namespace, is not ours.
