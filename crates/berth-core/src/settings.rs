@@ -48,6 +48,19 @@ pub struct Settings {
     /// by alias: install it, or keep using tmux (D55). A host with no entry
     /// has not been asked.
     pub host_servers: std::collections::BTreeMap<String, crate::remote::Choice>,
+    /// The session last used on each host, by alias: what opening the host
+    /// shows again, in tmux or on the host's server (D55).
+    pub last_sessions: std::collections::BTreeMap<String, LastSession>,
+}
+
+/// A session on a host, as the one last used there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LastSession {
+    /// A tmux session, by its slug.
+    Tmux(String),
+    /// A session on the host's server, by its id there.
+    Server(u64),
 }
 
 impl Default for Settings {
@@ -57,6 +70,7 @@ impl Default for Settings {
             host_names: std::collections::BTreeMap::new(),
             local_direct: false,
             host_servers: std::collections::BTreeMap::new(),
+            last_sessions: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -164,6 +178,21 @@ impl Settings {
             Some(choice) => self.host_servers.insert(alias.to_string(), choice) != Some(choice),
             None => self.host_servers.remove(alias).is_some(),
         }
+    }
+
+    /// The session last used on a host, if one is known.
+    pub fn last_session(&self, alias: &str) -> Option<&LastSession> {
+        self.last_sessions.get(alias)
+    }
+
+    /// Note the session used on a host now. Returns whether anything
+    /// changed, so moving between panes is not a file write each time.
+    pub fn set_last_session(&mut self, alias: &str, session: LastSession) -> bool {
+        if self.last_sessions.get(alias) == Some(&session) {
+            return false;
+        }
+        self.last_sessions.insert(alias.to_string(), session);
+        true
     }
 }
 
@@ -347,5 +376,28 @@ mod tests {
         assert!(loaded.set_host_server("web", None));
         assert_eq!(loaded.host_server("web"), None);
         assert!(!loaded.set_host_server("web", None));
+    }
+
+    /// Each host's last session, tmux or server, is kept across a save,
+    /// and noting the same one again is not a change.
+    #[test]
+    fn a_hosts_last_session_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut settings = Settings::default();
+        assert_eq!(settings.last_session("web"), None);
+        assert!(settings.set_last_session("web", LastSession::Tmux("main".into())));
+        assert!(!settings.set_last_session("web", LastSession::Tmux("main".into())));
+        assert!(settings.set_last_session("db", LastSession::Server(7)));
+        settings.save_to(&path);
+
+        let mut loaded = Settings::load_from(&path);
+        assert_eq!(
+            loaded.last_session("web"),
+            Some(&LastSession::Tmux("main".into()))
+        );
+        assert_eq!(loaded.last_session("db"), Some(&LastSession::Server(7)));
+        assert!(loaded.set_last_session("web", LastSession::Server(2)));
+        assert_eq!(loaded.last_session("web"), Some(&LastSession::Server(2)));
     }
 }
