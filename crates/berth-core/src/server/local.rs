@@ -1,5 +1,9 @@
-//! Local sessions as the app sees them: the supervisor's sessions, each
-//! looking like an ordinary pty to the view and the output pump (D50).
+//! A server's sessions as the app sees them: the supervisor's sessions, each
+//! looking like an ordinary pty to the view and the output pump (D50). The
+//! supervisor is this machine's, on its local socket, or a host's, through
+//! its relay on an ssh channel (D55): one handle, [`Server`], over either,
+//! so a host's sessions, status, title and directory arrive as local ones
+//! do.
 //!
 //! One connection to the supervisor carries every session; a router hands
 //! each session its own messages. A screen from the worker is replayed into
@@ -47,6 +51,24 @@ pub enum Start {
     External,
 }
 
+/// A fresh stream to a supervisor, each time one is asked for: what a
+/// connection, and every reconnection, rides on.
+pub type Opener = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Box<dyn client::Duplex>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// How the supervisor is reached.
+#[derive(Clone)]
+enum Dial {
+    /// This machine's, on its local socket, started if need be.
+    Local { places: Places, start: Start },
+    /// Any other, over whatever stream `Opener` gives: a host's relay.
+    Over(Opener),
+}
+
 /// What a request is waiting for.
 enum Waiting {
     Created(oneshot::Sender<std::result::Result<SessionId, String>>),
@@ -80,11 +102,15 @@ struct Shared {
     sessions: Option<SessionsListener>,
 }
 
-/// The app's handle on the local server. Cheap to clone.
+/// The app's handle on a server, this machine's or a host's. Cheap to
+/// clone.
 #[derive(Clone)]
-pub struct LocalServer {
+pub struct Server {
     shared: Arc<Mutex<Shared>>,
 }
+
+/// This machine's server: the name the app has used for it since D50.
+pub type LocalServer = Server;
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared
@@ -92,9 +118,13 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Connect to the supervisor, starting it if nothing answers and `start`
-/// allows.
-async fn reach(places: &Places, start: &Start, expected: &str) -> Result<client::Client> {
+/// Connect to the supervisor, starting this machine's if nothing answers
+/// and `start` allows.
+async fn reach(dial: &Dial, expected: &str) -> Result<client::Client> {
+    let (places, start) = match dial {
+        Dial::Local { places, start } => (places, start),
+        Dial::Over(open) => return client::over(open().await?, expected).await,
+    };
     if let Ok(client) = client::connect_expecting(places, expected).await {
         return Ok(client);
     }
@@ -114,15 +144,27 @@ async fn reach(places: &Places, start: &Start, expected: &str) -> Result<client:
     }
 }
 
-impl LocalServer {
-    /// Connect, starting the supervisor if needed, and keep connected.
+impl Server {
+    /// This machine's server: connect, starting the supervisor if needed,
+    /// and keep connected.
     pub async fn start(places: Places, start: Start) -> Result<Self> {
         // The supervisor should be the build this side would start.
         let expected = match &start {
             Start::Binary(exe) => paths::build_of(exe)?,
             Start::External => super::build(),
         };
-        let first = reach(&places, &start, &expected).await?;
+        Self::dial(Dial::Local { places, start }, expected).await
+    }
+
+    /// A server reached over whatever stream `open` gives, each time it
+    /// connects: a host's, through its relay (D55). `expected` is the build
+    /// installed there.
+    pub async fn over(open: Opener, expected: String) -> Result<Self> {
+        Self::dial(Dial::Over(open), expected).await
+    }
+
+    async fn dial(dial: Dial, expected: String) -> Result<Self> {
+        let first = reach(&dial, &expected).await?;
         let server = Self {
             shared: Arc::new(Mutex::new(Shared {
                 to_server: Some(first.to_server.clone()),
@@ -130,7 +172,7 @@ impl LocalServer {
             })),
         };
         let shared = server.shared.clone();
-        tokio::spawn(route(shared, places, start, expected, first));
+        tokio::spawn(route(shared, dial, expected, first));
         Ok(server)
     }
 
@@ -525,13 +567,7 @@ async fn forward(
 }
 
 /// Hand the server's messages to whoever is waiting, and keep connected.
-async fn route(
-    shared: Arc<Mutex<Shared>>,
-    places: Places,
-    start: Start,
-    expected: String,
-    first: client::Client,
-) {
+async fn route(shared: Arc<Mutex<Shared>>, dial: Dial, expected: String, first: client::Client) {
     let mut client = first;
     loop {
         lock(&shared).to_server = Some(client.to_server.clone());
@@ -554,7 +590,7 @@ async fn route(
         tracing::warn!("lost the local server; connecting again");
         client = loop {
             tokio::time::sleep(RETRY_EVERY).await;
-            if let Ok(client) = reach(&places, &start, &expected).await {
+            if let Ok(client) = reach(&dial, &expected).await {
                 break client;
             }
         };

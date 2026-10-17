@@ -60,6 +60,7 @@ fn supervisor_pid(places: &Places) -> Option<u32> {
 fn alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -74,7 +75,10 @@ impl Drop for Stopped {
 }
 
 fn stop(pid: u32) {
-    let _ = Command::new("kill").arg(pid.to_string()).status();
+    let _ = Command::new("kill")
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status();
     let deadline = Instant::now() + Duration::from_secs(5);
     while alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -172,4 +176,102 @@ async fn a_supervisor_is_started_once_however_many_ask_at_once() {
     let _stopped = supervisor_pid(&places).map(Stopped);
     let starts = std::fs::read_to_string(&counter).unwrap();
     assert_eq!(starts.lines().count(), 1, "{starts:?}");
+}
+
+/// A relay as the app opens one on a host: the process's stdin and stdout
+/// as one stream. Each one's pid goes in `pids`, so a test can end it.
+fn relay_opener(
+    data: std::path::PathBuf,
+    pids: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+) -> berth_core::server::local::Opener {
+    std::sync::Arc::new(move || {
+        let data = data.clone();
+        let pids = pids.clone();
+        Box::pin(async move {
+            let mut child = tokio::process::Command::new(SERVER)
+                .arg("--connect")
+                .env(berth_core::env::DATA, &data)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?;
+            if let Some(pid) = child.id() {
+                pids.lock().unwrap().push(pid);
+            }
+            let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+                return Err(berth_core::Error::Server("no pipes to the relay".into()));
+            };
+            let stream: Box<dyn berth_core::server::client::Duplex> =
+                Box::new(tokio::io::join(stdout, stdin));
+            Ok(stream)
+        })
+    })
+}
+
+/// Read events until `needle` has been seen in the output.
+async fn until(events: &mut tokio::sync::mpsc::Receiver<berth_core::pty::PtyEvent>, needle: &str) {
+    let mut seen = Vec::new();
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            if let berth_core::pty::PtyEvent::Output(bytes) = event {
+                seen.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&seen).contains(needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        found == Ok(true),
+        "{needle:?} not seen in {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// The app's one handle over a relay, as it reaches a host (D55): a session
+/// made, shown, typed at and listed through `berth-server --connect`; and
+/// when the relay dies, as an ssh channel does, the handle opens another
+/// and the same session answers again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_over_a_relay_is_a_server_and_survives_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let places = Places::under(&data);
+    let version = Command::new(SERVER).arg("--version").output().unwrap();
+    let build = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    let pids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let server =
+        berth_core::server::local::Server::over(relay_opener(data.clone(), pids.clone()), build)
+            .await
+            .unwrap();
+    let _stopped = supervisor_pid(&places).map(Stopped);
+
+    let session = server.create(None, 40, 10, None, None).await.unwrap();
+    let (pty, mut events) = server.attach(session, 40, 10, None).await.unwrap();
+    pty.write(b"echo over_$((6*7))\n".to_vec()).await;
+    until(&mut events, "over_42").await;
+    let listed = server.list().await.unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![session]
+    );
+
+    // The relay dies under the app.
+    let first = pids.lock().unwrap()[0];
+    stop(first);
+    let mut answered = false;
+    for _ in 0..40 {
+        pty.write(b"echo again_$((2+2))\n".to_vec()).await;
+        let got = tokio::time::timeout(Duration::from_millis(500), until(&mut events, "again_4"));
+        if got.await.is_ok() {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the session never answered through a new relay");
+    assert!(pids.lock().unwrap().len() >= 2, "a second relay was opened");
+    server.kill(session).await.unwrap();
 }

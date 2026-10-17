@@ -41,6 +41,18 @@ pub async fn connect_expecting(places: &Places, expected: &str) -> Result<Client
     let stream = super::transport::connect(&places.supervisor())
         .await
         .map_err(|e| Error::Server(format!("no supervisor answers: {e}")))?;
+    over(stream, expected).await
+}
+
+/// A byte stream both ways to a supervisor, whatever carries it: the local
+/// socket, or a host's relay on an ssh channel (D55).
+pub trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static {}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> Duplex for S {}
+
+/// Greet a supervisor over `stream`, which should be the build `expected`,
+/// and trade messages with it.
+pub async fn over<S: Duplex>(stream: S, expected: &str) -> Result<Client> {
     let opened = link::open(stream, &link::hello()).await?;
     let other_build = opened.other_build(expected);
     if let Some(other) = &other_build {
