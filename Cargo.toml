@@ -87,6 +87,13 @@ tempfile = "3"
 [profile.dev]
 opt-level = 1
 
+# The release build with what a profiler needs to name what it measured:
+# symbols and line tables. Built in CI for berth-test only, never shipped.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
 [profile.dev.package."*"]
 opt-level = 2
 

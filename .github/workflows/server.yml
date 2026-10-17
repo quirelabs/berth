@@ -72,6 +72,32 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      # For profiling on berth-test only, never carried or installed: the
+      # same code with symbols, line tables and frame pointers, so a perf
+      # recording names what it measured (D50).
+      - name: Profiling build
+        if: startsWith(matrix.target, 'x86_64')
+        shell: bash
+        env:
+          RUSTFLAGS: -D warnings -C force-frame-pointers=yes
+        run: |
+          set -eux
+          cargo zigbuild --profile profiling --locked -p berth-core --bin berth-server --target ${{ matrix.target }}
+          bin=target/${{ matrix.target }}/profiling/berth-server
+          file "$bin"
+          file "$bin" | grep -q 'not stripped'
+          mkdir profiling
+          name=berth-server-${{ matrix.target }}-profiling
+          cp "$bin" "profiling/$name"
+          cd profiling
+          sha256sum "$name" > "$name.sha256"
+      - if: startsWith(matrix.target, 'x86_64')
+        uses: actions/upload-artifact@v4
+        with:
+          name: berth-server-${{ matrix.target }}-profiling
+          path: profiling/
+          if-no-files-found: error
+
   # macOS hosts, arm64 and x86_64, both from the arm64 runner: the engine's
   # build passes the target on to Zig, and Apple's linker links either.
   macos:
