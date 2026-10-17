@@ -29,6 +29,9 @@ hex.workspace = true
 # Development only: never enabled in a release build (D55, release blockers).
 dev-server-dir = []
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 

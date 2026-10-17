@@ -595,9 +595,17 @@ async fn the_app_typing_sets_the_size_of_a_session_two_show() {
     type_line(&large, session, "echo L_$(stty size | tr ' ' x)").await;
     until_output_within(&mut large, "L_12x60", Duration::from_secs(10)).await;
 
-    // The smaller app types: back to its size, before what it typed runs.
+    // The smaller app types in the same second: the larger one's size
+    // holds, so the two do not resize each other back and forth.
+    type_line(&small, session, "echo Q_$(stty size | tr ' ' x)").await;
+    until_output_within(&mut small, "Q_12x60", Duration::from_secs(10)).await;
+
+    // A second on, the smaller app types: back to its size, before what it
+    // typed runs.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     type_line(&small, session, "echo S_$(stty size | tr ' ' x)").await;
     until_output_within(&mut small, "S_10x40", Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // And the larger one again.
     type_line(&large, session, "echo T_$(stty size | tr ' ' x)").await;

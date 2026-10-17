@@ -64,6 +64,10 @@ serde_json = "1"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 # The local server's named pipe DACL and process checks on Windows (D50).
 # Signed off 2026-09-30; the version already in the lock through other crates.
+# setsid and close-on-exec for a detached supervisor (D55). Already in the
+# tree through tokio; a direct reference so the platforms' constants are the
+# crate's, not copied by hand. Approved by Jimmy 2026-10-17.
+libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

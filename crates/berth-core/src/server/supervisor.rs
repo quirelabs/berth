@@ -148,18 +148,44 @@ struct Session {
     /// a terminal's: the client that was last active sets it, and the
     /// others see the screen at that size (D55).
     sizes: HashMap<ClientId, (u16, u16)>,
+    /// The client whose size the session has, and when it was last active.
+    sized_by: Option<(ClientId, std::time::Instant)>,
     build: String,
 }
 
+/// How long a client that set a session's size holds it against another
+/// typing too: two apps typing in the same second do not resize each other
+/// back and forth (D55).
+const SIZE_HELD: Duration = Duration::from_secs(1);
+
 impl Session {
-    /// Whether `client` showing this session at its own size calls for a
-    /// resize first: it is the one active now, and its size is not the
-    /// session's.
-    fn size_for(&self, client: ClientId) -> Option<(u16, u16)> {
-        self.sizes
-            .get(&client)
-            .copied()
-            .filter(|size| *size != (self.info.cols, self.info.rows))
+    /// `client` was active at its size: the session takes it.
+    fn sized(&mut self, client: ClientId, (cols, rows): (u16, u16), now: std::time::Instant) {
+        self.sizes.insert(client, (cols, rows));
+        self.info.cols = cols;
+        self.info.rows = rows;
+        self.sized_by = Some((client, now));
+    }
+
+    /// `client` typed. The size the session should take first, if any: its
+    /// own, unless that is the session's already, or another client set the
+    /// size and was active within the last second, whose size then holds.
+    fn typed(&mut self, client: ClientId, now: std::time::Instant) -> Option<(u16, u16)> {
+        match self.sized_by {
+            Some((by, _)) if by == client => {
+                self.sized_by = Some((client, now));
+                return None;
+            }
+            Some((_, at)) if now.duration_since(at) < SIZE_HELD => return None,
+            _ => {}
+        }
+        let size = self.sizes.get(&client).copied()?;
+        if size == (self.info.cols, self.info.rows) {
+            self.sized_by = Some((client, now));
+            return None;
+        }
+        self.sized(client, size, now);
+        Some(size)
     }
 }
 
@@ -499,6 +525,7 @@ impl State {
                         to_worker,
                         attached: HashSet::new(),
                         sizes: HashMap::new(),
+                        sized_by: None,
                         build,
                     },
                 );
@@ -703,9 +730,7 @@ impl State {
                     return;
                 };
                 entry.attached.insert(client);
-                entry.sizes.insert(client, (cols, rows));
-                entry.info.cols = cols;
-                entry.info.rows = rows;
+                entry.sized(client, (cols, rows), std::time::Instant::now());
                 self.queue_for_worker(client, session, message).await;
             }
             ToServer::Detach { session } => {
@@ -720,21 +745,19 @@ impl State {
                 rows,
             } => {
                 if let Some(entry) = self.sessions.get_mut(&session) {
-                    entry.sizes.insert(client, (cols, rows));
-                    entry.info.cols = cols;
-                    entry.info.rows = rows;
+                    entry.sized(client, (cols, rows), std::time::Instant::now());
                 }
                 self.forward(client, session, message).await;
             }
             // Typing is being active: a client typing into a session that is
             // at another client's size takes it back to its own first, so
-            // what it types meets the screen it sees (D55). Scrolling stays
-            // each client's own.
+            // what it types meets the screen it sees, unless the other was
+            // active within the second (D55). Scrolling stays each client's
+            // own.
             ToServer::Input { session, .. } => {
+                let now = std::time::Instant::now();
                 let resize = self.sessions.get_mut(&session).and_then(|entry| {
-                    let (cols, rows) = entry.size_for(client)?;
-                    entry.info.cols = cols;
-                    entry.info.rows = rows;
+                    let (cols, rows) = entry.typed(client, now)?;
                     Some(ToServer::Resize {
                         session,
                         cols,
@@ -984,34 +1007,18 @@ where
     }
 }
 
-/// The C library's own calls for detaching, declared here rather than taken
-/// from a crate.
+/// Detaching, through the C library (`libc`, D55).
 #[cfg(unix)]
 mod detach {
-    use std::ffi::c_int;
-
-    unsafe extern "C" {
-        #[link_name = "setsid"]
-        fn c_setsid() -> c_int;
-        #[link_name = "fcntl"]
-        fn c_fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-        #[link_name = "getdtablesize"]
-        fn c_getdtablesize() -> c_int;
-    }
-
-    /// `F_SETFD` and `FD_CLOEXEC`: the same on Linux and macOS.
-    const F_SETFD: c_int = 2;
-    const FD_CLOEXEC: c_int = 1;
-
     /// The most descriptors looked at, whatever the limit says: a process
     /// started from an ssh channel holds a handful.
-    const AT_MOST: c_int = 65_536;
+    const AT_MOST: libc::c_int = 65_536;
 
     /// Start a session of its own. Async-signal-safe, for between fork and
     /// exec.
-    pub fn setsid() -> c_int {
+    pub fn setsid() -> libc::pid_t {
         // SAFETY: no arguments, no memory.
-        unsafe { c_setsid() }
+        unsafe { libc::setsid() }
     }
 
     /// Mark every descriptor past stderr to close on exec, so a child
@@ -1020,11 +1027,11 @@ mod detach {
     /// way already.
     pub fn close_on_exec() {
         // SAFETY: plain integers in and out.
-        let limit = unsafe { c_getdtablesize() }.clamp(3, AT_MOST);
+        let limit = unsafe { libc::getdtablesize() }.clamp(3, AT_MOST);
         for fd in 3..limit {
             // SAFETY: sets one flag on a descriptor; one that is not open
             // fails harmlessly.
-            unsafe { c_fcntl(fd, F_SETFD, FD_CLOEXEC) };
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
     }
 }

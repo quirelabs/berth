@@ -601,6 +601,7 @@ dependencies = [
  "berth-term",
  "dirs",
  "hex",
+ "libc",
  "notify",
  "portable-pty",
  "proptest",
