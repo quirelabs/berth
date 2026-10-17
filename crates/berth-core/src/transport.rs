@@ -149,11 +149,25 @@ impl Connection {
             return Err(Error::NoAgent);
         }
 
+        // An RSA key is signed with the strongest hash the server takes, as
+        // OpenSSH does: without one the signature is SHA-1 `ssh-rsa`, which
+        // current servers refuse. A server that does not say is asked for
+        // SHA-512, which every server that takes RSA at all takes now.
+        let rsa_hash = handle
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(Some(russh::keys::HashAlg::Sha512));
+
         // Offer each identity in the agent's own order, as OpenSSH does.
         for identity in &identities {
             let public = identity_key(identity);
+            let hash = matches!(public.algorithm(), russh::keys::Algorithm::Rsa { .. })
+                .then_some(rsa_hash)
+                .flatten();
             let result = handle
-                .authenticate_publickey_with(user.clone(), public, None, &mut agent)
+                .authenticate_publickey_with(user.clone(), public, hash, &mut agent)
                 .await
                 .map_err(|e| Error::Agent(e.to_string()))?;
             if result.success() {
