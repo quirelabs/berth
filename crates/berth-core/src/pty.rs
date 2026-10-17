@@ -35,6 +35,9 @@ pub enum PtyEvent {
     /// Input was dropped: the program is not reading, and what was typed at
     /// it filled the buffer to the pty (D50). The session carries on.
     InputDropped,
+    /// The scrollback now holds all of the history the worker had: the last
+    /// rebuild was of all of it, not only its newest range.
+    HistoryWhole,
 }
 
 /// The most input that waits to be written to a local pty, in bytes (D50).

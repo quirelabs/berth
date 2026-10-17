@@ -160,7 +160,12 @@ async fn read_until(rx: &mut mpsc::Receiver<PtyEvent>, needle: &str) -> String {
                     return seen;
                 }
             }
-            Ok(Some(PtyEvent::Exit(_) | PtyEvent::Rebuild(_) | PtyEvent::InputDropped)) => {}
+            Ok(Some(
+                PtyEvent::Exit(_)
+                | PtyEvent::Rebuild(_)
+                | PtyEvent::InputDropped
+                | PtyEvent::HistoryWhole,
+            )) => {}
             Ok(Some(PtyEvent::Closed)) | Ok(None) => {
                 panic!("channel closed before {needle:?} appeared; saw: {seen:?}")
             }

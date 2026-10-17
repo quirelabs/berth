@@ -499,30 +499,36 @@ impl Worker {
     /// meanwhile is simply not sent.
     pub fn history_below(&self, first_line: u64) -> Vec<ToApp> {
         let mut out = Vec::new();
-        let mut before = first_line;
-        loop {
-            let history = self.terminal.wire_history(Some(before), HISTORY_RANGE);
-            let complete = history.reaches_oldest || history.lines.is_empty();
-            let newest = history.newest;
-            let count = history.lines.len() as u64;
-            match Packed::pack(&history.lines) {
-                Ok(lines) => out.push(ToApp::History {
+        let mut before = Some(first_line);
+        while let Some(at) = before {
+            let (range, next) = self.history_range(at);
+            out.push(range);
+            before = next;
+        }
+        out
+    }
+
+    /// One range of the history above line `before`, the newest lines first
+    /// of what is left, and where the next range starts, `None` once this
+    /// one is the last. Sent one at a time, so the newest history reaches a
+    /// pane first and at once, however much is behind it.
+    pub fn history_range(&self, before: u64) -> (ToApp, Option<u64>) {
+        let history = self.terminal.wire_history(Some(before), HISTORY_RANGE);
+        let complete = history.reaches_oldest || history.lines.is_empty();
+        let newest = history.newest;
+        let count = history.lines.len() as u64;
+        match Packed::pack(&history.lines) {
+            Ok(lines) => (
+                ToApp::History {
                     session: self.session,
                     newest,
                     lines,
                     complete,
-                }),
-                Err(error) => {
-                    out.push(self.refused("history", error.to_string()));
-                    break;
-                }
-            }
-            if complete {
-                break;
-            }
-            before = newest + 1 - count;
+                },
+                (!complete).then(|| newest + 1 - count),
+            ),
+            Err(error) => (self.refused("history", error.to_string()), None),
         }
-        out
     }
 
     fn refused(&self, what: &str, why: String) -> ToApp {
@@ -592,7 +598,7 @@ fn pump(
                 },
             },
             PtyEvent::Closed => break,
-            PtyEvent::Rebuild(_) | PtyEvent::InputDropped => continue,
+            PtyEvent::Rebuild(_) | PtyEvent::InputDropped | PtyEvent::HistoryWhole => continue,
         };
         if tx.blocking_send(message).is_err() {
             // Nobody is listening any more. The shell keeps running only as

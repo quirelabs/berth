@@ -579,7 +579,10 @@ mod tests {
                     }
                 }
                 PtyEvent::Closed => return seen,
-                PtyEvent::Exit(_) | PtyEvent::Rebuild(_) | PtyEvent::InputDropped => {}
+                PtyEvent::Exit(_)
+                | PtyEvent::Rebuild(_)
+                | PtyEvent::InputDropped
+                | PtyEvent::HistoryWhole => {}
             }
         }
         seen

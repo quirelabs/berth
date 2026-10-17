@@ -1391,9 +1391,24 @@ mod through_the_app {
         // Reading again while output keeps coming, faster than calm: the
         // pane catches up, and no history comes unasked.
         assert!(!rebuilt_within(&mut events, Duration::from_secs(3)).await);
-        // Scrolled up into it: the history comes.
+        // Scrolled up into it: the history comes, its newest range swapped
+        // in at once and the whole of it after, so the lines just above the
+        // screen show without waiting for the rest.
         pty.want_history().await;
-        assert!(rebuilt_within(&mut events, Duration::from_secs(5)).await);
+        let mut commits = 0;
+        let whole = timeout(Duration::from_secs(5), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    PtyEvent::Rebuild(berth_term::Shadow::Commit) => commits += 1,
+                    PtyEvent::HistoryWhole => return true,
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(whole, Ok(true));
+        assert_eq!(commits, 2, "the newest range first, then the whole");
         let _ = app.kill(session).await;
     }
 }
@@ -1471,6 +1486,7 @@ mod sync_under_load {
             CellSize::new(8.0, 16.0),
         ));
         let pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let commits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (done_tx, done) = tokio::sync::oneshot::channel::<()>();
         let (rebuilt_tx, rebuilt) = tokio::sync::oneshot::channel::<()>();
         // Keeps feeding to the end: the screen and history that close the
@@ -1479,6 +1495,7 @@ mod sync_under_load {
         let _feeding = {
             let terminal = terminal.clone();
             let pause = pause.clone();
+            let commits = commits.clone();
             let mut done_tx = Some(done_tx);
             let mut rebuilt_tx = Some(rebuilt_tx);
             tokio::spawn(async move {
@@ -1502,10 +1519,15 @@ mod sync_under_load {
                         }
                         // As the app's pump does: in order with the output.
                         Some(PtyEvent::Rebuild(step)) => {
-                            let commit = step == berth_term::Shadow::Commit;
+                            if step == berth_term::Shadow::Commit && done_tx.is_none() {
+                                commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             terminal.shadow(step);
-                            if commit
-                                && done_tx.is_none()
+                        }
+                        // The whole history is in: the newest range went in
+                        // before it, at once, so there was a swap before this.
+                        Some(PtyEvent::HistoryWhole) => {
+                            if done_tx.is_none()
                                 && let Some(tx) = rebuilt_tx.take()
                             {
                                 let _ = tx.send(());
@@ -1537,6 +1559,8 @@ mod sync_under_load {
             .await
             .expect("the missed history never came")
             .unwrap();
+        // Not asked for: one swap, of the whole history.
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
         let _ = terminal.snapshot();
 
         let (worker_history, worker_screen) = worker_view(&server.places, session).await;

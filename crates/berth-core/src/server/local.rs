@@ -322,6 +322,22 @@ struct Rebuilding {
     since: std::time::Instant,
 }
 
+/// A replacement terminal built beside the pane's from `ranges` of history
+/// (each newest first, the newest range first), the screen above them and
+/// the output since, swapped in at once.
+fn rebuilt(out: &mut Vec<PtyEvent>, ranges: &[Vec<v1::Row>], screen: &v1::Screen, kept: &[u8]) {
+    let mut history: Vec<v1::Row> = ranges.iter().flatten().cloned().collect();
+    history.reverse();
+    out.push(PtyEvent::Rebuild(berth_term::Shadow::Begin));
+    out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(
+        berth_term::rebuild(&history, screen),
+    )));
+    if !kept.is_empty() {
+        out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(kept.to_vec())));
+    }
+    out.push(PtyEvent::Rebuild(berth_term::Shadow::Commit));
+}
+
 /// The server's messages for one session, as pty events.
 ///
 /// A screen is drawn as soon as it arrives, and output keeps going to the
@@ -394,18 +410,19 @@ async fn translate(
                         tracing::warn!(%error, "history from the local server did not unpack");
                     }
                 }
+                // History the user scrolled up and asked for: its newest range
+                // is put in at once, so the lines just above the screen show
+                // while the rest is on its way, and the whole history replaces
+                // it when complete. History nobody asked for keeps the pane's
+                // scrollback as it is until it is all here.
+                let first =
+                    pending.ranges.len() == 1 && missing.load(Ordering::Relaxed) == HISTORY_ASKED;
                 if complete && let Some(done) = rebuilding.take() {
-                    let mut history: Vec<v1::Row> = done.ranges.into_iter().flatten().collect();
-                    history.reverse();
-                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Begin));
-                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(
-                        berth_term::rebuild(&history, &done.screen),
-                    )));
-                    if !done.kept.is_empty() {
-                        out.push(PtyEvent::Rebuild(berth_term::Shadow::Write(done.kept)));
-                    }
-                    out.push(PtyEvent::Rebuild(berth_term::Shadow::Commit));
+                    rebuilt(&mut out, &done.ranges, &done.screen, &done.kept);
+                    out.push(PtyEvent::HistoryWhole);
                     missing.store(HISTORY_WHOLE, Ordering::Relaxed);
+                } else if first && let Some(pending) = rebuilding.as_ref() {
+                    rebuilt(&mut out, &pending.ranges, &pending.screen, &pending.kept);
                 }
             }
             ToApp::Output { seq, bytes, .. } => {

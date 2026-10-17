@@ -328,7 +328,7 @@ fn pump(terminal: SharedTerminal, intake: Arc<Intake>, mut events: mpsc::Receive
                     terminal.shadow(step);
                 }
                 PtyEvent::InputDropped => intake.note_input_dropped(),
-                PtyEvent::Exit(_) | PtyEvent::Closed => {}
+                PtyEvent::Exit(_) | PtyEvent::Closed | PtyEvent::HistoryWhole => {}
             }
         }
         feed(&terminal, &intake, &mut bytes);

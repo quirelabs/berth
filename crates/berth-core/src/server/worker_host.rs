@@ -416,15 +416,19 @@ async fn send_screen(
     };
     send(to_supervisor, &screen).await;
     flow.screen_sent(seq, kind, std::time::Instant::now());
-    if let (true, Some(first_line)) = (with_history, first_line) {
+    // The history, a range at a time and the newest first, each sent as
+    // soon as it is read: on a slow link the lines just above the screen
+    // arrive first, and scrolling up shows them at once.
+    let mut before = first_line.filter(|_| with_history);
+    while let Some(at) = before {
         let reading = worker.clone();
-        if let Ok(ranges) =
-            tokio::task::spawn_blocking(move || reading.history_below(first_line)).await
-        {
-            for range in &ranges {
-                send(to_supervisor, range).await;
-            }
-        }
+        let Ok((range, next)) =
+            tokio::task::spawn_blocking(move || reading.history_range(at)).await
+        else {
+            break;
+        };
+        send(to_supervisor, &range).await;
+        before = next;
     }
 }
 
