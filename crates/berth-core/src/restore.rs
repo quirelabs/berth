@@ -1,8 +1,10 @@
-//! Local sessions, saved so they come back after a quit or a reboot (D46).
+//! Tabs, saved so they come back after a quit or a reboot (D46, D55).
 //!
-//! A local shell ends with Berth (D36). What is kept is enough to put it back
-//! where it was: which tabs held local shells, how they were split, each
-//! shell's directory and its last screen. The screen is only ever redrawn,
+//! What is kept is enough to put every tab back where it was: how it was
+//! split, and for each pane its last screen and what it showed. A local
+//! shell also keeps its directory, since a shell of its own ends with Berth
+//! (D36); a host's pane keeps its host and its session there, tmux or on the
+//! host's server, to attach to again. The screen is only ever redrawn,
 //! never read for meaning, and there is no scrollback in it.
 //!
 //! Like `settings`, nothing here is fatal. A missing file is nothing to
@@ -41,7 +43,7 @@ impl Default for Saved {
     }
 }
 
-/// One tab of local shells.
+/// One tab, of local shells, hosts' sessions or both.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedTab {
     /// Where it sat in the tab strip.
@@ -107,6 +109,48 @@ pub struct SavedPane {
     /// it protects nothing from code running as the user.
     #[serde(default)]
     pub token: Option<String>,
+    /// The host and session a host's pane showed (D55). Absent for a local
+    /// pane, and in files from before hosts' tabs were kept.
+    #[serde(default)]
+    pub host: Option<SavedHost>,
+}
+
+/// A host's session a pane showed: its host by ssh config alias, and the
+/// session on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedHost {
+    pub alias: String,
+    pub session: HostSession,
+}
+
+/// A session on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostSession {
+    /// A tmux session, by its slug.
+    Tmux(String),
+    /// A session on the host's server, by its id there.
+    Server(u64),
+}
+
+impl SavedHost {
+    /// An alias as ssh config could have written it, and a slug Berth
+    /// could have made: nothing else is attached to.
+    fn is_sound(&self) -> bool {
+        let alias_ok = !self.alias.is_empty()
+            && self.alias.len() <= 255
+            && !self
+                .alias
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace());
+        let session_ok = match &self.session {
+            HostSession::Tmux(slug) => {
+                !slug.is_empty() && crate::session::Session::new(slug.clone(), 80, 24).slug == *slug
+            }
+            HostSession::Server(_) => true,
+        };
+        alias_ok && session_ok
+    }
 }
 
 /// A Claude conversation to resume: its id and the directory it is scoped to.
@@ -145,6 +189,7 @@ impl SavedTab {
                 (1..=MAX_SIDE).contains(&p.cols)
                     && (1..=MAX_SIDE).contains(&p.rows)
                     && p.screen.len() <= MAX_SCREEN_BYTES
+                    && p.host.as_ref().is_none_or(SavedHost::is_sound)
             })
     }
 }
@@ -237,6 +282,7 @@ mod tests {
             claude: None,
             session: None,
             token: None,
+            host: None,
         }
     }
 
@@ -458,5 +504,69 @@ mod tests {
         let loaded = Saved::load_from(&path);
         assert_eq!(loaded.tabs.len(), 1);
         assert!(loaded.tabs[0].panes.iter().all(|p| p.claude.is_none()));
+    }
+
+    /// A tab with a host's tmux pane and a pane on a host's server beside a
+    /// local one comes back as it was; a file from before hosts were kept
+    /// loads with every pane local.
+    #[test]
+    fn hosts_panes_survive_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        let mut tab = split_tab();
+        tab.panes[1].cwd = None;
+        tab.panes[1].host = Some(SavedHost {
+            alias: "web".into(),
+            session: HostSession::Tmux("main-2".into()),
+        });
+        tab.panes[2].cwd = None;
+        tab.panes[2].host = Some(SavedHost {
+            alias: "web".into(),
+            session: HostSession::Server(7),
+        });
+        let saved = Saved {
+            version: VERSION,
+            tabs: vec![tab],
+        };
+        saved.save_to(&path);
+        assert_eq!(Saved::load_from(&path), saved);
+
+        let old = "version = 1\n[[tabs]]\nposition = 0\nfocus = 0\nlayout = { Pane = 0 }\n\
+                   [[tabs.panes]]\ncols = 80\nrows = 24\nscreen = \"$\"\n";
+        std::fs::write(&path, old).expect("written");
+        let loaded = Saved::load_from(&path);
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].panes[0].host, None);
+    }
+
+    /// A host or a slug no ssh config or Berth would have written drops the
+    /// tab, never reaches a command.
+    #[test]
+    fn a_strange_host_or_slug_drops_its_tab() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("local-sessions.toml");
+        for host in [
+            SavedHost {
+                alias: "web; rm -rf ~".into(),
+                session: HostSession::Tmux("main".into()),
+            },
+            SavedHost {
+                alias: "web".into(),
+                session: HostSession::Tmux("main'; touch x".into()),
+            },
+            SavedHost {
+                alias: String::new(),
+                session: HostSession::Server(1),
+            },
+        ] {
+            let mut tab = split_tab();
+            tab.panes[0].host = Some(host);
+            Saved {
+                version: VERSION,
+                tabs: vec![tab],
+            }
+            .save_to(&path);
+            assert!(Saved::load_from(&path).tabs.is_empty());
+        }
     }
 }
