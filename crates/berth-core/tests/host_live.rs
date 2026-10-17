@@ -178,6 +178,41 @@ async fn the_server_installs_on_a_real_host_and_is_removed() {
     assert!(sessions.is_empty(), "{sessions:?}");
     drop(opened);
 
+    // The app's handle on it, through the same relay: a session made,
+    // shown, typed at, listed and ended, as a pane on this host does.
+    let current = std::sync::Arc::new(std::sync::Mutex::new(std::sync::Arc::new(connection)));
+    let server = berth_core::server::local::Server::over(
+        berth_core::remote::relay::opener(current.clone(), plan.path.clone()),
+        plan.build.clone(),
+    )
+    .await
+    .expect("the handle reached the server");
+    let session = server.create(None, 80, 24, None, None).await.unwrap();
+    let (pty, mut events) = server.attach(session, 80, 24, None).await.unwrap();
+    pty.write(b"echo host_$((6*7))\n".to_vec()).await;
+    let mut seen = Vec::new();
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(event) = events.recv().await {
+            if let berth_core::pty::PtyEvent::Output(bytes) = event {
+                seen.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&seen).contains("host_42") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(shown, Ok(true), "{:?}", String::from_utf8_lossy(&seen));
+    let listed = server.list().await.unwrap();
+    assert_eq!(
+        listed.iter().map(|s| s.id).collect::<Vec<_>>(),
+        vec![session]
+    );
+    server.kill(session).await.unwrap();
+    drop((pty, events, server));
+    let connection = current.lock().unwrap().clone();
+
     // Its own removal command, as given: the server finds its data directory
     // from where it is installed, and stops the supervisor it started.
     let removed = connection.run(&plan.removal(), b"").await.unwrap();

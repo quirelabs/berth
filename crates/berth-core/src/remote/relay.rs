@@ -44,6 +44,26 @@ pub async fn open(
     past_banner(stream, SCAN_WITHIN, SCAN_AT_MOST).await
 }
 
+/// A host's connection as it is now. Whoever reconnects the host puts the
+/// new one here, and a server reached through [`opener`] opens its next
+/// relay on it: the handle's own reconnects need nothing else.
+pub type Current = std::sync::Arc<std::sync::Mutex<std::sync::Arc<Connection>>>;
+
+/// Relays to the server installed at `server`, each opened on the host's
+/// connection as it is at the time: what [`crate::server::local::Server::over`]
+/// reaches a host's server with.
+pub fn opener(current: Current, server: String) -> crate::server::local::Opener {
+    std::sync::Arc::new(move || {
+        let connection = current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let server = server.clone();
+        Box::pin(async move {
+            let stream: Box<dyn crate::server::client::Duplex> =
+                Box::new(open(&connection, &server).await?);
+            Ok(stream)
+        })
+    })
+}
+
 /// A stream read past whatever came before the greeting: the greeting's
 /// frame first, from what was already read, then the stream itself.
 pub struct Greeted<S> {
