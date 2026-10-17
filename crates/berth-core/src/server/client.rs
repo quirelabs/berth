@@ -65,7 +65,15 @@ pub async fn connect_expecting(places: &Places, expected: &str) -> Result<Client
     let mut read = opened.read;
     let (other, failed) = (other_build.clone(), unreadable.clone());
     tokio::spawn(async move {
-        while let Ok(Some(payload)) = read.recv().await {
+        loop {
+            // A client dropped by its app closes the connection now, not at
+            // the next message: the supervisor counts it gone, and can go
+            // idle (D50).
+            let received = tokio::select! {
+                received = read.recv() => received,
+                _ = inbox.closed() => break,
+            };
+            let Ok(Some(payload)) = received else { break };
             match ToApp::decode(&payload) {
                 Ok(message) => {
                     if inbox.send(message).await.is_err() {

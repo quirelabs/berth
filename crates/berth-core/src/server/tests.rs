@@ -339,6 +339,45 @@ async fn an_idle_supervisor_exits() {
     assert!(!places.supervisor().exists(), "its endpoint is gone");
 }
 
+/// Its last session ended and its last client gone, the supervisor exits
+/// soon after, so an idle host runs nothing of Berth's; while either is
+/// there, it stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_supervisor_exits_after_its_last_session_and_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let places = places(dir.path());
+    let tasks = Tasks::default();
+    let idle = Duration::from_millis(400);
+    let mut supervisor = supervise(places.clone(), &tasks, idle).await;
+    let mut app = client::connect(&places).await.unwrap();
+    let session = create(&mut app).await;
+
+    // A session, and a client: well past the idle time, still up.
+    tokio::time::sleep(idle * 3).await;
+    assert!(!supervisor.is_finished(), "a session keeps it up");
+
+    // The session ends; the client is still there.
+    app.to_server
+        .send(ToServer::Kill { session })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if list(&mut app).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(idle * 3).await;
+    assert!(!supervisor.is_finished(), "a client keeps it up");
+
+    // The client goes too: it exits, and takes its endpoint and pid file.
+    drop(app);
+    let ended = timeout(Duration::from_secs(5), &mut supervisor).await;
+    assert!(matches!(ended, Ok(Ok(Ok(())))), "{ended:?}");
+    assert!(!places.supervisor().exists(), "its endpoint is gone");
+    assert!(!places.supervisor_pid().exists(), "its pid file is gone");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_supervisor_does_not_start() {
     let server = server().await;

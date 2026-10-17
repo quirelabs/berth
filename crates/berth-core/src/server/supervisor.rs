@@ -24,8 +24,9 @@ use super::worker_host::{self, Launch};
 use crate::error::{Error, Result};
 use crate::worker::Shell;
 
-/// How long a supervisor with no sessions and no clients stays up (D50).
-pub const IDLE_EXIT: Duration = Duration::from_secs(60);
+/// How long a supervisor with no sessions and no clients stays up: about
+/// ten seconds, so an idle host runs nothing of Berth's (D50, D55).
+pub const IDLE_EXIT: Duration = Duration::from_secs(10);
 
 /// Messages queued for one client or one worker link.
 const QUEUE: usize = 1024;
